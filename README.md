@@ -29,33 +29,42 @@ Orchestrator chat --MCP/HTTPS (tunnel)--> extention-proxy (server.js)
 | `read_chat(tab_id?, last_n?)` | Read a tab's transcript (default: orchestrator tab) |
 | `close_worker(tab_id)` | Close a worker window |
 
-## Setup
+## Setup (Windows desktop app)
 
-1. **Server**
-   ```powershell
-   cd extention-proxy
-   npm install
-   npm start
-   ```
-   It prints a token (also stored in `extention-proxy/.token`).
-
-2. **Extension**: `chrome://extensions` -> Developer mode -> *Load unpacked* -> select `extention/`.
-   Open the popup, paste the token, keep the URL `ws://localhost:8787/bridge`, **Save & reconnect**.
-   The status should turn green ("connected").
-
-3. **Mark the orchestrator tab**: open the chat that will act as orchestrator and click
-   *Set this tab as orchestrator* in the popup. Log in to both sites in this browser profile.
-
-4. **Expose the server to the cloud** (claude.ai / chatgpt.com call connectors from their servers,
-   so `localhost` is not reachable):
-   ```powershell
-   cloudflared tunnel --url http://localhost:8787
-   # or: ngrok http 8787
-   ```
-   Add a custom connector with URL `https://<tunnel-host>/mcp?token=<token>`.
-
-5. In the orchestrator chat, ask for example:
+1. Download the **Windows portable EXE** and **Chrome extension ZIP** from
+   [the latest release](https://github.com/EmpRider/Chat-Orchestrator/releases/latest).
+   Install the [ngrok CLI](https://ngrok.com/download/windows) separately and make sure `ngrok`
+   is available on your `PATH`.
+2. Double-click the EXE. In its UI, enter your **dedicated ngrok domain** and the
+   **matching ngrok authtoken**, then click **Save & Connect**. The app manages the tunnel
+   automatically; you do not need to start a tunnel manually. Your existing AgentBridge
+   domain and tunnel remain separate.
+3. Extract the extension ZIP. Open `chrome://extensions`, enable **Developer mode**,
+   select **Load unpacked**, and choose the extracted folder containing `manifest.json`.
+   In the extension popup, set the WebSocket URL to `ws://127.0.0.1:8787/bridge`,
+   copy the **bridge token** from the desktop app, and click **Save & reconnect**.
+4. Open the chat you want as orchestrator and click **Set this tab as orchestrator**
+   in the extension popup. Log in to your chosen worker-chat site in the same browser profile.
+5. Once the app shows the ngrok route as verified, click **Copy Connector URL**.
+   Add that URL as the ChatGPT connector endpoint. It uses your dedicated domain and
+   has the form `https://YOUR-DOMAIN/mcp?token=YOUR-BRIDGE-TOKEN`.
+   Keep this URL private.
+6. In the orchestrator chat, try:
    *"Use spawn_worker on chatgpt to review this plan, wait up to 45 seconds, then summarise."*
+
+For more detail, see the [desktop setup guide](extention-proxy/DESKTOP.md).
+
+## Develop from source
+
+```powershell
+cd extention-proxy
+npm ci
+npm test
+npm run desktop
+```
+
+The source desktop app uses the same dedicated-ngrok UI. Do not run it alongside
+the portable EXE, because both use local port `8787`.
 
 ## Verify the pieces
 
