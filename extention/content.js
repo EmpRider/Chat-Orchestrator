@@ -243,12 +243,47 @@
 
   // ------------------------------------------------------------- reading
   function readChat(lastN) {
-    const userSel = A.user.join(',');
-    const nodes = all([...A.user, ...A.assistant]);
-    let msgs = nodes.map((n) => ({
-      role: n.matches(userSel) ? 'user' : 'assistant',
-      text: n.innerText.trim(),
-    }));
+    let msgs;
+    if (site === 'chatgpt') {
+      const roleOf = (n) => (
+        n.getAttribute('data-message-role') ||
+        n.getAttribute('data-message-author-role') ||
+        n.getAttribute('data-turn') || ''
+      ).trim().toLowerCase();
+      const fallbackSel = '[data-testid^="conversation-turn-"] .markdown';
+      const matches = [...document.querySelectorAll(
+        `li[data-message-role], [data-message-author-role], article[data-turn], ${fallbackSel}`
+      )];
+      const explicit = matches.filter((n) => roleOf(n) === 'user' || roleOf(n) === 'assistant');
+      const candidates = matches.filter((n) => explicit.includes(n) ||
+        (n.matches(fallbackSel) && !roleOf(n) && !explicit.some((o) => o.contains(n))));
+      // An explicit li turn owns its role, even inside a legacy role wrapper.
+      const turns = candidates.filter((n) =>
+        !candidates.some((child) => child !== n && n.contains(child) && child.matches('li[data-message-role]'))
+      );
+      // Ignore broad wrappers enclosing multiple distinct message leaves.
+      const leaves = turns.filter((n) =>
+        !turns.some((other) => other !== n && n.contains(other))
+      );
+      const singleTurns = turns.filter((n) =>
+        leaves.filter((leaf) => n.contains(leaf)).length === 1
+      );
+      const nodes = singleTurns.filter((n) =>
+        !singleTurns.some((other) => other !== n && other.contains(n))
+      );
+      msgs = nodes.map((n) => {
+        const body = n.querySelector('[data-user-message-copy]') ||
+          n.querySelector('[data-assistant-markdown]') || n;
+        return { role: roleOf(n) || 'assistant', text: (body.textContent || '').trim() };
+      }).filter((m) => m.text);
+    } else {
+      const userSel = A.user.join(',');
+      const nodes = all([...A.user, ...A.assistant]);
+      msgs = nodes.map((n) => ({
+        role: n.matches(userSel) ? 'user' : 'assistant',
+        text: n.innerText.trim(),
+      }));
+    }
     if (lastN) msgs = msgs.slice(-lastN);
     const transcript = msgs
       .map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.text}`)
