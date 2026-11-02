@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "Chat Orchestrator Bridge",
+  "version": "0.1.1",
+  "description": "Lets an orchestrator chat (Claude/ChatGPT) spawn and talk to worker chat tabs through a local MCP server.",
+  "minimum_chrome_version": "116",
+  "permissions": ["tabs", "storage", "alarms", "scripting"],
+  "host_permissions": [
+    "https://claude.ai/*",
+    "https://chatgpt.com/*",
+    "https://chat.openai.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://claude.ai/*",
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "Chat Orchestrator",
+    "default_popup": "popup.html"
+  }
+}

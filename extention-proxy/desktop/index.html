@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'" />
+  <title>Chat Orchestrator</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <main>
+    <header>
+      <div><span class="eyebrow">LOCAL MCP DESKTOP</span><h1>Chat Orchestrator</h1><p>Control your browser-worker bridge from one place.</p></div>
+      <span id="overall" class="pill muted">Starting…</span>
+    </header>
+
+    <section class="status-grid" aria-label="Connection status">
+      <article class="status-card"><div class="card-title"><span class="dot" id="server-dot"></span> MCP server</div><strong id="server-state">Starting</strong><small>127.0.0.1:8787</small></article>
+      <article class="status-card"><div class="card-title"><span class="dot" id="extension-dot"></span> Extension</div><strong id="extension-state">Disconnected</strong><small>Local WebSocket</small></article>
+      <article class="status-card"><div class="card-title"><span class="dot" id="ngrok-dot"></span> Ngrok tunnel</div><strong id="ngrok-state">Not configured</strong><small id="ngrok-detail">Dedicated domain</small></article>
+    </section>
+
+    <section class="panel">
+      <div class="section-heading"><h2>Bridge token</h2><span class="hint">For ChatGPT and the browser extension</span></div>
+      <div class="input-row"><code id="token-value">••••••••••••••••••••••••••••</code><button id="toggle-token" type="button">Reveal</button><button id="copy-token" type="button">Copy</button></div>
+      <button id="import-token" type="button" class="link-button">Import existing .token file</button>
+    </section>
+
+    <section class="panel">
+      <div class="section-heading"><h2>Ngrok connection</h2><span class="hint">Separate domain for Chat Orchestrator</span></div>
+      <label for="domain">Dedicated ngrok HTTPS domain</label>
+      <div class="input-row"><input id="domain" type="text" spellcheck="false" autocomplete="off" placeholder="your-new-domain.ngrok-free.dev" /></div>
+      <label for="ngrok-token">Ngrok authtoken <span id="ngrok-token-status" class="hint">Not saved</span></label>
+      <div class="input-row"><input id="ngrok-token" type="password" spellcheck="false" autocomplete="new-password" placeholder="Paste your ngrok authtoken" /><button id="configure-ngrok" type="button" class="primary">Save &amp; Connect</button></div>
+      <p class="help">Find your authtoken at <code>dashboard.ngrok.com/get-started/your-authtoken</code>. Leave the field blank to keep a previously saved token.</p>
+    </section>
+
+    <section class="panel">
+      <div class="section-heading"><h2>ChatGPT connector</h2><span class="hint">Generated from your dedicated domain</span></div>
+      <label>Connector URL</label>
+      <div class="input-row"><code id="connector-url">Enter your domain above</code><button id="copy-url" type="button">Copy URL</button></div>
+      <p class="help">Only the bridge token is included in the ChatGPT URL. Your ngrok authtoken is encrypted locally and never included in this URL. Your existing AgentBridge tunnel stays unchanged. Keep this app running while using the connector.</p>
+    </section>
+
+    <footer>
+      <span id="message" role="status" aria-live="polite">Ready to configure.</span>
+      <div class="actions"><button id="start" type="button" class="primary">Start</button><button id="stop" type="button">Stop</button></div>
+    </footer>
+  </main>
+  <script src="renderer.js"></script>
+</body>
+</html>

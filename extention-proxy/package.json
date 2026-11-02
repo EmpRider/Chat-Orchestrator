@@ -1,0 +1,41 @@
+{
+  "name": "chat-orchestrator-mcp",
+  "version": "0.1.1",
+  "private": true,
+  "type": "module",
+  "description": "MCP server that lets an orchestrator chat (Claude/ChatGPT) control worker chat tabs through a browser extension.",
+  "main": "desktop/main.mjs",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test/smoke.mjs && node --test test/desktop-config.test.mjs test/ngrok-diagnostics.test.mjs test/server-lifecycle.test.mjs test/gateway.test.mjs test/renderer.test.mjs",
+    "desktop": "electron .",
+    "dist:win": "electron-builder --win portable"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.17.0",
+    "express": "^4.21.0",
+    "ws": "^8.18.0",
+    "zod": "^3.25.0"
+  },
+  "build": {
+    "appId": "com.empirerider.chat-orchestrator",
+    "productName": "Chat Orchestrator",
+    "asar": true,
+    "files": [
+      "desktop/**/*",
+      "server.js",
+      "package.json",
+      "node_modules/**/*"
+    ],
+    "win": {
+      "target": "portable"
+    }
+  },
+  "devDependencies": {
+    "electron": "^45.2.1",
+    "electron-builder": "^26.18.0"
+  }
+}

@@ -1,0 +1,198 @@
+name: Build and release
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  build:
+    name: Test and package Windows app and extension
+    runs-on: windows-2022
+    timeout-minutes: 40
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+      source_sha: ${{ steps.metadata.outputs.source_sha }}
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Validate source versions and extension
+        id: metadata
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $package = Get-Content 'extention-proxy/package.json' -Raw | ConvertFrom-Json
+          $lock = Get-Content 'extention-proxy/package-lock.json' -Raw | ConvertFrom-Json -AsHashtable
+          $manifest = Get-Content 'extention/manifest.json' -Raw | ConvertFrom-Json
+          $version = [string]$package.version
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw 'Invalid application version.' }
+          if ($version -ne [string]$lock['version'] -or $version -ne [string]$lock['packages']['']['version'] -or $version -ne [string]$manifest.version) {
+            throw 'Application, lockfile, and extension versions must match.'
+          }
+          if ($env:GITHUB_REF -like 'refs/tags/*' -and $env:GITHUB_REF_NAME -ne "v$version") {
+            throw 'Tag does not match the application version.'
+          }
+          $expected = @('background.js', 'content.js', 'manifest.json', 'popup.html', 'popup.js')
+          $actual = @(Get-ChildItem 'extention' -File | ForEach-Object { $_.Name } | Sort-Object)
+          if (@(Compare-Object ($expected | Sort-Object) $actual).Count -ne 0) {
+            throw "Unexpected extension file inventory: $($actual -join ', ')"
+          }
+          foreach ($file in @('background.js', 'content.js', 'popup.js')) {
+            node --check "extention/$file"
+            if ($LASTEXITCODE -ne 0) { throw "JavaScript syntax error in $file" }
+          }
+          foreach ($ref in @('background.service_worker', 'action.default_popup')) {
+            if ($ref -eq 'background.service_worker' -and $manifest.background.service_worker -ne 'background.js') {
+              throw 'Invalid service-worker reference.'
+            }
+            if ($ref -eq 'action.default_popup' -and $manifest.action.default_popup -ne 'popup.html') {
+              throw 'Invalid popup reference.'
+            }
+          }
+          $sha = (git rev-parse HEAD).Trim()
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "source_sha=$sha" >> $env:GITHUB_OUTPUT
+      - name: Install locked dependencies
+        working-directory: extention-proxy
+        run: npm ci
+      - name: Run test suite
+        working-directory: extention-proxy
+        run: npm test
+      - name: Build portable Windows x64 application
+        working-directory: extention-proxy
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: npm run dist:win -- --x64 --publish never
+      - name: Package and verify release assets
+        env:
+          VERSION: ${{ steps.metadata.outputs.version }}
+          SOURCE_SHA: ${{ steps.metadata.outputs.source_sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Add-Type -AssemblyName System.IO.Compression
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $folder = New-Item -ItemType Directory -Path 'release-assets' -Force
+          $exeName = "Chat-Orchestrator-$env:VERSION-windows-x64-portable.exe"
+          $zipName = "Chat-Orchestrator-$env:VERSION-extension.zip"
+          $exeFiles = @(Get-ChildItem 'extention-proxy/dist' -Filter '*.exe' -File)
+          if ($exeFiles.Count -ne 1 -or $exeFiles[0].Length -lt 1000000) {
+            throw 'Expected exactly one nonempty portable Windows executable.'
+          }
+          Copy-Item $exeFiles[0].FullName (Join-Path $folder.FullName $exeName)
+          $zipPath = Join-Path $folder.FullName $zipName
+          git archive --format=zip "--output=$zipPath" HEAD:extention
+          if ($LASTEXITCODE -ne 0) { throw 'git archive failed.' }
+          $zip = [IO.Compression.ZipFile]::OpenRead($zipPath)
+          try {
+            $expected = @('background.js', 'content.js', 'manifest.json', 'popup.html', 'popup.js')
+            $actual = @($zip.Entries | ForEach-Object { $_.FullName } | Sort-Object)
+            if (@(Compare-Object ($expected | Sort-Object) $actual).Count -ne 0) {
+              throw "Unexpected extension ZIP contents: $($actual -join ', ')"
+            }
+            foreach ($entry in $zip.Entries) {
+              if ($entry.Length -eq 0) { throw "Empty extension asset: $($entry.FullName)" }
+            }
+          } finally {
+            $zip.Dispose()
+          }
+          $info = [ordered]@{
+            name = 'Chat Orchestrator'
+            version = $env:VERSION
+            source_commit = $env:SOURCE_SHA
+            release_tag = "v$env:VERSION"
+            architecture = 'windows-x64'
+            extension_format = 'chrome-mv3-unpacked-zip'
+          }
+          $info | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $folder.FullName 'build-info.json') -Encoding utf8
+          $checksumPaths = @($exeName, $zipName, 'build-info.json')
+          $checksums = foreach ($name in $checksumPaths) {
+            $hash = (Get-FileHash (Join-Path $folder.FullName $name) -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $name"
+          }
+          [IO.File]::WriteAllLines((Join-Path $folder.FullName 'SHA256SUMS'), [string[]]$checksums, [Text.Encoding]::ASCII)
+          Get-ChildItem $folder.FullName -File | Select-Object Name, Length
+      - name: Upload release package
+        id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-assets-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-assets/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  release:
+    name: Publish verified GitHub Release
+    needs: build
+    if: >-
+      github.repository == 'EmpRider/Chat-Orchestrator' &&
+      github.event_name == 'push' &&
+      startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download assets from this exact build run
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact_id }}
+          path: release-assets
+      - name: Verify checksums, create draft, verify uploaded assets, publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.build.outputs.version }}
+          SOURCE_SHA: ${{ needs.build.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$TAG" == "v$VERSION" ]] || { echo 'Version/tag mismatch'; exit 1; }
+          cd release-assets
+          sha256sum --check SHA256SUMS
+          [[ "$(jq -r '.source_commit' build-info.json)" == "$SOURCE_SHA" ]] || { echo 'Manifest/source mismatch'; exit 1; }
+          [[ "$(jq -r '.version' build-info.json)" == "$VERSION" ]] || { echo 'Manifest/version mismatch'; exit 1; }
+          remote_sha="$(gh api "repos/$GH_REPO/commits/$TAG" --jq '.sha')"
+          [[ "$remote_sha" == "$SOURCE_SHA" ]] || { echo 'Tag/source mismatch'; exit 1; }
+          relation="$(gh api "repos/$GH_REPO/compare/$SOURCE_SHA...main" --jq '.status')"
+          [[ "$relation" == 'identical' || "$relation" == 'ahead' ]] || { echo 'Tag commit is not reachable from main'; exit 1; }
+          if gh release view "$TAG" --json isDraft --jq '.isDraft' > existing-draft.txt 2>/dev/null; then
+            [[ "$(cat existing-draft.txt)" == 'true' ]] || { echo 'Existing published release will not be overwritten'; exit 1; }
+          else
+            gh release create "$TAG" --verify-tag --draft --title "Chat Orchestrator $VERSION" --notes "Windows x64 portable desktop app and Chrome MV3 extension. Install ngrok CLI separately, then configure a dedicated domain and authtoken in the desktop UI. The Windows executable is unsigned. See README.md and extention-proxy/DESKTOP.md in the source repository."
+          fi
+          rm -f existing-draft.txt
+          gh release upload "$TAG" \
+            "Chat-Orchestrator-$VERSION-windows-x64-portable.exe" \
+            "Chat-Orchestrator-$VERSION-extension.zip" \
+            build-info.json SHA256SUMS --clobber
+          mkdir verify
+          gh release download "$TAG" --dir verify
+          (
+            cd verify
+            sha256sum --check SHA256SUMS
+            [[ "$(jq -r '.source_commit' build-info.json)" == "$SOURCE_SHA" ]] || exit 1
+          )
+          gh release edit "$TAG" --draft=false --latest
+          echo "Published verified release $TAG from $SOURCE_SHA"

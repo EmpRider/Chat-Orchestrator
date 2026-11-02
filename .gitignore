@@ -1,0 +1,26 @@
+# Local workspace state and diagnostics
+.serena/
+test-output/
+*.log
+*.tmp
+
+# Authentication and machine-specific settings
+.token
+**/.token
+.env
+.env.*
+!.env.example
+**/ngrok-auth.bin
+**/bridge.token
+
+# Installed dependencies and generated packages
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+*.exe
+*.zip
+
+# OS metadata
+.DS_Store
+Thumbs.db
