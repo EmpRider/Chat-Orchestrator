@@ -7,7 +7,7 @@
   "main": "desktop/main.mjs",
   "scripts": {
     "start": "node server.js",
-    "test": "node test/smoke.mjs && node --test test/desktop-config.test.mjs test/ngrok-diagnostics.test.mjs test/server-lifecycle.test.mjs test/gateway.test.mjs test/renderer.test.mjs",
+    "test": "node test/smoke.mjs && node --test test/desktop-config.test.mjs test/ngrok-diagnostics.test.mjs test/server-lifecycle.test.mjs test/gateway.test.mjs test/renderer.test.mjs test/read-chat-extraction.test.mjs",
     "desktop": "electron .",
     "dist:win": "electron-builder --win portable"
   },
