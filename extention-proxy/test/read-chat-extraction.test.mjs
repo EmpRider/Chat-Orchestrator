@@ -71,7 +71,7 @@ function element(tag, attributes = {}, children = [], text = '') {
   return node;
 }
 
-function loadReadChat(hostname, turns) {
+function loadReadChat(hostname, turns, documentParent = false) {
   const root = element('main', {}, turns);
   const document = {
     title: 'Fixture',
@@ -79,6 +79,7 @@ function loadReadChat(hostname, turns) {
       return [...walk(root)].filter((node) => matchesGroup(node, selectors));
     },
   };
+  if (documentParent) root.parentNode = document;
   let onMessage;
   const chrome = {
     runtime: {
@@ -242,6 +243,18 @@ test('legacy ChatGPT conversation-turn markdown without role attributes remains 
   });
 });
 
+test('fallback markdown reaches a Document ancestor without getAttribute', () => {
+  const readChat = loadReadChat('chatgpt.com', [
+    element('div', { 'data-testid': 'conversation-turn-1' }, [
+      element('div', { class: 'markdown' }, [], 'A1'),
+    ]),
+  ], true);
+  assert.deepEqual(readChat(), {
+    ok: true, site: 'chatgpt', title: 'Fixture', message_count: 1,
+    transcript: 'Assistant: A1',
+  });
+});
+
 test('broad legacy role ancestor does not collapse two sibling li turns', () => {
   const readChat = loadReadChat('chatgpt.com', [
     element('div', { 'data-message-author-role': 'user' }, [
@@ -285,6 +298,49 @@ test('explicit outer li user role wins over a nested assistant article', () => {
     ok: true, site: 'chatgpt', title: 'Fixture', message_count: 1,
     transcript: 'User: U1',
   });
+});
+
+test('unknown li role blocks nested legacy markdown assistant fallback', () => {
+  const readChat = loadReadChat('chatgpt.com', [
+    element('li', { 'data-message-role': 'tool' }, [
+      element('div', { 'data-testid': 'conversation-turn-3' }, [
+        element('div', { class: 'markdown' }, [], 'TOOL_OUTPUT'),
+      ]),
+    ]),
+  ]);
+  assert.deepEqual(readChat(), {
+    ok: true, site: 'chatgpt', title: 'Fixture', message_count: 0,
+    transcript: '',
+  });
+});
+
+test('tool li containing an assistant article must not leak tool output as an assistant message', () => {
+  const readChat = loadReadChat('chatgpt.com', [
+    element('li', { 'data-message-role': 'tool' }, [
+      element('article', { 'data-turn': 'assistant' }, [], 'TOOL_OUTPUT'),
+    ]),
+  ]);
+  assert.deepEqual(readChat(), {
+    ok: true, site: 'chatgpt', title: 'Fixture', message_count: 0,
+    transcript: '',
+  });
+});
+
+test('sibling markdown blocks in one role-free legacy turn are one assistant message', () => {
+  const readChat = loadReadChat('chatgpt.com', [
+    element('div', { 'data-testid': 'conversation-turn-5' }, [
+      element('div', { class: 'markdown' }, [], 'P1'),
+      element('div', { class: 'markdown' }, [], 'P2'),
+    ]),
+  ]);
+  // One logical turn: join its separate markdown blocks with a newline in DOM order.
+  assert.deepEqual(readChat(), {
+    ok: true, site: 'chatgpt', title: 'Fixture', message_count: 1,
+    transcript: 'Assistant: P1\nP2',
+  });
+  assert.deepEqual([readChat(1).message_count, readChat(1).transcript], [
+    1, 'Assistant: P1\nP2',
+  ]);
 });
 
 test('Claude extraction remains separate and unchanged', () => {
