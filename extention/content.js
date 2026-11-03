@@ -250,13 +250,24 @@
         n.getAttribute('data-message-author-role') ||
         n.getAttribute('data-turn') || ''
       ).trim().toLowerCase();
+      const hasNonChatRoleAncestor = (n) => {
+        for (let p = n.parentNode; p; p = p.parentNode) {
+          if (typeof p.getAttribute !== 'function') continue;
+          if (['data-message-role', 'data-message-author-role', 'data-turn']
+            .some((attr) => p.getAttribute(attr) !== null) &&
+            roleOf(p) !== 'user' && roleOf(p) !== 'assistant') return true;
+        }
+        return false;
+      };
       const fallbackSel = '[data-testid^="conversation-turn-"] .markdown';
       const matches = [...document.querySelectorAll(
         `li[data-message-role], [data-message-author-role], article[data-turn], ${fallbackSel}`
       )];
-      const explicit = matches.filter((n) => roleOf(n) === 'user' || roleOf(n) === 'assistant');
+      const explicit = matches.filter((n) =>
+        (roleOf(n) === 'user' || roleOf(n) === 'assistant') && !hasNonChatRoleAncestor(n));
       const candidates = matches.filter((n) => explicit.includes(n) ||
-        (n.matches(fallbackSel) && !roleOf(n) && !explicit.some((o) => o.contains(n))));
+        (n.matches(fallbackSel) && !roleOf(n) && !hasNonChatRoleAncestor(n) &&
+          !explicit.some((o) => o.contains(n))));
       // An explicit li turn owns its role, even inside a legacy role wrapper.
       const turns = candidates.filter((n) =>
         !candidates.some((child) => child !== n && n.contains(child) && child.matches('li[data-message-role]'))
@@ -271,11 +282,32 @@
       const nodes = singleTurns.filter((n) =>
         !singleTurns.some((other) => other !== n && other.contains(n))
       );
-      msgs = nodes.map((n) => {
+      // Role-free legacy turns can contain several sibling Markdown blocks.
+      // Keep them as one logical assistant message before applying lastN.
+      const fallbackGroups = new Map();
+      msgs = [];
+      for (const n of nodes) {
         const body = n.querySelector('[data-user-message-copy]') ||
           n.querySelector('[data-assistant-markdown]') || n;
-        return { role: roleOf(n) || 'assistant', text: (body.textContent || '').trim() };
-      }).filter((m) => m.text);
+        const text = (body.textContent || '').trim();
+        if (!text) continue;
+        if (!roleOf(n) && n.matches(fallbackSel)) {
+          let turn = n.parentNode;
+          while (turn && (typeof turn.matches !== 'function' ||
+            !turn.matches('[data-testid^="conversation-turn-"]'))) turn = turn.parentNode;
+          if (turn) {
+            const group = fallbackGroups.get(turn);
+            if (group) group.text += `\n${text}`;
+            else {
+              const message = { role: 'assistant', text };
+              fallbackGroups.set(turn, message);
+              msgs.push(message);
+            }
+            continue;
+          }
+        }
+        msgs.push({ role: roleOf(n) || 'assistant', text });
+      }
     } else {
       const userSel = A.user.join(',');
       const nodes = all([...A.user, ...A.assistant]);
