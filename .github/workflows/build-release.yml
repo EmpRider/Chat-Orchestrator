@@ -114,11 +114,11 @@ jobs:
           try {
             $expected = @(git ls-tree -r --name-only HEAD:extention | Where-Object { $_ } | Sort-Object)
             if ($LASTEXITCODE -ne 0) { throw 'Could not enumerate committed extension assets.' }
-            $actual = @($zip.Entries | ForEach-Object { $_.FullName } | Sort-Object)
+            $actual = @($zip.Entries | Where-Object { -not $_.FullName.EndsWith('/') } | ForEach-Object { $_.FullName } | Sort-Object)
             if (@(Compare-Object ($expected | Sort-Object) $actual).Count -ne 0) {
               throw "Unexpected extension ZIP contents: $($actual -join ', ')"
             }
-            foreach ($entry in $zip.Entries) {
+            foreach ($entry in $zip.Entries | Where-Object { -not $_.FullName.EndsWith('/') }) {
               if ($entry.Length -eq 0) { throw "Empty extension asset: $($entry.FullName)" }
             }
           } finally {
