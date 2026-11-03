@@ -1,10 +1,15 @@
 {
   "manifest_version": 3,
   "name": "Chat Orchestrator Bridge",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Lets an orchestrator chat (Claude/ChatGPT) spawn and talk to worker chat tabs through a local MCP server.",
   "minimum_chrome_version": "116",
-  "permissions": ["tabs", "storage", "alarms", "scripting"],
+  "permissions": [
+    "tabs",
+    "storage",
+    "alarms",
+    "scripting"
+  ],
   "host_permissions": [
     "https://claude.ai/*",
     "https://chatgpt.com/*",
@@ -16,29 +21,47 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://chatgpt.com/*"],
-      "js": ["reference-exporter/adapters/chatgpt/hook-main.js"],
+      "matches": [
+        "https://chatgpt.com/*"
+      ],
+      "js": [
+        "reference-exporter/adapters/chatgpt/hook-main.js"
+      ],
       "run_at": "document_start",
       "world": "MAIN"
     },
     {
-      "matches": ["https://chatgpt.com/*"],
-      "js": ["reference-exporter/adapters/chatgpt/hook-iso.js"],
+      "matches": [
+        "https://chatgpt.com/*"
+      ],
+      "js": [
+        "reference-exporter/adapters/chatgpt/hook-iso.js"
+      ],
       "run_at": "document_start"
     },
     {
-      "matches": ["https://gemini.google.com/*"],
-      "js": ["reference-exporter/adapters/gemini/hook-main.js"],
+      "matches": [
+        "https://gemini.google.com/*"
+      ],
+      "js": [
+        "reference-exporter/adapters/gemini/hook-main.js"
+      ],
       "run_at": "document_start",
       "world": "MAIN"
     },
     {
-      "matches": ["https://gemini.google.com/*"],
-      "js": ["reference-exporter/adapters/gemini/hook-iso.js"],
+      "matches": [
+        "https://gemini.google.com/*"
+      ],
+      "js": [
+        "reference-exporter/adapters/gemini/hook-iso.js"
+      ],
       "run_at": "document_start"
     },
     {
-      "matches": ["https://chatgpt.com/*"],
+      "matches": [
+        "https://chatgpt.com/*"
+      ],
       "js": [
         "reference-exporter/core/utils.js",
         "reference-exporter/adapters/chatgpt/api.js",
@@ -50,7 +73,9 @@
       "run_at": "document_idle"
     },
     {
-      "matches": ["https://claude.ai/*"],
+      "matches": [
+        "https://claude.ai/*"
+      ],
       "js": [
         "reference-exporter/core/utils.js",
         "reference-exporter/adapters/claude/api.js",
@@ -62,7 +87,9 @@
       "run_at": "document_idle"
     },
     {
-      "matches": ["https://gemini.google.com/*"],
+      "matches": [
+        "https://gemini.google.com/*"
+      ],
       "js": [
         "reference-exporter/core/utils.js",
         "reference-exporter/adapters/gemini/api.js",
@@ -73,8 +100,12 @@
       "run_at": "document_idle"
     },
     {
-      "matches": ["https://chat.openai.com/*"],
-      "js": ["content.js"],
+      "matches": [
+        "https://chat.openai.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
       "run_at": "document_idle"
     }
   ],

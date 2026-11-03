@@ -8,6 +8,14 @@ browser extension, which opens/drives worker chat tabs and returns their replies
 [the desktop setup guide](extention-proxy/DESKTOP.md). The desktop app manages its own
 ngrok tunnel and gives you the ChatGPT connector URL.
 
+![Compact black desktop dashboard](docs/dark-ui-preview.png)
+
+The Windows desktop app includes a compact dark interface and a system tray
+icon. **Minimize to system tray when closing** is checked by default: closing
+the window keeps the proxy and ngrok alive. Uncheck it to exit when closing,
+or use **Exit** from the tray context menu at any time. The choice persists
+across restarts. Desktop icon artwork is by [Icons8](https://icons8.com/).
+
 ```
 Orchestrator chat --MCP/HTTPS (tunnel)--> extention-proxy (server.js)
                                               | WebSocket (localhost)

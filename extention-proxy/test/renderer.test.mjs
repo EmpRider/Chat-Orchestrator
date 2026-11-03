@@ -28,6 +28,10 @@ test('status refresh never erases an unsaved ngrok domain while the authtoken fi
   const bridge = {
     status: async () => state,
     onState(callback) { stateListener = callback; },
+    async setMinimizeToTray(enabled) {
+      state.minimizeToTray = enabled;
+      return { ...state };
+    },
     async configureNgrok(domain, authToken) {
       submitted = { domain, authToken };
       return { ...state, domain: `https://${domain}`, ngrokAuthConfigured: true, ngrokPhase: 'starting' };
@@ -53,4 +57,13 @@ test('status refresh never erases an unsaved ngrok domain while the authtoken fi
     authToken: 'test-only-ngrok-authtoken',
   });
   assert.equal(domainInput.value, 'https://unheated-detached-jokester.ngrok-free.dev');
+  assert.equal(element('minimize-to-tray').checked, true, 'default checked');
+  element('minimize-to-tray').checked = false;
+  await element('minimize-to-tray').dispatch('change');
+  assert.equal(state.minimizeToTray, false);
+  stateListener({ ...state, phase: 'running' });
+  assert.equal(element('minimize-to-tray').checked, false, 'poll updates preserve preference');
+  element('minimize-to-tray').checked = true;
+  await element('minimize-to-tray').dispatch('change');
+  assert.equal(state.minimizeToTray, true);
 });

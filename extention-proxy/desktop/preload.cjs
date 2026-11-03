@@ -2,6 +2,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('bridge', Object.freeze({
   status: () => ipcRenderer.invoke('bridge:status'),
+  setMinimizeToTray: (enabled) => ipcRenderer.invoke('bridge:setMinimizeToTray', enabled),
   showToken: () => ipcRenderer.invoke('bridge:showToken'),
   copyToken: () => ipcRenderer.invoke('bridge:copyToken'),
   copyUrl: () => ipcRenderer.invoke('bridge:copyUrl'),

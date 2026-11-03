@@ -8,43 +8,94 @@
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
-  <main>
-    <header>
-      <div><span class="eyebrow">LOCAL MCP DESKTOP</span><h1>Chat Orchestrator</h1><p>Control your browser-worker bridge from one place.</p></div>
+  <main class="app-shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark"><img src="assets/app.png" width="42" height="42" alt="" /></div>
+        <div>
+          <div class="eyebrow">LOCAL PROXY / MCP BRIDGE</div>
+          <h1>Chat Orchestrator</h1>
+          <p>One secure bridge. Every conversation.</p>
+        </div>
+      </div>
       <span id="overall" class="pill muted">Starting…</span>
     </header>
 
     <section class="status-grid" aria-label="Connection status">
-      <article class="status-card"><div class="card-title"><span class="dot" id="server-dot"></span> MCP server</div><strong id="server-state">Starting</strong><small>127.0.0.1:8787</small></article>
-      <article class="status-card"><div class="card-title"><span class="dot" id="extension-dot"></span> Extension</div><strong id="extension-state">Disconnected</strong><small>Local WebSocket</small></article>
-      <article class="status-card"><div class="card-title"><span class="dot" id="ngrok-dot"></span> Ngrok tunnel</div><strong id="ngrok-state">Not configured</strong><small id="ngrok-detail">Dedicated domain</small></article>
+      <article class="status-card">
+        <div class="card-title"><span class="status-icon"><img src="assets/server.png" alt="" /></span><span>MCP SERVER</span><span class="dot" id="server-dot"></span></div>
+        <strong id="server-state">Starting</strong><small>localhost:8787</small>
+      </article>
+      <article class="status-card">
+        <div class="card-title"><span class="status-icon"><img src="assets/puzzle.png" alt="" /></span><span>EXTENSION</span><span class="dot" id="extension-dot"></span></div>
+        <strong id="extension-state">Disconnected</strong><small>Browser WebSocket</small>
+      </article>
+      <article class="status-card">
+        <div class="card-title"><span class="status-icon"><img src="assets/cloud.png" alt="" /></span><span>NGROK TUNNEL</span><span class="dot" id="ngrok-dot"></span></div>
+        <strong id="ngrok-state">Not configured</strong><small id="ngrok-detail">Dedicated domain</small>
+      </article>
     </section>
 
-    <section class="panel">
-      <div class="section-heading"><h2>Bridge token</h2><span class="hint">For ChatGPT and the browser extension</span></div>
-      <div class="input-row"><code id="token-value">••••••••••••••••••••••••••••</code><button id="toggle-token" type="button">Reveal</button><button id="copy-token" type="button">Copy</button></div>
-      <button id="import-token" type="button" class="link-button">Import existing .token file</button>
+    <div class="workspace-grid">
+      <div class="column-stack">
+        <section class="panel">
+          <div class="section-heading">
+            <h2><img src="assets/key.png" alt="" /> Bridge credentials</h2>
+            <span class="hint">PRIVATE</span>
+          </div>
+          <label for="token-value">Bridge token</label>
+          <div class="input-row">
+            <code id="token-value">••••••••••••••••••••••••••••</code>
+            <button id="toggle-token" class="icon-button" type="button" aria-label="Reveal token" title="Reveal token"><img id="token-visibility-icon" src="assets/visible.png" alt="" /></button>
+            <button id="copy-token" class="icon-button" type="button" aria-label="Copy bridge token" title="Copy bridge token"><img src="assets/copy.png" alt="" /></button>
+          </div>
+          <button id="import-token" type="button" class="link-button"><img src="assets/upload.png" alt="" /> Import existing token</button>
+        </section>
+
+        <section class="panel connector-panel">
+          <div class="section-heading">
+            <h2><img src="assets/link.png" alt="" /> Connector URL</h2>
+            <span class="hint">CHATGPT MCP</span>
+          </div>
+          <div class="input-row">
+            <code id="connector-url">Enter your domain above</code>
+            <button id="copy-url" class="icon-button" type="button" aria-label="Copy connector URL" title="Copy connector URL"><img src="assets/copy.png" alt="" /></button>
+          </div>
+          <p class="help">Share this URL only with your own connector. Its access token stays masked here.</p>
+        </section>
+      </div>
+
+      <section class="panel ngrok-panel">
+        <div class="section-heading">
+          <h2><img src="assets/network.png" alt="" /> Tunnel settings</h2>
+          <span class="hint">NGROK</span>
+        </div>
+        <label for="domain">Dedicated HTTPS domain</label>
+        <input id="domain" type="text" spellcheck="false" autocomplete="off" placeholder="your-domain.ngrok-free.dev" />
+        <label for="ngrok-token">Authtoken <span id="ngrok-token-status" class="hint">(required)</span></label>
+        <input id="ngrok-token" type="password" spellcheck="false" autocomplete="new-password" placeholder="Enter your ngrok authtoken" />
+        <p class="help">Credentials are encrypted locally. Leave the token blank to reuse the saved value. Your AgentBridge tunnel is unaffected.</p>
+        <button id="configure-ngrok" type="button" class="primary wide"><img src="assets/checkmark.png" alt="" /> Save &amp; connect</button>
+      </section>
+    </div>
+
+    <section class="panel behavior-panel" aria-label="Window behavior">
+      <div class="behavior-heading"><span class="behavior-icon"><img src="assets/minimize-window.png" alt="" /></span><div><h2>Background operation</h2><p>Keep your connections running when this window is closed.</p></div></div>
+      <label class="tray-toggle" for="minimize-to-tray">
+        <input id="minimize-to-tray" type="checkbox" checked />
+        <span>Minimize to system tray when closing</span>
+      </label>
     </section>
 
-    <section class="panel">
-      <div class="section-heading"><h2>Ngrok connection</h2><span class="hint">Separate domain for Chat Orchestrator</span></div>
-      <label for="domain">Dedicated ngrok HTTPS domain</label>
-      <div class="input-row"><input id="domain" type="text" spellcheck="false" autocomplete="off" placeholder="your-new-domain.ngrok-free.dev" /></div>
-      <label for="ngrok-token">Ngrok authtoken <span id="ngrok-token-status" class="hint">Not saved</span></label>
-      <div class="input-row"><input id="ngrok-token" type="password" spellcheck="false" autocomplete="new-password" placeholder="Paste your ngrok authtoken" /><button id="configure-ngrok" type="button" class="primary">Save &amp; Connect</button></div>
-      <p class="help">Find your authtoken at <code>dashboard.ngrok.com/get-started/your-authtoken</code>. Leave the field blank to keep a previously saved token.</p>
-    </section>
-
-    <section class="panel">
-      <div class="section-heading"><h2>ChatGPT connector</h2><span class="hint">Generated from your dedicated domain</span></div>
-      <label>Connector URL</label>
-      <div class="input-row"><code id="connector-url">Enter your domain above</code><button id="copy-url" type="button">Copy URL</button></div>
-      <p class="help">Only the bridge token is included in the ChatGPT URL. Your ngrok authtoken is encrypted locally and never included in this URL. Your existing AgentBridge tunnel stays unchanged. Keep this app running while using the connector.</p>
-    </section>
-
-    <footer>
-      <span id="message" role="status" aria-live="polite">Ready to configure.</span>
-      <div class="actions"><button id="start" type="button" class="primary">Start</button><button id="stop" type="button">Stop</button></div>
+    <footer class="bottom-bar">
+      <div class="footer-left">
+        <span id="message" role="status" aria-live="polite">Ready to configure.</span>
+        <a class="credits" href="https://icons8.com/" target="_blank" rel="noopener noreferrer">Icons by Icons8</a>
+      </div>
+      <div class="actions">
+        <button id="stop" type="button" class="secondary"><img src="assets/shutdown.png" alt="" /> Stop</button>
+        <button id="start" type="button" class="primary"><img src="assets/play.png" alt="" /> Start proxy</button>
+      </div>
     </footer>
   </main>
   <script src="renderer.js"></script>

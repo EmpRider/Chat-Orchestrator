@@ -1,13 +1,13 @@
 {
   "name": "chat-orchestrator-mcp",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "type": "module",
   "description": "MCP server that lets an orchestrator chat (Claude/ChatGPT) control worker chat tabs through a browser extension.",
   "main": "desktop/main.mjs",
   "scripts": {
     "start": "node server.js",
-    "test": "node test/smoke.mjs && node --test test/desktop-config.test.mjs test/ngrok-diagnostics.test.mjs test/server-lifecycle.test.mjs test/gateway.test.mjs test/renderer.test.mjs test/read-chat-extraction.test.mjs test/read-chat-structured.test.mjs test/read-chat-mcp-e2e.test.mjs",
+    "test": "node test/smoke.mjs && node --test test/desktop-config.test.mjs test/ngrok-diagnostics.test.mjs test/server-lifecycle.test.mjs test/gateway.test.mjs test/renderer.test.mjs test/tray-lifecycle.test.mjs test/ui-assets.test.mjs test/read-chat-extraction.test.mjs test/read-chat-structured.test.mjs test/read-chat-mcp-e2e.test.mjs",
     "desktop": "electron .",
     "dist:win": "electron-builder --win portable"
   },
@@ -31,7 +31,8 @@
       "node_modules/**/*"
     ],
     "win": {
-      "target": "portable"
+      "target": "portable",
+      "icon": "desktop/assets/app.ico"
     }
   },
   "devDependencies": {

@@ -1,10 +1,11 @@
-import { app, BrowserWindow, clipboard, dialog, ipcMain, safeStorage, utilityProcess } from 'electron';
+import { app, BrowserWindow, Menu, Tray, clipboard, dialog, ipcMain, nativeImage, safeStorage, shell, utilityProcess } from 'electron';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { connectorUrl, ensureDesktopToken, ISOLATED_NGROK_CONFIG, normalizeNgrokAuthtoken, normalizeNgrokDomain } from './config.mjs';
 import { createNgrokLogReader } from './ngrok-diagnostics.mjs';
+import { createDesktopTray, installWindowCloseBehavior, minimizeToTrayPreference } from './tray-lifecycle.mjs';
 
 // Set CHAT_ORCH_DIAGNOSTICS=1 for lifecycle messages (never credentials).
 const debug = (message) => {
@@ -12,8 +13,14 @@ const debug = (message) => {
 };
 
 const appDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const PORT = 8787;
+// Test mode uses an isolated port; normal application behavior stays on 8787.
+const E2E_MODE = !app.isPackaged && process.env.CHAT_ORCH_E2E_MODE === '1';
+const PORT = E2E_MODE ? Number(process.env.CHAT_ORCH_E2E_PORT || 8897) : 8787;
 let window;
+let tray;
+let minimizeToTray = true;
+let exitStarted = false;
+let exitReady = false;
 let child;
 let ngrokChild;
 let ngrokGeneration = 0;
@@ -28,6 +35,7 @@ let extensionConnected = false;
 let stopping = false;
 
 app.setName('Chat Orchestrator');
+if (process.platform === 'win32') app.setAppUserModelId('com.empirerider.chat-orchestrator');
 const hasInstanceLock = app.requestSingleInstanceLock();
 debug(`single-instance lock=${hasInstanceLock}`);
 if (!hasInstanceLock) app.quit();
@@ -56,6 +64,8 @@ function state() {
     domain,
     port: PORT,
     routeVerified,
+    minimizeToTray,
+    trayAvailable: Boolean(tray && !tray.isDestroyed()),
     localWebSocketUrl: `ws://127.0.0.1:${PORT}/bridge`,
     publicPath: '/mcp',
   };
@@ -69,14 +79,16 @@ function loadSettings() {
   try {
     const saved = JSON.parse(fs.readFileSync(settingsFile(), 'utf8'));
     domain = saved.domain ? normalizeNgrokDomain(saved.domain) : '';
+    minimizeToTray = minimizeToTrayPreference(saved.minimizeToTray);
   } catch {
     domain = '';
+    minimizeToTray = true;
   }
 }
 
 function writeSettings() {
   fs.mkdirSync(dataDir(), { recursive: true });
-  fs.writeFileSync(settingsFile(), JSON.stringify({ domain }, null, 2), 'utf8');
+  fs.writeFileSync(settingsFile(), JSON.stringify({ domain, minimizeToTray }, null, 2), 'utf8');
 }
 
 async function saveNgrokAuth(value) {
@@ -339,6 +351,14 @@ function requireTrustedWindow(event) {
 
 function registerActions() {
   ipcMain.handle('bridge:status', (event) => { requireTrustedWindow(event); return state(); });
+  ipcMain.handle('bridge:setMinimizeToTray', (event, enabled) => {
+    requireTrustedWindow(event);
+    if (typeof enabled !== 'boolean') throw new Error('Invalid tray preference');
+    minimizeToTray = enabled;
+    writeSettings();
+    publishState();
+    return state();
+  });
   ipcMain.handle('bridge:showToken', (event) => { requireTrustedWindow(event); return token; });
   ipcMain.handle('bridge:copyToken', (event) => {
     requireTrustedWindow(event);
@@ -397,11 +417,12 @@ function createWindow() {
   debug('creating window');
   window = new BrowserWindow({
     title: 'Chat Orchestrator',
-    width: 700,
-    height: 690,
-    minWidth: 570,
+    width: 780,
+    height: 710,
+    minWidth: 650,
     minHeight: 600,
-    backgroundColor: '#101522',
+    icon: path.join(appDir, 'desktop', 'assets', 'app.ico'),
+    backgroundColor: '#070708',
     show: false,
     autoHideMenuBar: true,
     webPreferences: {
@@ -411,12 +432,66 @@ function createWindow() {
       nodeIntegration: false,
     },
   });
-  window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  window.webContents.setWindowOpenHandler(({ url }) => {
+    if (url === 'https://icons8.com/') void shell.openExternal(url);
+    return { action: 'deny' };
+  });
   window.webContents.on('will-navigate', (event) => event.preventDefault());
   window.loadFile(path.join(appDir, 'desktop', 'index.html'));
   window.webContents.on('render-process-gone', (_event, details) => debug(`renderer gone: ${details.reason}`));
+  installWindowCloseBehavior(window, {
+    shouldMinimize: () => minimizeToTray,
+    trayAvailable: () => Boolean(tray && !tray.isDestroyed()),
+    isExiting: () => exitStarted || exitReady,
+  });
   window.on('closed', () => debug('window closed'));
   window.once('ready-to-show', () => window.show());
+}
+
+function restoreWindow() {
+  if (!window || window.isDestroyed()) return;
+  if (window.isMinimized()) window.restore();
+  window.show();
+  window.focus();
+}
+
+function createTray() {
+  // Tray is created before the browser window so X never hides without a restore path.
+  try {
+    const image = nativeImage.createFromPath(path.join(appDir, 'desktop', 'assets', 'app.ico'));
+    if (image.isEmpty()) throw new Error('Application icon is missing');
+    tray = createDesktopTray({
+      Tray, Menu, icon: image,
+      restore: restoreWindow,
+      exit: () => app.quit(),
+    });
+  } catch (error) {
+    // Without a usable tray, X closes the app rather than leaving it invisible.
+    debug(`tray unavailable: ${error.message}`);
+    tray = null;
+  }
+}
+
+async function shutdownOwnedServices() {
+  if (exitStarted) return;
+  exitStarted = true;
+  try {
+    await Promise.allSettled([stopNgrok(), stopProxy()]);
+  } finally {
+    tray?.destroy();
+    tray = null;
+    exitReady = true;
+    app.quit();
+  }
+}
+
+if (E2E_MODE) {
+  // Main-process only; not packaged and never bridged into the renderer.
+  globalThis.__chatOrchE2E = Object.freeze({
+    getWindow: () => window,
+    getTray: () => tray,
+    state,
+  });
 }
 
 if (hasInstanceLock) {
@@ -431,11 +506,12 @@ if (hasInstanceLock) {
       app.quit();
     });
   }
-  app.on('second-instance', () => { window?.show(); window?.focus(); });
+  app.on('second-instance', restoreWindow);
   app.whenReady().then(() => {
     debug('app ready');
     loadSettings();
     registerActions();
+    createTray();
     createWindow();
     startProxy();
     void startNgrok();
@@ -443,5 +519,13 @@ if (hasInstanceLock) {
     setInterval(pollNgrok, 5000);
   }).catch((error) => debug(`app ready failed: ${error.message}`));
   app.on('window-all-closed', () => { debug('all windows closed'); app.quit(); });
-  app.on('before-quit', () => { debug('before quit'); child?.kill(); ngrokChild?.kill(); });
+  app.on('before-quit', (event) => {
+    if (exitReady) return;
+    event.preventDefault();
+    void shutdownOwnedServices();
+  });
+  app.on('will-quit', () => {
+    child?.kill();
+    ngrokChild?.kill();
+  });
 }

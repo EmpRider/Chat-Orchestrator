@@ -5,7 +5,7 @@ let domainDirty = false;
 
 function notify(message, isError = false) {
   $('message').textContent = message;
-  $('message').style.color = isError ? '#ff9fad' : '#94a8c3';
+  $('message').style.color = isError ? '#ff98a8' : '#a4a4af';
 }
 
 function render(state) {
@@ -29,6 +29,8 @@ function render(state) {
   $('start').disabled = state.phase === 'starting' || state.phase === 'stopping'
     || (state.phase === 'running' && (state.ngrokPhase === 'running' || state.ngrokPhase === 'starting'));
   $('stop').disabled = (state.phase === 'stopped' && state.ngrokPhase === 'stopped') || state.phase === 'stopping' || state.ngrokPhase === 'stopping';
+  $('minimize-to-tray').checked = state.minimizeToTray !== false;
+  $('minimize-to-tray').disabled = state.trayAvailable === false;
   // Health polling updates the dashboard while users edit both fields.
   // Preserve the unsaved hostname even after focus moves to the authtoken.
   if (!domainDirty) $('domain').value = state.domain;
@@ -52,7 +54,9 @@ async function perform(action, successMessage) {
 $('toggle-token').addEventListener('click', () => perform(async () => {
   visibleToken = !visibleToken;
   $('token-value').textContent = visibleToken ? await window.bridge.showToken() : '••••••••••••••••••••••••••••';
-  $('toggle-token').textContent = visibleToken ? 'Hide' : 'Reveal';
+  $('toggle-token').setAttribute('aria-label', visibleToken ? 'Hide token' : 'Reveal token');
+  $('toggle-token').title = visibleToken ? 'Hide token' : 'Reveal token';
+  $('token-visibility-icon').src = visibleToken ? 'assets/hide.png' : 'assets/visible.png';
 }));
 $('copy-token').addEventListener('click', () => perform(() => window.bridge.copyToken(), 'Token copied to clipboard.'));
 $('copy-url').addEventListener('click', () => perform(() => window.bridge.copyUrl(), 'Connector URL copied. Keep it private.'));
@@ -78,14 +82,29 @@ $('import-token').addEventListener('click', () => perform(async () => {
   if (await window.bridge.importToken()) {
     visibleToken = false;
     $('token-value').textContent = '••••••••••••••••••••••••••••';
-    $('toggle-token').textContent = 'Reveal';
+    $('toggle-token').setAttribute('aria-label', 'Reveal token');
+    $('toggle-token').title = 'Reveal token';
+    $('token-visibility-icon').src = 'assets/visible.png';
     notify('Existing bridge token imported. Reconnecting local proxy…');
   }
 }));
+$('minimize-to-tray').addEventListener('change', async () => {
+  const checked = $('minimize-to-tray').checked;
+  try {
+    const saved = await window.bridge.setMinimizeToTray(checked);
+    render(saved);
+    notify(checked ? 'Closing this window will keep the proxy in the tray.' : 'Closing this window will exit and stop the proxy.');
+  } catch (error) {
+    $('minimize-to-tray').checked = currentState?.minimizeToTray !== false;
+    notify(error.message || String(error), true);
+  }
+});
 window.addEventListener('blur', () => {
   visibleToken = false;
   $('token-value').textContent = '••••••••••••••••••••••••••••';
-  $('toggle-token').textContent = 'Reveal';
+  $('toggle-token').setAttribute('aria-label', 'Reveal token');
+  $('toggle-token').title = 'Reveal token';
+  $('token-visibility-icon').src = 'assets/visible.png';
 });
 window.bridge.onState(render);
 perform(async () => render(await window.bridge.status()));
