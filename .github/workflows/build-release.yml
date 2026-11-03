@@ -52,14 +52,22 @@ jobs:
           if ($env:GITHUB_REF -like 'refs/tags/*' -and $env:GITHUB_REF_NAME -ne "v$version") {
             throw 'Tag does not match the application version.'
           }
-          $expected = @('background.js', 'content.js', 'manifest.json', 'popup.html', 'popup.js')
+          $expected = @('background.js', 'content.js', 'manifest.json', 'popup.html', 'popup.js', 'structured-reader.js')
           $actual = @(Get-ChildItem 'extention' -File | ForEach-Object { $_.Name } | Sort-Object)
           if (@(Compare-Object ($expected | Sort-Object) $actual).Count -ne 0) {
             throw "Unexpected extension file inventory: $($actual -join ', ')"
           }
-          foreach ($file in @('background.js', 'content.js', 'popup.js')) {
+          foreach ($file in @('background.js', 'content.js', 'popup.js', 'structured-reader.js')) {
             node --check "extention/$file"
             if ($LASTEXITCODE -ne 0) { throw "JavaScript syntax error in $file" }
+          }
+          foreach ($group in $manifest.content_scripts) {
+            foreach ($file in $group.js) {
+              $target = Join-Path 'extention' $file
+              if (-not (Test-Path -LiteralPath $target -PathType Leaf)) { throw "Missing content script: $file" }
+              node --check $target
+              if ($LASTEXITCODE -ne 0) { throw "JavaScript syntax error in $file" }
+            }
           }
           foreach ($ref in @('background.service_worker', 'action.default_popup')) {
             if ($ref -eq 'background.service_worker' -and $manifest.background.service_worker -ne 'background.js') {
@@ -104,7 +112,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'git archive failed.' }
           $zip = [IO.Compression.ZipFile]::OpenRead($zipPath)
           try {
-            $expected = @('background.js', 'content.js', 'manifest.json', 'popup.html', 'popup.js')
+            $expected = @(git ls-tree -r --name-only HEAD:extention | Where-Object { $_ } | Sort-Object)
+            if ($LASTEXITCODE -ne 0) { throw 'Could not enumerate committed extension assets.' }
             $actual = @($zip.Entries | ForEach-Object { $_.FullName } | Sort-Object)
             if (@(Compare-Object ($expected | Sort-Object) $actual).Count -ne 0) {
               throw "Unexpected extension ZIP contents: $($actual -join ', ')"

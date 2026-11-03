@@ -15,6 +15,8 @@
   const host = location.hostname;
   const site = /(^|\.)claude\.ai$/.test(host)
     ? 'claude'
+    : /(^|\.)gemini\.google\.com$/.test(host)
+    ? 'gemini'
     : /(^|\.)chatgpt\.com$|(^|\.)chat\.openai\.com$/.test(host)
     ? 'chatgpt'
     : null;
@@ -44,6 +46,14 @@
       assistant: ['div[data-is-streaming]', '.font-claude-response', '.font-claude-message'],
       user: ['[data-testid="user-message"]'],
       streamingAttr: '[data-is-streaming="true"]',
+    },
+    gemini: {
+      input: ['div[contenteditable="true"][role="textbox"]', 'div[contenteditable="true"]'],
+      send: ['button[aria-label="Send message"]'],
+      stop: ['button[aria-label*="stop" i]'],
+      assistant: ['message-content .markdown'],
+      user: ['user-query .query-text'],
+      streamingAttr: null,
     },
   };
   const A = CONFIGS[site];
@@ -403,6 +413,37 @@
         }
         break;
       case 'read_chat':
+        if (typeof self !== 'undefined' && self.__chatOrchStructuredReader) {
+          let readTimer;
+          const apiRead = self.__chatOrchStructuredReader.readChat(site, msg.lastN, {
+            includeReasoning: msg.includeReasoning === true,
+            includeAttachments: msg.includeAttachments !== false,
+          });
+          Promise.race([
+            apiRead,
+            new Promise((_, reject) => {
+              readTimer = setTimeout(() => reject(new Error('API read timeout')), 30000);
+            }),
+          ]).then((result) => {
+            sendResponse({ ok: true, ...result });
+          }).catch(() => {
+            // Do not reflect raw API exceptions: paths, query parameters and
+            // token-bearing request details may be present in their messages.
+            try {
+              const fallback = readChat(msg.lastN);
+              if (fallback.message_count > 0) {
+                sendResponse({ ok: true, ...fallback, source: 'dom_fallback' });
+                return;
+              }
+            } catch { /* preserve fail-closed behavior */ }
+            sendResponse({
+              ok: false, site, message_count: 0, transcript: '',
+              error_code: 'EXTRACTION_UNAVAILABLE',
+              error: 'Structured conversation read failed and no DOM messages were found. Refresh the conversation tab.',
+            });
+          }).finally(() => clearTimeout(readTimer));
+          return true; // async chrome.runtime message channel
+        }
         sendResponse({ ok: true, ...readChat(msg.lastN) });
         break;
       case 'diagnose':

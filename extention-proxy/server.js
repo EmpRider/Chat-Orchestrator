@@ -235,7 +235,7 @@ function buildServer() {
     {
       title: 'Read a chat transcript',
       description:
-        'Read the visible conversation of a tab (user and assistant messages). Defaults to the tab marked as orchestrator, otherwise the tab the user is looking at.',
+        'Read the conversation using the site conversation API where available, with DOM fallback. Supports ChatGPT, Claude and Gemini. Defaults to orchestrator/active tab. Reasoning is excluded by default; image and attachment names can be included.',
       inputSchema: {
         tab_id: z
           .number()
@@ -243,6 +243,8 @@ function buildServer() {
           .optional()
           .describe('Tab to read. Omit for the orchestrator/active tab.'),
         last_n: z.number().int().min(1).max(200).optional().describe('Only return the last N messages.'),
+        include_reasoning: z.boolean().optional().describe('Include thinking/tool blocks in the transcript (default false).'),
+        include_attachments: z.boolean().optional().describe('Include image and attachment labels (default true); never downloads file bytes.'),
       },
     },
     forward('read_chat')

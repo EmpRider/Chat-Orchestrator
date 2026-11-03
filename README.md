@@ -68,9 +68,16 @@ the portable EXE, because both use local port `8787`.
 
 ## Verify the pieces
 
-- `cd extention-proxy; npm test` runs an end-to-end smoke test with a fake extension (passes).
-- Popup -> **Diagnose this tab** shows how many elements each DOM selector matches. If a count is
-  `0`, update the selector lists at the top of `extention/content.js`.
+- `cd extention-proxy; npm test` runs MCP smoke tests and synthetic extraction
+  regression tests for ChatGPT, Claude and Gemini. Live site verification is separate.
+- `read_chat` prefers structured conversation data (using the same-site private
+  web APIs adapted from Liksu/llm-chat-exporter-extension), then falls back to
+  visible DOM messages. If both readers fail, it returns an extraction error
+  instead of falsely reporting an empty successful chat.
+- Optional `read_chat` flags: `last_n`, `include_reasoning` (default false),
+  `include_attachments` (default true, returns names/placeholders only).
+- **Do not run the legacy "Diagnose this tab" control on private conversations:**
+  that older diagnostic response can include page text. Use synthetic tests instead.
 
 ## Safety knobs
 
@@ -80,7 +87,11 @@ the portable EXE, because both use local port `8787`.
 
 ## Known limits
 
-- DOM selectors are best-effort and untested against the live sites; expect to tweak them.
-- Replies are read with `innerText`, so code-fence markers are lost.
+- The structured reader depends on private web APIs that may change. ChatGPT
+  and Gemini use browser-local session-token hooks; credentials are not sent to
+  the MCP server. Reload the extension **and** refresh existing conversation tabs
+  so hooks can initialize at document start.
+- Gemini is supported for `read_chat`; automated Gemini worker prompting is not
+  enabled. Legacy DOM-only reads can still lose formatting and older virtualized turns.
 - Automating the web UIs may conflict with each site's terms; keep it to personal use.
 - Anyone with your token and tunnel URL can drive your logged-in chats: keep the token secret.

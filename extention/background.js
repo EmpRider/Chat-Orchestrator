@@ -8,6 +8,7 @@ const TAB_PATTERNS = [
   'https://claude.ai/*',
   'https://chatgpt.com/*',
   'https://chat.openai.com/*',
+  'https://gemini.google.com/*',
 ];
 
 // Sent once, at the top of the first message of every NEW worker chat (spawn_worker).
@@ -47,6 +48,7 @@ const getConfig = async () => ({ ...DEFAULTS, ...(await chrome.storage.local.get
 function siteOfUrl(url = '') {
   if (/^https:\/\/claude\.ai\//.test(url)) return 'claude';
   if (/^https:\/\/(chatgpt\.com|chat\.openai\.com)\//.test(url)) return 'chatgpt';
+  if (/^https:\/\/gemini\.google\.com\//.test(url)) return 'gemini';
   return null;
 }
 
@@ -168,7 +170,33 @@ async function resolveTab(ref) {
 // Tabs opened before the extension was (re)loaded have no live content script.
 // Inject it on demand instead of asking the user to refresh the page.
 async function injectContentScript(tabId) {
-  await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
+  const tab = await chrome.tabs.get(tabId);
+  const site = siteOfUrl(tab.url);
+  const target = { tabId };
+  const base = 'reference-exporter/';
+  if (site === 'chatgpt' && /^https:\/\/chatgpt\.com\//.test(tab.url)) {
+    await chrome.scripting.executeScript({ target, world: 'MAIN', files: [`${base}adapters/chatgpt/hook-main.js`] });
+    await chrome.scripting.executeScript({ target, files: [
+      `${base}adapters/chatgpt/hook-iso.js`, `${base}core/utils.js`,
+      `${base}adapters/chatgpt/api.js`, `${base}adapters/chatgpt/genui.js`,
+      `${base}adapters/chatgpt/normalize.js`, 'structured-reader.js', 'content.js',
+    ] });
+  } else if (site === 'claude') {
+    await chrome.scripting.executeScript({ target, files: [
+      `${base}core/utils.js`, `${base}adapters/claude/api.js`,
+      `${base}adapters/claude/widgets.js`, `${base}adapters/claude/normalize.js`,
+      'structured-reader.js', 'content.js',
+    ] });
+  } else if (site === 'gemini') {
+    await chrome.scripting.executeScript({ target, world: 'MAIN', files: [`${base}adapters/gemini/hook-main.js`] });
+    await chrome.scripting.executeScript({ target, files: [
+      `${base}adapters/gemini/hook-iso.js`, `${base}core/utils.js`,
+      `${base}adapters/gemini/api.js`, `${base}adapters/gemini/normalize.js`,
+      'structured-reader.js', 'content.js',
+    ] });
+  } else {
+    await chrome.scripting.executeScript({ target, files: ['content.js'] });
+  }
 }
 
 async function injectIntoOpenTabs() {
@@ -189,7 +217,7 @@ async function tabMessage(tabId, msg) {
   }
   const tab = await chrome.tabs.get(tabId).catch(() => null);
   if (!tab) throw new Error(`Tab ${tabId} no longer exists (it was closed).`);
-  if (!siteOfUrl(tab.url)) throw new Error(`Tab ${tabId} is not a Claude/ChatGPT page (${tab.url || 'unknown url'}).`);
+  if (!siteOfUrl(tab.url)) throw new Error(`Tab ${tabId} is not a supported chat page.`);
 
   // The script is missing or orphaned: (re)inject it, then retry a few times.
   let injectErr = null;
@@ -303,7 +331,7 @@ async function handleCall(method, p) {
       }
       const tab = await chrome.tabs.get(p.tab_id).catch(() => null);
       const site = siteOfUrl(tab?.url);
-      if (!site) throw new Error(`Tab ${p.tab_id} is not an open Claude/ChatGPT tab.`);
+      if (!site || site === 'gemini') throw new Error(`Tab ${p.tab_id} does not support send_to_tab.`);
       return startTask(p.tab_id, site, p.text, p.wait_seconds || 0, cfg);
     }
 
@@ -317,7 +345,11 @@ async function handleCall(method, p) {
     case 'read_chat': {
       await guard();
       const tabId = await resolveTab(p.tab_id ?? 'orchestrator');
-      return tabMessage(tabId, { cmd: 'read_chat', lastN: p.last_n });
+      return tabMessage(tabId, {
+        cmd: 'read_chat', lastN: p.last_n,
+        includeReasoning: p.include_reasoning,
+        includeAttachments: p.include_attachments,
+      });
     }
 
     case 'close_worker': {

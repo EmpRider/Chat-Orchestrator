@@ -8,18 +8,72 @@
   "host_permissions": [
     "https://claude.ai/*",
     "https://chatgpt.com/*",
-    "https://chat.openai.com/*"
+    "https://chat.openai.com/*",
+    "https://gemini.google.com/*"
   ],
   "background": {
     "service_worker": "background.js"
   },
   "content_scripts": [
     {
-      "matches": [
-        "https://claude.ai/*",
-        "https://chatgpt.com/*",
-        "https://chat.openai.com/*"
+      "matches": ["https://chatgpt.com/*"],
+      "js": ["reference-exporter/adapters/chatgpt/hook-main.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["https://chatgpt.com/*"],
+      "js": ["reference-exporter/adapters/chatgpt/hook-iso.js"],
+      "run_at": "document_start"
+    },
+    {
+      "matches": ["https://gemini.google.com/*"],
+      "js": ["reference-exporter/adapters/gemini/hook-main.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["https://gemini.google.com/*"],
+      "js": ["reference-exporter/adapters/gemini/hook-iso.js"],
+      "run_at": "document_start"
+    },
+    {
+      "matches": ["https://chatgpt.com/*"],
+      "js": [
+        "reference-exporter/core/utils.js",
+        "reference-exporter/adapters/chatgpt/api.js",
+        "reference-exporter/adapters/chatgpt/genui.js",
+        "reference-exporter/adapters/chatgpt/normalize.js",
+        "structured-reader.js",
+        "content.js"
       ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://claude.ai/*"],
+      "js": [
+        "reference-exporter/core/utils.js",
+        "reference-exporter/adapters/claude/api.js",
+        "reference-exporter/adapters/claude/widgets.js",
+        "reference-exporter/adapters/claude/normalize.js",
+        "structured-reader.js",
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://gemini.google.com/*"],
+      "js": [
+        "reference-exporter/core/utils.js",
+        "reference-exporter/adapters/gemini/api.js",
+        "reference-exporter/adapters/gemini/normalize.js",
+        "structured-reader.js",
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://chat.openai.com/*"],
       "js": ["content.js"],
       "run_at": "document_idle"
     }
