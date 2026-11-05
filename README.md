@@ -1,5 +1,28 @@
 # Chat Orchestrator (MCP + browser extension)
 
+## Local 0.1.3 redesigned UI release candidate (November 5, 2026)
+
+This is a **locally built candidate**, not yet a published GitHub Release. It includes a reorganized
+four-page desktop experience (Overview, Connections, Agents & queue, Preferences) and a
+simpler extension popup with direct guidance for the **extension-only** credential.
+
+- Desktop EXE: `extention-proxy/dist/Chat Orchestrator 0.1.3.exe`
+- Browser extension ZIP: `extention-proxy/dist/Chat-Orchestrator-0.1.3-extension.zip`
+
+To update an existing installation, exit the old desktop program using its **system tray > Exit**
+command (window X may only hide it), then run the new portable EXE using the **same profile**.
+Settings and credentials live in the Windows profile data folder, not in the EXE. To update the
+browser extension without losing its extension ID and saved credentials, replace the files in
+its existing unpacked folder, choose **Reload** in Edge/Chrome extensions, then refresh chat
+tabs so document-start hooks are installed. In the extension popup, use **Connections >
+Extension-only credential** from the desktop; the MCP token cannot authorize settings sync.
+
+Local verification: `npm test` (72 passing), isolated real Electron navigation/layout smoke
+(`node test/ui-redesign-runtime.mjs`), and packaged settings WebSocket smoke
+(`node test/packaged-extension-settings-smoke.mjs`). These do **not** mean the separate
+unfinished P0 crash-recovery and final end-to-end release gates are approved.
+
+
 An orchestrator chat (Claude or ChatGPT) calls MCP tools; a local server forwards them to a
 browser extension, which opens/drives worker chat tabs and returns their replies.
 

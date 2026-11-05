@@ -1,31 +1,58 @@
 <!doctype html>
-<html>
-  <head>
-    <meta charset="utf-8" />
-    <title>Chat Orchestrator Connection</title>
-    <style>
-      :root { color-scheme: dark; --ink: #e7e8ed; --line: #34353d; --panel: #1a1b21; }
-      body { font: 12px/1.45 system-ui,sans-serif; width: 340px; margin: 12px; background: #0d0e12; color: var(--ink); }
-      h1 { font-size: 15px; margin: 0 0 8px; }
-      label { display: block; margin: 9px 0 3px; font-weight: 600; }
-      input { width: 100%; box-sizing: border-box; padding: 7px; background: #121318; color: var(--ink); border: 1px solid var(--line); border-radius: 6px; }
-      button { margin-top: 10px; padding: 7px 10px; border-radius: 6px; background: #26354a; border: 1px solid #415879; color: var(--ink); cursor: pointer; }
-      .status { padding: 7px; border-radius: 6px; background: var(--panel); margin-bottom: 6px; }
-      .ok { background: #173b2d; color: #9de3c3; }
-      .bad { background: #44242c; color: #ffc1c9; }
-      .hint { color: #a7aab6; margin: 9px 0 0; }
-    </style>
-  </head>
-  <body>
-    <h1>Chat Orchestrator Extension</h1>
-    <div id="status" class="status">Connecting…</div>
-    <div id="info" class="hint"></div>
-    <label for="serverUrl">Proxy WebSocket URL</label>
-    <input id="serverUrl" type="url" spellcheck="false" autocomplete="off" />
-    <label for="token">Extension-only token</label>
-    <input id="token" type="password" spellcheck="false" autocomplete="new-password" />
-    <button id="save" type="button">Save connection &amp; reconnect</button>
-    <p class="hint">All automation limits, worker behavior and system prompts are managed in the Proxy Tool → Extension settings. They sync automatically on connection.</p>
-    <script src="popup.js"></script>
-  </body>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Chat Orchestrator Bridge</title>
+  <style>
+    :root { color-scheme: dark; font: 12px/1.5 "Segoe UI", system-ui, sans-serif; color: #edf3fd; }
+    * { box-sizing: border-box; }
+    body { width: 352px; margin: 0; background: #0c121c; }
+    header { padding: 20px 20px 16px; background: #131f30; border-bottom: 1px solid #304054; }
+    .eyebrow { color: #92b8f8; font-size: 10px; letter-spacing: 1.2px; font-weight: 750; }
+    h1 { margin: 4px 0 3px; font-size: 20px; letter-spacing: -.5px; line-height: 1.25; }
+    .muted { color: #a1b0c5; margin: 0; font-size: 11px; }
+    main { padding: 16px 20px 22px; }
+    .status { padding: 13px 14px; border-radius: 10px; background: #242b39; border: 1px solid #3a485c; font-weight: 650; }
+    .status.ok { background: #18392f; border-color: #2e7157; color: #a7efcd; }
+    .status.bad { background: #3a2929; border-color: #704343; color: #ffd0c6; }
+    .hint { color: #93a3b9; margin: 10px 0; line-height: 1.55; font-size: 11px; }
+    #next-step { margin: 9px 0 18px; color: #bdd2ed; }
+    .divider { border-top: 1px solid #2b384b; margin: 16px 0; }
+    label { display: block; color: #d0dceb; margin: 13px 0 5px; font-weight: 650; }
+    input { width: 100%; height: 39px; padding: 9px 11px; background: #0f1926; color: #f0f5fb; border: 1px solid #425169; border-radius: 8px; outline: none; font: 12px "Segoe UI", sans-serif; }
+    input:focus-visible { border-color: #91b7fd; box-shadow: 0 0 0 2px #547cac44; }
+    input::placeholder { color: #798ba3; }
+    button { width: 100%; margin-top: 17px; padding: 10px 12px; border-radius: 8px; background: #487fd6; border: 1px solid #6397e9; color: #fff; font-weight: 700; cursor: pointer; }
+    button:hover:not(:disabled) { background: #5b91e9; }
+    button:disabled { opacity: .55; cursor: not-allowed; }
+    .callout { padding: 12px; margin-top: 16px; background: #19283b; border: 1px solid #2d4867; border-radius: 9px; font-size: 11px; color: #b7cbe6; }
+    .callout strong { display: block; color: #e6efff; margin-bottom: 4px; }
+    .callout p { margin: 0; line-height: 1.55; }
+    #info { margin-top: 12px; font-size: 10px; color: #7789a2; }
+  </style>
+</head>
+<body>
+  <header>
+    <span class="eyebrow">BROWSER EXTENSION</span>
+    <h1>Connect to Orchestrator</h1>
+    <p class="muted">A secure local connection to your desktop proxy</p>
+  </header>
+  <main>
+    <div id="status" class="status" role="status" aria-live="polite">Checking connection…</div>
+    <p id="next-step" class="hint">Checking the extension-only credential and settings sync.</p>
+    <div class="divider"></div>
+    <label for="serverUrl">Local proxy URL</label>
+    <input id="serverUrl" type="url" spellcheck="false" autocomplete="off" placeholder="ws://127.0.0.1:8787/bridge" />
+    <label for="token">Extension-only credential</label>
+    <input id="token" type="password" spellcheck="false" autocomplete="new-password" placeholder="Paste from desktop Connections page" />
+    <button id="save" type="button">Save and reconnect</button>
+    <div class="callout">
+      <strong>Which credential should I use?</strong>
+      <p>In the desktop app, open <b>Connections</b> and copy the <b>Extension-only credential</b>. The MCP connector token is different and cannot sync settings.</p>
+    </div>
+    <div id="info"></div>
+  </main>
+  <script src="popup.js"></script>
+</body>
 </html>

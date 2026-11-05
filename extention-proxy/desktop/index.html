@@ -6,21 +6,51 @@
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'" />
   <title>Chat Orchestrator</title>
   <link rel="stylesheet" href="style.css" />
+  <link rel="stylesheet" href="redesign.css" />
 </head>
 <body>
-  <main class="app-shell">
-    <header class="topbar">
-      <div class="brand">
-        <div class="brand-mark"><img src="assets/app.png" width="42" height="42" alt="" /></div>
-        <div>
-          <div class="eyebrow">LOCAL PROXY / MCP BRIDGE</div>
-          <h1>Chat Orchestrator</h1>
-          <p>One secure bridge. Every conversation.</p>
-        </div>
+  <div class="app-layout">
+    <aside class="sidebar" aria-label="Main navigation">
+      <div class="sidebar-brand">
+        <div class="sidebar-logo"><img src="assets/app.png" width="36" height="36" alt="" /></div>
+        <div><strong>Orchestrator</strong><span>Desktop control center</span></div>
       </div>
-      <span id="overall" class="pill muted">Starting…</span>
-    </header>
-
+      <div class="sidebar-label">WORKSPACE</div>
+      <nav class="sidebar-nav" aria-label="Sections">
+        <button class="nav-item active" data-view="overview" aria-current="page" type="button"><img src="assets/server.png" alt="" /><span>Overview</span></button>
+        <button class="nav-item" data-view="connections" type="button"><img src="assets/link.png" alt="" /><span>Connections</span></button>
+        <button class="nav-item" data-view="agents" type="button"><img src="assets/puzzle.png" alt="" /><span>Agents &amp; queue</span></button>
+        <button class="nav-item" data-view="settings" type="button"><img src="assets/key.png" alt="" /><span>Preferences</span></button>
+      </nav>
+      <div class="sidebar-bottom">
+        <span class="sidebar-subtitle">CURRENT PROFILE</span>
+        <strong id="sidebar-profile">Default profile</strong>
+        <span class="sidebar-footnote">Local, profile-specific configuration</span>
+      </div>
+    </aside>
+    <main class="app-shell">
+      <header class="topbar">
+        <div class="page-kicker">
+          <span class="eyebrow">CHAT ORCHESTRATOR</span>
+          <h1 id="page-title">Overview</h1>
+        </div>
+        <span id="overall" class="pill muted">Checking services</span>
+      </header>
+      <section id="view-overview" class="app-view" aria-labelledby="page-title">
+        <div class="welcome">
+          <div class="welcome-copy">
+            <span class="welcome-label">YOUR CONTROL CENTER</span>
+            <h2>Your workspace, simplified.<br />Stay in control.</h2>
+            <p>Connect the desktop proxy, browser extension and ChatGPT. Manage your agents from one place.</p>
+            <button class="primary" data-open-view="connections" type="button">Set up connection <span aria-hidden="true">→</span></button>
+          </div>
+          <div class="welcome-visual" aria-hidden="true">
+            <span class="visual-node visual-main"><img src="assets/app.png" alt="" /></span>
+            <span class="visual-node visual-a"><img src="assets/cloud.png" alt="" /></span>
+            <span class="visual-node visual-b"><img src="assets/puzzle.png" alt="" /></span>
+          </div>
+        </div>
+        <div class="section-intro"><h2>Connection health</h2><span>Live status from this profile</span></div>
     <section class="status-grid" aria-label="Connection status">
       <article class="status-card">
         <div class="card-title"><span class="status-icon"><img src="assets/server.png" alt="" /></span><span>MCP SERVER</span><span class="dot" id="server-dot"></span></div>
@@ -35,8 +65,87 @@
         <strong id="ngrok-state">Not configured</strong><small id="ngrok-detail">Dedicated domain</small>
       </article>
     </section>
-
-    <details class="panel coordination-panel" id="coordination-panel">
+        <div class="section-intro"><h2>Get started</h2><span>Use these steps in order</span></div>
+        <div class="quick-grid">
+          <article class="panel quick-card">
+            <div class="quick-card-top"><span class="step-number">01</span><span id="quick-extension-status" class="step-state">Waiting</span></div>
+            <h3>Connect the extension</h3>
+            <p>Copy the extension-only credential, then paste it into the browser extension popup.</p>
+            <button id="quick-extension-token" type="button" class="secondary">Copy extension credential</button>
+          </article>
+          <article class="panel quick-card">
+            <div class="quick-card-top"><span class="step-number">02</span><span id="quick-connector-status" class="step-state">Waiting</span></div>
+            <h3>Connect ChatGPT</h3>
+            <p>Copy the MCP connector URL after the tunnel is online. This credential is different.</p>
+            <button id="quick-copy-url" type="button" class="secondary">Copy connector URL</button>
+          </article>
+        </div>
+        <div class="help-strip">
+          <img src="assets/checkmark.png" alt="" />
+          <div><strong id="setup-headline">Checking your connection…</strong><p id="setup-guidance">Start with the extension and tunnel connection status above.</p></div>
+          <button type="button" class="text-action" data-open-view="connections">Connection details</button>
+        </div>
+      </section>
+      <section id="view-connections" class="app-view" hidden>
+        <div class="view-heading">
+          <span class="eyebrow">STEP 1 / CONNECTION SETUP</span>
+          <h2>Connect your tools</h2>
+          <p>Configure your private tunnel, then copy the correct credentials to the extension and ChatGPT.</p>
+        </div>
+        <div class="workspace-grid connection-layout">
+          <div class="column-stack">      <section class="panel ngrok-panel">
+        <div class="section-heading">
+          <h2><img src="assets/network.png" alt="" /> Tunnel settings</h2>
+          <span class="hint">NGROK</span>
+        </div>
+        <label for="proxy-port">Local proxy port</label>
+        <div class="input-row">
+          <input id="proxy-port" type="number" min="1024" max="65535" step="1" value="8787" inputmode="numeric" />
+          <button id="save-proxy-port" type="button" class="secondary">Save port</button>
+        </div>
+        <p class="help" id="profile-description">Profile: default. Stop the proxy and tunnel before changing port.</p>
+        <p class="help">Extension WebSocket: <code id="extension-local-url">ws://127.0.0.1:8787/bridge</code>. Each profile needs its own extension settings and Ngrok domain.</p>
+        <label for="domain">Dedicated HTTPS domain</label>
+        <input id="domain" type="text" spellcheck="false" autocomplete="off" placeholder="your-domain.ngrok-free.dev" />
+        <label for="ngrok-token">Authtoken <span id="ngrok-token-status" class="hint">(required)</span></label>
+        <input id="ngrok-token" type="password" spellcheck="false" autocomplete="new-password" placeholder="Enter your ngrok authtoken" />
+        <p class="help">Credentials are encrypted locally. Leave the token blank to reuse the saved value. Your AgentBridge tunnel is unaffected.</p>
+        <button id="configure-ngrok" type="button" class="primary wide"><img src="assets/checkmark.png" alt="" /> Save &amp; connect</button>
+      </section></div>
+          <div class="column-stack">        <section class="panel">
+          <div class="section-heading">
+            <h2><img src="assets/key.png" alt="" /> Bridge credentials</h2>
+            <span class="hint">PRIVATE</span>
+          </div>
+          <label for="token-value">Bridge token</label>
+          <div class="input-row">
+            <code id="token-value">••••••••••••••••••••••••••••</code>
+            <button id="toggle-token" class="icon-button" type="button" aria-label="Reveal token" title="Reveal token"><img id="token-visibility-icon" src="assets/visible.png" alt="" /></button>
+            <button id="copy-token" class="icon-button" type="button" aria-label="Copy bridge token" title="Copy bridge token"><img src="assets/copy.png" alt="" /></button>
+          </div>
+          <button id="import-token" type="button" class="link-button"><img src="assets/upload.png" alt="" /> Import existing token</button>
+          <div class="input-row"><span class="hint">Extension-only credential</span><button id="copy-extension-token" class="icon-button" type="button" aria-label="Copy extension bridge token" title="Copy extension bridge token"><img src="assets/copy.png" alt="" /></button></div>
+          <p class="help">Use the extension-only token in the browser extension popup for private coordination. Keep the MCP connector token unchanged.</p>
+        </section>        <section class="panel connector-panel">
+          <div class="section-heading">
+            <h2><img src="assets/link.png" alt="" /> Connector URL</h2>
+            <span class="hint">CHATGPT MCP</span>
+          </div>
+          <div class="input-row">
+            <code id="connector-url">Enter your domain above</code>
+            <button id="copy-url" class="icon-button" type="button" aria-label="Copy connector URL" title="Copy connector URL"><img src="assets/copy.png" alt="" /></button>
+          </div>
+          <p class="help">Share this URL only with your own connector. Its access token stays masked here.</p>
+        </section></div>
+        </div>
+      </section>
+      <section id="view-agents" class="app-view" hidden>
+        <div class="view-heading">
+          <span class="eyebrow">STEP 2 / AGENTS</span>
+          <h2>Agent coordination</h2>
+          <p>See registered agents, queue state and recent activity. Uncertain work remains held for review.</p>
+        </div>
+    <details class="panel coordination-panel" id="coordination-panel" open>
       <summary>Agent coordination <span id="coordination-summary" class="hint">Queue unavailable</span></summary>
       <div class="coordination-grid">
         <div><h2>REUSABLE SEATS</h2><div id="agent-seats" class="coordination-scroll">No paired seats</div></div>
@@ -47,7 +156,51 @@
       <p id="private-journal-inspection" class="help">Journal owner state unknown until inspected locally.</p>
       <p class="help">Read-only proxy snapshot. DELIVERED is not PROCESSED; Saga confirmation is separate. UNCERTAIN requires manual reconciliation.</p>
     </details>
-
+        <details class="panel pairing-panel" id="principal-panel">
+          <summary>Scoped agent pairing <span class="hint">LOCAL ADMIN</span></summary>
+          <p class="help">Create a separately revocable connector identity. Choose the actual manager tab ID; never share the scoped URL with another agent.</p>
+          <label for="pair-seat">Reusable agent seat</label>
+          <select id="pair-seat">
+            <option value="">Custom role</option>
+            <option value="BA">BA · Orchestrator</option>
+            <option value="PM">PM · Epic manager</option>
+            <option value="TL">TL · Task lead</option>
+            <option value="Council A">Council A · Systems</option>
+            <option value="Council B">Council B · Security</option>
+            <option value="Council C">Council C · Architecture</option>
+            <option value="Council D">Council D · QA</option>
+            <option value="Council E">Council E · Devil's advocate</option>
+            <option value="BA Watchdog">BA Watchdog</option>
+          </select>
+          <label for="pair-role">Role</label>
+          <select id="pair-role">
+            <option value="pm">PM</option><option value="tl">TL</option>
+            <option value="ba">BA</option><option value="specialist">Specialist</option>
+            <option value="council">Council</option><option value="watchdog">Watchdog</option>
+          </select>
+          <label for="pair-workspace">Workspace</label>
+          <input id="pair-workspace" value="web-chat-automation" autocomplete="off" />
+          <label for="pair-project">Saga project</label>
+          <input id="pair-project" value="4" autocomplete="off" />
+          <label for="pair-orchestrator">Orchestrator</label>
+          <input id="pair-orchestrator" value="chat-orchestrator-p0" autocomplete="off" />
+          <label for="pair-parent-task">Parent task</label>
+          <input id="pair-parent-task" value="65" autocomplete="off" />
+          <label for="pair-tab">Manager tab ID</label>
+          <input id="pair-tab" type="number" min="0" placeholder="From list_tabs" />
+          <div class="input-row">
+            <button id="pair-principal" type="button" class="primary">Pair identity</button>
+            <button id="copy-principal-url" type="button" class="secondary" disabled>Copy one-time URL</button>
+          </div>
+          <div id="principal-list" class="principal-list" aria-live="polite"></div>
+        </details>
+      </section>
+      <section id="view-settings" class="app-view" hidden>
+        <div class="view-heading">
+          <span class="eyebrow">YOUR PREFERENCES</span>
+          <h2>Automation &amp; preferences</h2>
+          <p>Configure worker limits, role prompts and how this desktop app runs in the background.</p>
+        </div>
     <details class="panel extension-settings-panel" id="extension-settings-panel">
       <summary>Extension settings &amp; system prompts <span id="extension-settings-sync" class="hint">Profile-scoped · opens on demand</span></summary>
       <p class="help">Proxy-managed settings synchronize to the extension when connected with this profile's extension-only token. The extension popup keeps only WebSocket URL and token.</p>
@@ -93,97 +246,6 @@
         <pre id="agent-admin-output" class="coordination-scroll" hidden></pre>
       </details>
     </details>
-
-    <div class="workspace-grid">
-      <div class="column-stack">
-        <section class="panel">
-          <div class="section-heading">
-            <h2><img src="assets/key.png" alt="" /> Bridge credentials</h2>
-            <span class="hint">PRIVATE</span>
-          </div>
-          <label for="token-value">Bridge token</label>
-          <div class="input-row">
-            <code id="token-value">••••••••••••••••••••••••••••</code>
-            <button id="toggle-token" class="icon-button" type="button" aria-label="Reveal token" title="Reveal token"><img id="token-visibility-icon" src="assets/visible.png" alt="" /></button>
-            <button id="copy-token" class="icon-button" type="button" aria-label="Copy bridge token" title="Copy bridge token"><img src="assets/copy.png" alt="" /></button>
-          </div>
-          <button id="import-token" type="button" class="link-button"><img src="assets/upload.png" alt="" /> Import existing token</button>
-          <div class="input-row"><span class="hint">Extension-only credential</span><button id="copy-extension-token" class="icon-button" type="button" aria-label="Copy extension bridge token" title="Copy extension bridge token"><img src="assets/copy.png" alt="" /></button></div>
-          <p class="help">Use the extension-only token in the browser extension popup for private coordination. Keep the MCP connector token unchanged.</p>
-        </section>
-
-        <section class="panel connector-panel">
-          <div class="section-heading">
-            <h2><img src="assets/link.png" alt="" /> Connector URL</h2>
-            <span class="hint">CHATGPT MCP</span>
-          </div>
-          <div class="input-row">
-            <code id="connector-url">Enter your domain above</code>
-            <button id="copy-url" class="icon-button" type="button" aria-label="Copy connector URL" title="Copy connector URL"><img src="assets/copy.png" alt="" /></button>
-          </div>
-          <p class="help">Share this URL only with your own connector. Its access token stays masked here.</p>
-        </section>
-        <details class="panel pairing-panel" id="principal-panel">
-          <summary>Scoped agent pairing <span class="hint">LOCAL ADMIN</span></summary>
-          <p class="help">Create a separately revocable connector identity. Choose the actual manager tab ID; never share the scoped URL with another agent.</p>
-          <label for="pair-seat">Reusable agent seat</label>
-          <select id="pair-seat">
-            <option value="">Custom role</option>
-            <option value="BA">BA · Orchestrator</option>
-            <option value="PM">PM · Epic manager</option>
-            <option value="TL">TL · Task lead</option>
-            <option value="Council A">Council A · Systems</option>
-            <option value="Council B">Council B · Security</option>
-            <option value="Council C">Council C · Architecture</option>
-            <option value="Council D">Council D · QA</option>
-            <option value="Council E">Council E · Devil's advocate</option>
-            <option value="BA Watchdog">BA Watchdog</option>
-          </select>
-          <label for="pair-role">Role</label>
-          <select id="pair-role">
-            <option value="pm">PM</option><option value="tl">TL</option>
-            <option value="ba">BA</option><option value="specialist">Specialist</option>
-            <option value="council">Council</option><option value="watchdog">Watchdog</option>
-          </select>
-          <label for="pair-workspace">Workspace</label>
-          <input id="pair-workspace" value="web-chat-automation" autocomplete="off" />
-          <label for="pair-project">Saga project</label>
-          <input id="pair-project" value="4" autocomplete="off" />
-          <label for="pair-orchestrator">Orchestrator</label>
-          <input id="pair-orchestrator" value="chat-orchestrator-p0" autocomplete="off" />
-          <label for="pair-parent-task">Parent task</label>
-          <input id="pair-parent-task" value="65" autocomplete="off" />
-          <label for="pair-tab">Manager tab ID</label>
-          <input id="pair-tab" type="number" min="0" placeholder="From list_tabs" />
-          <div class="input-row">
-            <button id="pair-principal" type="button" class="primary">Pair identity</button>
-            <button id="copy-principal-url" type="button" class="secondary" disabled>Copy one-time URL</button>
-          </div>
-          <div id="principal-list" class="principal-list" aria-live="polite"></div>
-        </details>
-      </div>
-
-      <section class="panel ngrok-panel">
-        <div class="section-heading">
-          <h2><img src="assets/network.png" alt="" /> Tunnel settings</h2>
-          <span class="hint">NGROK</span>
-        </div>
-        <label for="proxy-port">Local proxy port</label>
-        <div class="input-row">
-          <input id="proxy-port" type="number" min="1024" max="65535" step="1" value="8787" inputmode="numeric" />
-          <button id="save-proxy-port" type="button" class="secondary">Save port</button>
-        </div>
-        <p class="help" id="profile-description">Profile: default. Stop the proxy and tunnel before changing port.</p>
-        <p class="help">Extension WebSocket: <code id="extension-local-url">ws://127.0.0.1:8787/bridge</code>. Each profile needs its own extension settings and Ngrok domain.</p>
-        <label for="domain">Dedicated HTTPS domain</label>
-        <input id="domain" type="text" spellcheck="false" autocomplete="off" placeholder="your-domain.ngrok-free.dev" />
-        <label for="ngrok-token">Authtoken <span id="ngrok-token-status" class="hint">(required)</span></label>
-        <input id="ngrok-token" type="password" spellcheck="false" autocomplete="new-password" placeholder="Enter your ngrok authtoken" />
-        <p class="help">Credentials are encrypted locally. Leave the token blank to reuse the saved value. Your AgentBridge tunnel is unaffected.</p>
-        <button id="configure-ngrok" type="button" class="primary wide"><img src="assets/checkmark.png" alt="" /> Save &amp; connect</button>
-      </section>
-    </div>
-
     <section class="panel behavior-panel" aria-label="Window behavior">
       <div class="behavior-heading"><span class="behavior-icon"><img src="assets/minimize-window.png" alt="" /></span><div><h2>Background operation</h2><p>Keep your connections running when this window is closed.</p></div></div>
       <label class="tray-toggle" for="minimize-to-tray">
@@ -191,7 +253,7 @@
         <span>Minimize to system tray when closing</span>
       </label>
     </section>
-
+      </section>
     <footer class="bottom-bar">
       <div class="footer-left">
         <span id="message" role="status" aria-live="polite">Ready to configure.</span>
@@ -202,7 +264,9 @@
         <button id="start" type="button" class="primary"><img src="assets/play.png" alt="" /> Start proxy</button>
       </div>
     </footer>
-  </main>
+    </main>
+  </div>
   <script src="renderer.js"></script>
+  <script src="navigation.js"></script>
 </body>
 </html>

@@ -142,7 +142,28 @@ const verifiedPrincipalContexts = new WeakSet();
 const verifiedCoordinationScopes = new WeakSet();
 
 /** @param {PrincipalContext} principal @param {PrivateCoordinationScope} scope */
+// A token validated at MCP connection time is not sufficient for a long-running
+// asynchronous delivery. Consult the revocable registry before every journal
+// mutation and immediately before issuing an external browser side effect.
+function currentPrivatePrincipal(principal) {
+  if (!principal || principal.mode !== 'scoped') return false;
+  try {
+    const record = listPrincipalCredentials(PRINCIPAL_REGISTRY_FILE).find((item) =>
+      item.credentialId === principal.credentialId && !item.revokedAt);
+    return Boolean(record && record.principalId === principal.principalId &&
+      record.browserSessionId === principal.browserSessionId &&
+      record.sessionIncarnationId === principal.sessionIncarnationId &&
+      record.connectionGeneration === principal.connectionGeneration &&
+      record.callerTabId === principal.callerTabId &&
+      record.workspaceId === principal.workspaceId &&
+      record.projectId === principal.projectId &&
+      record.orchestratorId === principal.orchestratorId &&
+      record.parentTaskId === principal.parentTaskId);
+  } catch { return false; } // Corrupt/missing registry never grants authority.
+}
+
 function authorizePrivateCoordination(principal, scope) {
+  if (!currentPrivatePrincipal(principal)) return false;
   if (!privateCoordinationEnabled ||
       !verifiedPrincipalContexts.has(principal) ||
       !verifiedCoordinationScopes.has(scope)) return false;
@@ -950,6 +971,7 @@ function privateReadinessState({ revoked, registered, connected, observation, no
 async function registerPrivateManager(principal) {
   privateManagerScope(principal);
   const observation = await callExtension('manager_state', { __trustedPrincipal: principal });
+  if (!currentPrivatePrincipal(principal)) throw new Error('Manager credential revoked during registration');
   rememberPrivateManagerReadiness(principal, observation);
   activePrivateManagers.set(principal.credentialId, principal);
   return { registered: true, manager_tab_id: principal.callerTabId,
@@ -1045,6 +1067,7 @@ async function verifiedSagaClose(principal, args) {
         },
       }, crypto.randomUUID());
   }
+   registeredPrivateManager(active); // Recheck authority after asynchronous Saga readback.
   return callExtension('close_verified_worker', {
     __trustedPrincipal: active, tab_id: args.tab_id,
     worker_incarnation_id: original.source.incarnationId,
@@ -1224,6 +1247,7 @@ async function pumpOnePrivateManager(principal) {
     }
     let submitted = false;
     try {
+      registeredPrivateManager(principal); // No stale credential may submit a browser prompt.
       const outcome = await callExtension('wake_manager', {
         __trustedPrincipal: principal, batch_id: batchId, events,
       });

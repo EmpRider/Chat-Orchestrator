@@ -1,15 +1,42 @@
 # Chat Orchestrator desktop app (Windows)
 
+## Local 0.1.3 redesigned UI release candidate (November 5, 2026)
+
+This is a **locally built candidate**, not yet a published GitHub Release. It includes a reorganized
+four-page desktop experience (Overview, Connections, Agents & queue, Preferences) and a
+simpler extension popup with direct guidance for the **extension-only** credential.
+
+- Desktop EXE: `extention-proxy/dist/Chat Orchestrator 0.1.3.exe`
+- Browser extension ZIP: `extention-proxy/dist/Chat-Orchestrator-0.1.3-extension.zip`
+
+To update an existing installation, exit the old desktop program using its **system tray > Exit**
+command (window X may only hide it), then run the new portable EXE using the **same profile**.
+Settings and credentials live in the Windows profile data folder, not in the EXE. To update the
+browser extension without losing its extension ID and saved credentials, replace the files in
+its existing unpacked folder, choose **Reload** in Edge/Chrome extensions, then refresh chat
+tabs so document-start hooks are installed. In the extension popup, use **Connections >
+Extension-only credential** from the desktop; the MCP token cannot authorize settings sync.
+
+Local verification: `npm test` (72 passing), isolated real Electron navigation/layout smoke
+(`node test/ui-redesign-runtime.mjs`), and packaged settings WebSocket smoke
+(`node test/packaged-extension-settings-smoke.mjs`). These do **not** mean the separate
+unfinished P0 crash-recovery and final end-to-end release gates are approved.
+
+
 The desktop app runs the MCP server locally and starts a dedicated ngrok tunnel. It does not change the existing AgentBridge tunnel or its ngrok configuration.
 
 ## Install from a GitHub release
 
 Download both files from [Chat Orchestrator Releases](https://github.com/EmpRider/Chat-Orchestrator/releases):
 
-- `Chat-Orchestrator-0.1.2-windows-x64-portable.exe`: portable Windows desktop app.
-- `Chat-Orchestrator-0.1.2-extension.zip`: Chrome/Edge extension. Extract it first; the extracted directory must contain `manifest.json` at its root.
+- `Chat-Orchestrator-0.1.3.exe`: portable Windows desktop app.
+- `Chat-Orchestrator-0.1.3-extension.zip`: Chrome/Edge extension. Extract it first; the extracted directory must contain `manifest.json` at its root.
 
 The executable is not code-signed, so Windows may show an unknown-publisher warning. You must install the [ngrok CLI](https://ngrok.com/download/windows) separately and ensure `ngrok` is on `PATH`.
+
+## Redesigned desktop (0.1.3)
+
+The navigation has four pages: **Overview** for connection status and guided setup; **Connections** for the local port, extension-only credential, Ngrok domain and ChatGPT connector URL; **Agents & queue** for scoped pairing, journal diagnostics and worker activity; **Preferences** for worker limits, system prompts and tray behavior. The browser extension popup now explains credential mismatches in plain language. Use the **extension-only credential**, never the MCP token, in the popup. The setup flow does not reset user-data settings or existing credentials.
 
 ## Connect
 

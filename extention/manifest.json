@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Chat Orchestrator Bridge",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Lets an orchestrator chat (Claude/ChatGPT) spawn and talk to worker chat tabs through a local MCP server.",
   "minimum_chrome_version": "116",
   "permissions": [

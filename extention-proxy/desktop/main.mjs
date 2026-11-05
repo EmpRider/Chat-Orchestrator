@@ -679,12 +679,12 @@ function createWindow() {
   debug('creating window');
   window = new BrowserWindow({
     title: 'Chat Orchestrator',
-    width: 780,
-    height: 710,
-    minWidth: 650,
-    minHeight: 600,
+    width: 1080,
+    height: 790,
+    minWidth: 820,
+    minHeight: 620,
     icon: path.join(appDir, 'desktop', 'assets', 'app.ico'),
-    backgroundColor: '#070708',
+    backgroundColor: '#0c111a',
     show: false,
     autoHideMenuBar: true,
     webPreferences: {

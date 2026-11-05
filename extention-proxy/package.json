@@ -1,13 +1,13 @@
 {
   "name": "chat-orchestrator-mcp",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "private": true,
   "type": "module",
   "description": "MCP server that lets an orchestrator chat (Claude/ChatGPT) control worker chat tabs through a browser extension.",
   "main": "desktop/main.mjs",
   "scripts": {
     "start": "node server.js",
-    "test": "node test/smoke.mjs && node --test test/agent-settings.test.mjs test/extension-settings-ws.test.mjs test/extension-settings-renderer.test.mjs test/desktop-config.test.mjs test/ngrok-diagnostics.test.mjs test/server-lifecycle.test.mjs test/gateway.test.mjs test/renderer.test.mjs test/tray-lifecycle.test.mjs test/principal-auth.test.mjs test/scoped-mcp-auth.test.mjs test/owner-acl.test.mjs test/private-journal.test.mjs test/private-journal-disk.test.mjs test/coordination-storage.test.mjs test/private-coordination-mcp.test.mjs test/ui-assets.test.mjs test/read-chat-extraction.test.mjs test/read-chat-structured.test.mjs test/read-chat-mcp-e2e.test.mjs",
+    "test": "node test/smoke.mjs && node --test test/agent-settings.test.mjs test/extension-settings-ws.test.mjs test/extension-settings-renderer.test.mjs test/desktop-config.test.mjs test/ngrok-diagnostics.test.mjs test/server-lifecycle.test.mjs test/gateway.test.mjs test/renderer.test.mjs test/tray-lifecycle.test.mjs test/principal-auth.test.mjs test/scoped-mcp-auth.test.mjs test/owner-acl.test.mjs test/private-journal.test.mjs test/private-journal-disk.test.mjs test/coordination-storage.test.mjs test/private-coordination-mcp.test.mjs test/ui-assets.test.mjs test/read-chat-extraction.test.mjs test/read-chat-structured.test.mjs test/read-chat-mcp-e2e.test.mjs test/ui-redesign-contract.test.mjs",
     "desktop": "electron .",
     "dist:win": "electron-builder --win portable"
   },

@@ -12,7 +12,8 @@ import WebSocket from 'ws';
 
 if (process.platform !== 'win32') throw new Error('Windows portable smoke only');
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const executable = path.join(root, 'dist', 'Chat Orchestrator 0.1.2.exe');
+const currentVersion = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8')).version;
+const executable = path.join(root, 'dist', 'Chat Orchestrator ' + currentVersion + '.exe');
 if (!existsSync(executable)) throw new Error('Build portable EXE before running packaged smoke');
 const dataDir = mkdtempSync(path.join(tmpdir(), 'chat-orchestrator-smoke-settings-'));
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
