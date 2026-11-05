@@ -9,6 +9,7 @@ import { createNgrokLogReader } from './ngrok-diagnostics.mjs';
 import { preparePrivateJournal } from './coordination-storage.mjs';
 import { createDesktopTray, installWindowCloseBehavior, minimizeToTrayPreference } from './tray-lifecycle.mjs';
 import { createPrincipalCredential, listPrincipalCredentials, resolvePrincipalCredential, revokePrincipalCredential } from '../principal-auth.mjs';
+import { DEFAULT_AGENT_SETTINGS, normalizeAgentSettings, disabledAgentSettings } from '../agent-settings.mjs';
 
 // Set CHAT_ORCH_DIAGNOSTICS=1 for lifecycle messages (never credentials).
 const debug = (message) => {
@@ -38,6 +39,7 @@ let exitStarted = false;
 let exitReady = false;
 let child;
 const managerAttestations = new Map(); // trusted utilityProcess replies, never HTTP
+const desktopExtensionActions = new Map(); // local admin requests only
 let ngrokChild;
 let ngrokGeneration = 0;
 let token = '';
@@ -55,6 +57,8 @@ let runningPrivateCoordination = null;
 let principalState = 'unknown';
 let coordinationSnapshot = null; // Owned utilityProcess emits redacted, read-only state.
 let stopping = false;
+let agentSettings = normalizeAgentSettings({});
+let agentSettingsSyncRevision = 0;
 
 // Optional loopback CDP is test-only; packaged releases never expose DevTools.
 if (E2E_MODE && !app.isPackaged && process.env.CHAT_ORCH_E2E_CDP_PORT) {
@@ -135,6 +139,7 @@ function state() {
     privateCoordinationRestartRequired: Boolean(child && runningPrivateCoordination !== privateCoordinationOptIn),
     principalState,
     coordinationSnapshot,
+    agentSettingsSyncRevision,
     domain,
     profile: PROFILE,
     port: PORT,
@@ -151,23 +156,29 @@ function publishState() {
 }
 
 function loadSettings() {
+  if (!fs.existsSync(settingsFile())) {
+    agentSettings = normalizeAgentSettings({});
+    return;
+  }
   try {
     const saved = JSON.parse(fs.readFileSync(settingsFile(), 'utf8'));
     domain = saved.domain ? normalizeNgrokDomain(saved.domain) : '';
     minimizeToTray = minimizeToTrayPreference(saved.minimizeToTray);
     privateCoordinationOptIn = saved.privateCoordinationOptIn === true;
+    agentSettings = normalizeAgentSettings(saved.agentSettings || {});
     if (!E2E_MODE) PORT = normalizeProxyPort(saved.proxyPort ?? 8787);
   } catch {
     domain = '';
     minimizeToTray = true;
     privateCoordinationOptIn = false;
+    agentSettings = disabledAgentSettings();
     if (!E2E_MODE) PORT = 8787;
   }
 }
 
 function writeSettings() {
   fs.mkdirSync(dataDir(), { recursive: true });
-  fs.writeFileSync(settingsFile(), JSON.stringify({ domain, minimizeToTray, privateCoordinationOptIn, proxyPort: PORT }, null, 2), 'utf8');
+  fs.writeFileSync(settingsFile(), JSON.stringify({ domain, minimizeToTray, privateCoordinationOptIn, proxyPort: PORT, agentSettings }, null, 2), { encoding: 'utf8', mode: 0o600 });
 }
 
 async function saveNgrokAuth(value) {
@@ -320,6 +331,7 @@ function startProxy() {
   phase = 'starting';
   errorMessage = '';
   extensionConnected = false;
+  agentSettingsSyncRevision = 0;
   publishState();
 
   try {
@@ -353,6 +365,14 @@ function startProxy() {
         debug('local MCP proxy ready');
         phase = 'running';
         errorMessage = '';
+      } else if (message?.type === 'desktop_extension_action_result') {
+        const pending = desktopExtensionActions.get(message.request_id);
+        if (pending) {
+          clearTimeout(pending.timer);
+          desktopExtensionActions.delete(message.request_id);
+          if (message.ok) pending.resolve(message.result);
+          else pending.reject(new Error(message.error || 'Desktop extension action failed'));
+        }
       } else if (message?.type === 'manager_attestation') {
         const pending = managerAttestations.get(message.request_id);
         if (pending) {
@@ -361,6 +381,10 @@ function startProxy() {
           if (message.ok) pending.resolve(message.result);
           else pending.reject(new Error(message.error || 'Manager attestation failed'));
         }
+      } else if (message?.type === 'agent_settings_synced') {
+        agentSettingsSyncRevision = Number(message.revision) || 0;
+      } else if (message?.type === 'agent_settings_reloaded') {
+        agentSettingsSyncRevision = Number(message.revision) || 0;
       } else if (message?.type === 'coordination_snapshot') {
         if (message.snapshot && typeof message.snapshot === 'object') {
           coordinationSnapshot = message.snapshot;
@@ -385,6 +409,11 @@ function startProxy() {
         clearTimeout(pending.timer);
         pending.reject(new Error('Proxy stopped during manager attestation'));
         managerAttestations.delete(id);
+      }
+      for (const [id, pending] of desktopExtensionActions) {
+        clearTimeout(pending.timer);
+        pending.reject(new Error('Proxy stopped during extension action'));
+        desktopExtensionActions.delete(id);
       }
       runningPrivateCoordination = null;
       extensionConnected = false;
@@ -479,7 +508,47 @@ function attestManagerTab(tabId) {
   });
 }
 
+function desktopExtensionAction(action, tabId) {
+  if (!child || phase !== 'running') return Promise.reject(new Error('Start proxy and connect extension first'));
+  if (!['set_orchestrator','diagnose','close_legacy_workers'].includes(action)) {
+    return Promise.reject(new Error('Unsupported desktop action'));
+  }
+  if (action !== 'close_legacy_workers' && (!Number.isSafeInteger(tabId) || tabId <= 0)) {
+    return Promise.reject(new Error('Enter an actual positive tab ID'));
+  }
+  const owned = child;
+  const id = crypto.randomUUID();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {desktopExtensionActions.delete(id);
+      reject(new Error('Extension action timed out; outcome unknown'));}, 15000);
+    desktopExtensionActions.set(id, {resolve,reject,timer});
+    try {owned.postMessage({type:'desktop_extension_action', request_id:id, action, tab_id:tabId});}
+    catch (error) {clearTimeout(timer); desktopExtensionActions.delete(id); reject(error);}
+  });
+}
+
 function registerActions() {
+  ipcMain.handle('bridge:extensionAction', (event, action, tabId) => {
+    requireTrustedWindow(event);
+    return desktopExtensionAction(action, tabId);
+  });
+  ipcMain.handle('bridge:getAgentSettings', (event) => {
+    requireTrustedWindow(event);
+    return structuredClone(agentSettings);
+  });
+  ipcMain.handle('bridge:getDefaultAgentSettings', (event) => {
+    requireTrustedWindow(event);
+    return structuredClone(DEFAULT_AGENT_SETTINGS);
+  });
+  ipcMain.handle('bridge:saveAgentSettings', (event, next) => {
+    requireTrustedWindow(event);
+    agentSettings = normalizeAgentSettings(next);
+    writeSettings();
+    agentSettingsSyncRevision = 0;
+    if (child && phase === 'running') child.postMessage({ type: 'reload_agent_settings' });
+    publishState();
+    return structuredClone(agentSettings);
+  });
   ipcMain.handle('bridge:status', (event) => { requireTrustedWindow(event); return state(); });
   ipcMain.handle('bridge:setMinimizeToTray', (event, enabled) => {
     requireTrustedWindow(event);

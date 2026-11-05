@@ -7,7 +7,7 @@
   "main": "desktop/main.mjs",
   "scripts": {
     "start": "node server.js",
-    "test": "node test/smoke.mjs && node --test test/desktop-config.test.mjs test/ngrok-diagnostics.test.mjs test/server-lifecycle.test.mjs test/gateway.test.mjs test/renderer.test.mjs test/tray-lifecycle.test.mjs test/principal-auth.test.mjs test/scoped-mcp-auth.test.mjs test/owner-acl.test.mjs test/private-journal.test.mjs test/private-journal-disk.test.mjs test/coordination-storage.test.mjs test/private-coordination-mcp.test.mjs test/ui-assets.test.mjs test/read-chat-extraction.test.mjs test/read-chat-structured.test.mjs test/read-chat-mcp-e2e.test.mjs",
+    "test": "node test/smoke.mjs && node --test test/agent-settings.test.mjs test/extension-settings-ws.test.mjs test/extension-settings-renderer.test.mjs test/desktop-config.test.mjs test/ngrok-diagnostics.test.mjs test/server-lifecycle.test.mjs test/gateway.test.mjs test/renderer.test.mjs test/tray-lifecycle.test.mjs test/principal-auth.test.mjs test/scoped-mcp-auth.test.mjs test/owner-acl.test.mjs test/private-journal.test.mjs test/private-journal-disk.test.mjs test/coordination-storage.test.mjs test/private-coordination-mcp.test.mjs test/ui-assets.test.mjs test/read-chat-extraction.test.mjs test/read-chat-structured.test.mjs test/read-chat-mcp-e2e.test.mjs",
     "desktop": "electron .",
     "dist:win": "electron-builder --win portable"
   },
@@ -27,6 +27,7 @@
     "files": [
       "desktop/**/*",
       "server.js",
+      "agent-settings.mjs",
       "principal-auth.mjs",
       "package.json",
       "node_modules/**/*"

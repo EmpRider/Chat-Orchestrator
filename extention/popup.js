@@ -1,79 +1,36 @@
 const $ = (id) => document.getElementById(id);
-const FIELDS = ['serverUrl', 'token', 'maxWorkers', 'maxTasksPerHour', 'taskTimeoutMin', 'workerSystemPrompt'];
 
-function show(text) {
-  $('out').hidden = false;
-  $('out').textContent = typeof text === 'string' ? text : JSON.stringify(text, null, 2);
-}
-
-async function refresh(fillFields) {
-  const s = await chrome.runtime.sendMessage({ type: 'popup_status' });
-  const connected = s.wsState === 'connected';
-  $('status').textContent = `Server: ${s.wsState}`;
+async function refresh(fillFields = false) {
+  const status = await chrome.runtime.sendMessage({type: 'popup_status'});
+  const connected = status.wsState === 'connected' && status.settingsSynced;
+  $('status').textContent = status.wsState === 'connected' && !status.settingsSynced
+    ? 'Connected · Settings not authorized (use the extension-only token)'
+    : `Proxy: ${status.wsState} · ${status.settingsSynced ? 'Settings synced' : 'Not synced'}`;
   $('status').className = `status ${connected ? 'ok' : 'bad'}`;
-  $('info').textContent =
-    `Orchestrator tab: ${s.cfg.orchestratorTabId ?? 'not set'} · Workers: ${s.workers.length} · Running: ${s.running} · Private storage: ${s.coordinationMode || 'unknown'}`;
-  $('enabled').checked = s.cfg.enabled;
-  $('autoClose').checked = false;
-  $('autoClose').disabled = true;
-  $('useSysPrompt').checked = s.cfg.useWorkerSystemPrompt;
-  if (fillFields) FIELDS.forEach((f) => ($(f).value = s.cfg[f]));
+  $('info').textContent = `Worker tabs: ${status.workers.length} · Running: ${status.running} · Private queue: ${status.coordinationMode || 'unknown'}`;
+  if (fillFields) {
+    $('serverUrl').value = status.cfg.serverUrl;
+    $('token').value = status.cfg.token;
+  }
 }
-
-async function activeChatTab() {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  return tab;
-}
-
-$('enabled').addEventListener('change', async (e) => {
-  await chrome.storage.local.set({ enabled: e.target.checked });
-  refresh(false);
-});
-
-$('autoClose').addEventListener('change', () => { $('autoClose').checked = false; });
-
-$('useSysPrompt').addEventListener('change', async (e) => {
-  await chrome.storage.local.set({ useWorkerSystemPrompt: e.target.checked });
-});
-
-$('resetPrompt').addEventListener('click', async () => {
-  await chrome.storage.local.remove('workerSystemPrompt');
-  refresh(true);
-});
 
 $('save').addEventListener('click', async () => {
-  const values = {
-    serverUrl: $('serverUrl').value.trim(),
-    token: $('token').value.trim(),
-    maxWorkers: Number($('maxWorkers').value) || 10,
-    maxTasksPerHour: Number($('maxTasksPerHour').value) || 100,
-    taskTimeoutMin: Number($('taskTimeoutMin').value) || 60,
-    workerSystemPrompt: $('workerSystemPrompt').value,
-  };
-  await chrome.storage.local.set(values);
-  await chrome.runtime.sendMessage({ type: 'reconnect' });
-  setTimeout(() => refresh(false), 800);
-});
-
-$('setOrch').addEventListener('click', async () => {
-  const tab = await activeChatTab();
-  await chrome.runtime.sendMessage({ type: 'set_orchestrator', tabId: tab.id });
-  refresh(false);
-});
-
-$('diagnose').addEventListener('click', async () => {
-  const tab = await activeChatTab();
+  const url = $('serverUrl').value.trim();
+  const token = $('token').value.trim();
+  let validUrl = false;
   try {
-    show(await chrome.tabs.sendMessage(tab.id, { cmd: 'diagnose' }));
-  } catch {
-    show('Content script not reachable in this tab. Open a claude.ai / chatgpt.com tab and reload it.');
+    const parsed = new URL(url);
+    validUrl = (parsed.protocol === 'ws:' || parsed.protocol === 'wss:') &&
+      parsed.pathname === '/bridge' && !parsed.username && !parsed.password;
+  } catch {}
+  if (!validUrl || !token || token.length > 256) {
+    $('status').textContent = 'Enter a valid bridge WebSocket URL and extension-only token.';
+    $('status').className = 'status bad';
+    return;
   }
-});
-
-$('closeAll').addEventListener('click', async () => {
-  const result = await chrome.runtime.sendMessage({ type: 'close_all_workers' });
-  show(`Closed ${result.closed || 0} legacy workers; protected/active tabs held: ${result.held || 0}.`);
-  refresh(false);
+  await chrome.storage.local.set({serverUrl: url, token});
+  await chrome.runtime.sendMessage({type: 'reconnect'});
+  setTimeout(() => refresh(false), 650);
 });
 
 refresh(true);

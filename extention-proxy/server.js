@@ -15,6 +15,7 @@ import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { listPrincipalCredentials, resolvePrincipalCredential } from './principal-auth.mjs';
+import { disabledAgentSettings, normalizeAgentSettings } from './agent-settings.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 8787);
@@ -48,6 +49,31 @@ const PRINCIPAL_REGISTRY_FILE = path.join(
   path.dirname(process.env.BRIDGE_TOKEN_FILE || path.join(__dirname, '.token')),
   'coordination-principals.json'
 );
+// Settings live beside this profile's bridge token, never in the extension.
+const AGENT_SETTINGS_FILE = path.join(path.dirname(PRINCIPAL_REGISTRY_FILE), 'settings.json');
+let agentSettings = disabledAgentSettings();
+let agentSettingsRevision = 0;
+const trustedExtensionSockets = new WeakSet();
+function reloadAgentSettings() {
+  try {
+    if (!fs.existsSync(AGENT_SETTINGS_FILE)) {
+      agentSettings = normalizeAgentSettings({});
+    } else {
+      if (fs.statSync(AGENT_SETTINGS_FILE).size > 128000) throw new Error('settings file too large');
+      const stored = JSON.parse(fs.readFileSync(AGENT_SETTINGS_FILE, 'utf8'));
+      agentSettings = normalizeAgentSettings(stored.agentSettings || {});
+    }
+  } catch (error) {
+    console.error('[settings] invalid profile settings; automation remains disabled:', error.message);
+    agentSettings = disabledAgentSettings();
+  }
+  agentSettingsRevision++;
+}
+function sendAgentSettings(ws) {
+  if (ws?.readyState !== 1 || !trustedExtensionSockets.has(ws)) return;
+  ws.send(JSON.stringify({type: 'settings_snapshot', schema: 1,
+    revision: agentSettingsRevision, settings: agentSettings}));
+}
 
 function safeEqual(a, b) {
   const A = Buffer.from(String(a));
@@ -802,6 +828,7 @@ wss.on('connection', (ws) => {
   console.log('[bridge] extension connected');
   ws.send(JSON.stringify({ type: 'coordination_capabilities',
     queue_enabled: privateCoordinationEnabled && Boolean(privateJournal) }));
+  sendAgentSettings(ws);
 
   ws.on('message', (raw) => {
     if (ws !== bridge) return; // Stale transport may never ACK a new generation.
@@ -809,6 +836,12 @@ wss.on('connection', (ws) => {
     try {
       msg = JSON.parse(raw.toString());
     } catch {
+      return;
+    }
+    if (msg.type === 'settings_applied') {
+      if (trustedExtensionSockets.has(ws) && msg.revision === agentSettingsRevision) {
+        process.parentPort?.postMessage({type: 'agent_settings_synced', revision: msg.revision});
+      }
       return;
     }
     if (msg.type === 'ping') {
@@ -1621,23 +1654,27 @@ httpServer.on('upgrade', (req, socket, head) => {
     !req.headers.forwarded;
   // Legacy bridge remains compatible while private coordination is off.
   // Private worker completion/attestation NEVER uses the shared MCP token.
+  const extensionAuthenticated = Boolean(directLocal && EXTENSION_TOKEN && safeEqual(supplied, EXTENSION_TOKEN));
   const ok = url.pathname === '/bridge' &&
     (privateCoordinationRequested
-      ? Boolean(directLocal && EXTENSION_TOKEN && safeEqual(supplied, EXTENSION_TOKEN))
-      : safeEqual(supplied, TOKEN) ||
-        Boolean(EXTENSION_TOKEN && safeEqual(supplied, EXTENSION_TOKEN)));
+      ? extensionAuthenticated
+      : safeEqual(supplied, TOKEN) || extensionAuthenticated);
   if (!ok) {
     socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
     socket.destroy();
     return;
   }
-  wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    if (extensionAuthenticated) trustedExtensionSockets.add(ws);
+    wss.emit('connection', ws, req);
+  });
 });
 
 export async function startServer() {
   if (httpServer.listening) return httpServer.address();
   TOKEN = loadToken();
   EXTENSION_TOKEN = loadExtensionToken();
+  reloadAgentSettings();
   if (privateCoordinationRequested && !EXTENSION_TOKEN) {
     throw new Error('Private coordination requires separate extension bridge credential');
   }
@@ -1700,6 +1737,28 @@ export async function stopServer() {
 
 if (process.parentPort) {
   process.parentPort.on('message', async (event) => {
+    if (event?.data?.type === 'desktop_extension_action') {
+      const id = event.data.request_id;
+      if (!PRIVATE_EVENT_ID.test(id || '')) return;
+      const action = event.data.action;
+      const method = {set_orchestrator: 'desktop_set_orchestrator_tab',
+        diagnose: 'desktop_diagnose_tab', close_legacy_workers: 'desktop_close_legacy_workers'}[action];
+      if (!method) return;
+      try {
+        const result = await callExtension(method, {tab_id: event.data.tab_id}, 12000);
+        process.parentPort.postMessage({type:'desktop_extension_action_result',request_id:id,ok:true,result});
+      } catch (error) {
+        process.parentPort.postMessage({type:'desktop_extension_action_result',request_id:id,ok:false,
+          error:String(error?.message || 'Extension action failed')});
+      }
+      return;
+    }
+    if (event?.data?.type === 'reload_agent_settings') {
+      reloadAgentSettings();
+      sendAgentSettings(bridge);
+      process.parentPort.postMessage({ type: 'agent_settings_reloaded', revision: agentSettingsRevision });
+      return;
+    }
     if (event?.data?.type === 'attest_manager_tab') {
       const requestId = event.data.request_id;
       if (!PRIVATE_EVENT_ID.test(requestId || '')) return;

@@ -122,3 +122,25 @@ button.wide { width: 100%; margin-top: auto; }
 .coordination-scroll { min-height: 35px; max-height: 118px; overflow: auto; padding: 5px 7px; border: 1px solid var(--border); border-radius: 6px; background: #0b0b0e; font-size: 10px; color: #aeb4c1; }
 .coordination-row { padding: 4px 0; border-bottom: 1px solid #24252c; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .coordination-row:last-child { border-bottom: 0; }
+
+.extension-settings-panel { margin: 0 0 11px; padding: 10px 14px; }
+.extension-settings-panel summary { cursor: pointer; color: #c6d8f9; font-weight: 650; font-size: 11px; }
+.extension-settings-panel summary .hint { float: right; }
+.extension-settings-panel[open] summary { margin-bottom: 10px; }
+.extension-settings-grid { display: grid; grid-template-columns: minmax(0, .75fr) minmax(0, 1.45fr); gap: 18px; margin: 12px 0; }
+.extension-behavior, .extension-prompts { min-width: 0; }
+.extension-behavior .tray-toggle { display: flex; margin: 0 0 10px; }
+.extension-settings-panel select, .extension-settings-panel textarea {
+  width: 100%; border: 1px solid #303039; border-radius: 7px; background: #08080a;
+  color: #e5e5e9; padding: 8px 10px; font: 11px/1.5 Consolas, ui-monospace, monospace;
+}
+.extension-settings-panel select { font-family: inherit; height: 34px; }
+.extension-settings-panel textarea { margin-top: 8px; min-height: 165px; resize: vertical; }
+.extension-settings-panel .input-row { margin-top: 10px; flex-wrap: wrap; }
+#agent-settings-message { white-space: normal; line-height: 1.4; }
+
+.extension-admin-actions { border-top: 1px solid var(--border); margin-top: 10px; padding-top: 9px; }
+.extension-admin-actions summary { cursor: pointer; color: #aebedb; font-size: 10px; }
+.extension-admin-actions .input-row { gap: 6px; }
+.extension-admin-actions .input-row button { white-space: normal; }
+#agent-admin-output { margin-top: 10px; white-space: pre-wrap; overflow-wrap: anywhere; }

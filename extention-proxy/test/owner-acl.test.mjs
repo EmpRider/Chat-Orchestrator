@@ -74,19 +74,19 @@ test('all six Worker Tool operations enforce credential and tab ownership', asyn
   runInContext(source, ctx);
   const handleCall = runInContext('handleCall', ctx);
   const defaults = runInContext('DEFAULTS', ctx);
-  assert.equal(defaults.maxWorkers, 10);
-  assert.equal(defaults.maxTasksPerHour, 100);
-  assert.equal(defaults.taskTimeoutMin, 60);
+  assert.match(defaults.serverUrl, /\/bridge$/);
+  assert.equal(runInContext('proxySettings', ctx), null, 'Extension starts fail-closed without proxy snapshot');
+  runInContext("proxySettings = { enabled: true, maxWorkers: 10, maxTasksPerHour: 100, taskTimeoutMin: 60, useWorkerSystemPrompt: true, systemPrompts: { worker: 'Worker default', specialist: 'Specialist guidance', council_a: 'Council A / Systems guidance', watchdog: 'BA Watchdog guidance' } }", ctx);
   assert.equal(runInContext('SITES.gemini.newChatUrl', ctx), 'https://gemini.google.com/app');
   const buildPrompt = runInContext('buildWorkerPrompt', ctx);
-  const migrated = buildPrompt({ useWorkerSystemPrompt: true,
-    workerSystemPrompt: 'Read the agent-team skill before working.\nUse agent-team and stay focused.\nKeep evidence exact.' },
+  const editable = buildPrompt({ useWorkerSystemPrompt: true,
+    systemPrompts: { council_a: 'Council A / Systems guidance',
+      watchdog: 'BA Watchdog guidance', worker: 'User-edited instructions remain intact.' } },
     'Investigate one scope', '', 'council_a');
-  assert.match(migrated, /Council A \/ Systems/);
-  assert.match(migrated, /Use AgentBridge only/);
-  assert.match(migrated, /<system_instructions>\nKeep evidence exact\.\n<\/system_instructions>/);
-  assert.doesNotMatch(migrated, /<system_instructions>[\s\S]*agent-team/);
-  assert.match(buildPrompt({ useWorkerSystemPrompt: false }, 'Check', '', 'watchdog'), /BA Watchdog/);
+  assert.match(editable, /Council A \/ Systems/);
+  assert.match(editable, /<system_instructions>\nUser-edited instructions remain intact\./);
+  assert.match(buildPrompt({ useWorkerSystemPrompt: false,
+    systemPrompts: {watchdog: 'BA Watchdog guidance'} }, 'Check', '', 'watchdog'), /BA Watchdog/);
   const withOwner = (p, principal) => ({ ...p, __trustedPrincipal: principal });
 
   const ownTabs = await handleCall('list_tabs', withOwner({}, principalA));

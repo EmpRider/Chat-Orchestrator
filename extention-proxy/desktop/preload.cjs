@@ -1,6 +1,10 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('bridge', Object.freeze({
+  extensionAction: (action, tabId) => ipcRenderer.invoke('bridge:extensionAction', action, tabId),
+  getAgentSettings: () => ipcRenderer.invoke('bridge:getAgentSettings'),
+  getDefaultAgentSettings: () => ipcRenderer.invoke('bridge:getDefaultAgentSettings'),
+  saveAgentSettings: (settings) => ipcRenderer.invoke('bridge:saveAgentSettings', settings),
   status: () => ipcRenderer.invoke('bridge:status'),
   configurePort: (port) => ipcRenderer.invoke('bridge:configurePort', port),
   setMinimizeToTray: (enabled) => ipcRenderer.invoke('bridge:setMinimizeToTray', enabled),

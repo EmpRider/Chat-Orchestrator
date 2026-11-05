@@ -47,6 +47,52 @@
       <p class="help">Read-only proxy snapshot. DELIVERED is not PROCESSED; Saga confirmation is separate. UNCERTAIN requires manual reconciliation.</p>
     </details>
 
+    <details class="panel extension-settings-panel" id="extension-settings-panel">
+      <summary>Extension settings &amp; system prompts <span id="extension-settings-sync" class="hint">Profile-scoped · opens on demand</span></summary>
+      <p class="help">Proxy-managed settings synchronize to the extension when connected with this profile's extension-only token. The extension popup keeps only WebSocket URL and token.</p>
+      <div class="extension-settings-grid">
+        <div class="extension-behavior">
+          <label class="tray-toggle" for="agent-enabled"><input type="checkbox" id="agent-enabled" /> Automation enabled</label>
+          <label class="tray-toggle" for="agent-use-prompt"><input type="checkbox" id="agent-use-prompt" /> Include worker system prompt</label>
+          <label for="agent-max-workers">Max worker tabs (1–10)</label><input id="agent-max-workers" type="number" min="1" max="10" />
+          <label for="agent-max-tasks">Max tasks per hour (1–500)</label><input id="agent-max-tasks" type="number" min="1" max="500" />
+          <label for="agent-timeout">Task timeout in minutes (1–60)</label><input id="agent-timeout" type="number" min="1" max="60" />
+          <p class="help">Worker auto-close is held until verified Saga completion; this safety rule is not editable.</p>
+        </div>
+        <div class="extension-prompts">
+          <label for="agent-prompt-role">Editable system prompt</label>
+          <select id="agent-prompt-role">
+            <option value="worker">Default worker system prompt</option>
+            <option value="ba">Business Analyst</option><option value="pm">Project Manager</option>
+            <option value="tl">Technical Lead</option><option value="specialist">Specialist</option>
+            <option value="council_a">Council A · Systems</option><option value="council_b">Council B · Security</option>
+            <option value="council_c">Council C · Architecture</option><option value="council_d">Council D · QA</option>
+            <option value="council_e">Council E · Devil's advocate</option><option value="watchdog">BA Watchdog</option>
+          </select>
+          <textarea id="agent-prompt-text" rows="9" spellcheck="false" placeholder="Select a role to edit its prompt"></textarea>
+          <div class="input-row">
+            <button id="agent-prompt-reset" type="button" class="link-button">Reset selected prompt</button>
+            <button id="agent-reset-all" type="button" class="secondary">Reset all</button>
+          </div>
+        </div>
+      </div>
+      <div class="input-row">
+        <button id="agent-settings-save" type="button" class="primary">Save extension settings</button>
+        <span id="agent-settings-message" class="hint" role="status" aria-live="polite">Open to load this profile's settings.</span>
+      </div>
+      <details class="extension-admin-actions">
+        <summary>Advanced browser actions</summary>
+        <p class="help">Provide a supported ChatGPT / Claude / Gemini tab ID from list_tabs. Scoped worker tabs remain protected from legacy closure.</p>
+        <label for="agent-admin-tab">Browser chat tab ID</label><input id="agent-admin-tab" type="number" min="1" placeholder="e.g. 101" />
+        <div class="input-row">
+          <button id="agent-set-orchestrator" type="button" class="secondary">Set legacy orchestrator</button>
+          <button id="agent-diagnose-tab" type="button" class="secondary">Diagnose tab</button>
+          <button id="agent-close-legacy" type="button" class="secondary">Close idle legacy workers</button>
+        </div>
+        <pre id="agent-admin-output" class="coordination-scroll" hidden></pre>
+      </details>
+    </details>
+
     <div class="workspace-grid">
       <div class="column-stack">
         <section class="panel">

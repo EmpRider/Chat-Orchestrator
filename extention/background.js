@@ -12,51 +12,38 @@ const TAB_PATTERNS = [
   'https://gemini.google.com/*',
 ];
 
-// Sent once, at the top of the first message of every NEW worker chat (spawn_worker).
-// Editable in the popup. Follow-ups (send_to_tab) do not repeat it.
-const DEFAULT_WORKER_PROMPT = [
-  'You are a worker inside Chat Orchestrator. An authorized manager delegated the task below; return a precise result.',
-  '',
-  'Use AgentBridge for file, source, Saga MCP and project operations as available. Do not use the agent-team skill.',
-  'Do not spawn other agents unless the manager explicitly requests delegation.',
-  'Preserve workspace/project/task boundaries and follow the exact requested scope.',
-  'For code work: report changed paths, actual test/build evidence, unverified gaps and safety holds.',
-  'For Saga work: update the assigned board task before completion; include exact IDs and ask the manager to independently read back evidence.',
-  'If a task is blocked, mark it clearly; never invent successful commits, tests, Saga effects or chat delivery ACKs.',
-  'Never close this tab yourself. The manager owns closure after independent Saga verification.',
-  'Complete tool use first; finish with a structured, concise result containing task status, evidence, and blockers.',
-].join('\n');
-
-const ROLE_GUIDANCE = Object.freeze({
-  ba: 'BA: maintain one active epic; verify Saga before task closure, own Watchdog checkpoints.',
-  pm: 'PM: maintain one active epic, reuse Council seats, delegate and end turn; process all queued child results before status requests.',
-  tl: 'TL: maintain one active major task; collect specialist evidence and independent review before handoff.',
-  specialist: 'Specialist: implement only assigned file/function scope, then report evidence and gaps; keep tab open.',
-  council_a: 'Council A / Systems: independent system design, immutable initial proposal and anonymous peer review.',
-  council_b: 'Council B / Security: independent trust and authorization analysis; report falsifiers.',
-  council_c: 'Council C / Architecture: independent integration and storage tradeoffs; report assumptions.',
-  council_d: 'Council D / QA: independent verification criteria and failure scenarios.',
-  council_e: 'Council E / Devil\'s advocate: independently challenge claims; do not silently revise frozen positions.',
-  watchdog: 'BA Watchdog: independent read-only verification, clear PASS/CHANGES-NEEDED, no delegated release authority.',
-});
-
-const DEFAULTS = {
-  serverUrl: 'ws://localhost:8787/bridge',
-  token: '',
-  enabled: true, // kill switch
-  autoCloseWorkers: false, // default: the ORCHESTRATOR closes workers with close_worker (spawn_worker auto_close=true overrides per worker)
-  useWorkerSystemPrompt: true,
-  workerSystemPrompt: DEFAULT_WORKER_PROMPT,
-  maxWorkers: 10,
-  maxTasksPerHour: 100,
-  taskTimeoutMin: 60,
-  orchestratorTabId: null,
-};
-
+// Connection details stay in the extension. All behavior and prompts arrive only
+// from a WebSocket authenticated using the desktop's extension-only credential.
+const DEFAULTS = { serverUrl: 'ws://localhost:8787/bridge', token: '', orchestratorTabId: null };
+let proxySettings = null;
+let proxySettingsRevision = 0;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const getConfig = async () => ({ ...DEFAULTS, ...(await chrome.storage.local.get(Object.keys(DEFAULTS))),
-  autoCloseWorkers: false, // Forced until independent Saga closure verification.
+const getConfig = async () => ({
+  ...DEFAULTS,
+  ...(await chrome.storage.local.get(Object.keys(DEFAULTS))),
+  ...(proxySettings || {enabled: false, maxWorkers: 0, maxTasksPerHour: 0, taskTimeoutMin: 0,
+    useWorkerSystemPrompt: false, systemPrompts: {}}),
+  autoCloseWorkers: false, // Forced until independently verified Saga closure.
 });
+function acceptProxySettings(msg) {
+  if (msg.schema !== 1 || !Number.isSafeInteger(msg.revision) || msg.revision <= 0 ||
+      msg.revision < proxySettingsRevision ||
+      !msg.settings || typeof msg.settings !== 'object') return false;
+  const c = msg.settings;
+  const names = ['worker','ba','pm','tl','specialist','council_a','council_b','council_c','council_d','council_e','watchdog'];
+  if (typeof c.enabled !== 'boolean' || typeof c.useWorkerSystemPrompt !== 'boolean' ||
+      !Number.isSafeInteger(c.maxWorkers) || c.maxWorkers < 1 || c.maxWorkers > 10 ||
+      !Number.isSafeInteger(c.maxTasksPerHour) || c.maxTasksPerHour < 1 || c.maxTasksPerHour > 500 ||
+      !Number.isSafeInteger(c.taskTimeoutMin) || c.taskTimeoutMin < 1 || c.taskTimeoutMin > 60 ||
+      !c.systemPrompts || typeof c.systemPrompts !== 'object' ||
+      names.some((name) => typeof c.systemPrompts[name] !== 'string' ||
+        !c.systemPrompts[name].trim() || c.systemPrompts[name].length > 8192)) return false;
+  proxySettings = {enabled: c.enabled, useWorkerSystemPrompt: c.useWorkerSystemPrompt,
+    maxWorkers: c.maxWorkers, maxTasksPerHour: c.maxTasksPerHour,
+    taskTimeoutMin: c.taskTimeoutMin, systemPrompts: Object.fromEntries(names.map((name) => [name, c.systemPrompts[name]]))};
+  proxySettingsRevision = msg.revision;
+  return true;
+}
 
 function siteOfUrl(url = '') {
   if (/^https:\/\/claude\.ai\//.test(url)) return 'claude';
@@ -193,7 +180,8 @@ function waitTask(id, ms) {
 async function guard({ newWorker = false } = {}) {
   await stateReady;
   const cfg = await getConfig();
-  if (!cfg.enabled) throw new Error('Kill switch is ON in the extension popup. Automation is disabled.');
+  if (!proxySettings) throw new Error('Proxy settings not synchronized. Connect with the desktop extension-only token.');
+  if (!cfg.enabled) throw new Error('Automation is disabled in the proxy Settings panel.');
 
   const hourAgo = Date.now() - 3600 * 1000;
   taskLog = taskLog.filter((ts) => ts > hourAgo);
@@ -342,13 +330,10 @@ async function waitReady(tabId, timeoutMs = 45000) {
 // ------------------------------------------------------------------ tasks
 function buildWorkerPrompt(cfg, task, contextTranscript, role = 'specialist') {
   const parts = [];
-  parts.push('<role_instructions>\n' + (ROLE_GUIDANCE[role] || ROLE_GUIDANCE.specialist) + '\nUse AgentBridge only. Never invoke the agent-team skill.\n</role_instructions>');
-  if (cfg.useWorkerSystemPrompt && String(cfg.workerSystemPrompt || '').trim()) {
-    // Migrate unsafe legacy default clauses in memory without rewriting user settings.
-    const clean = cfg.workerSystemPrompt.split('\n')
-      .filter((line) => !/\bagent-team\b/i.test(line))
-      .join('\n').trim();
-    parts.push(`<system_instructions>\n${clean}\n</system_instructions>`);
+  const prompts = cfg.systemPrompts || {};
+  parts.push('<role_instructions>\n' + (prompts[role] || prompts.specialist || '') + '\n</role_instructions>');
+  if (cfg.useWorkerSystemPrompt && String(prompts.worker || '').trim()) {
+    parts.push(`<system_instructions>\n${prompts.worker}\n</system_instructions>`);
   }
   if (contextTranscript) {
     parts.push(
@@ -418,6 +403,30 @@ async function handleCall(method, p = {}) {
     await callerManagerTab(p, await getConfig()); // All six public Worker Tool operations.
   }
   switch (method) {
+    // Called only through trusted desktop IPC -> proxy utilityProcess. Never registered as MCP tools.
+    case 'desktop_set_orchestrator_tab': {
+      if (!Number.isSafeInteger(p.tab_id) || p.tab_id <= 0) throw new Error('Invalid tab ID');
+      const tab = await chrome.tabs.get(p.tab_id).catch(() => null);
+      if (!tab || !siteOfUrl(tab.url)) throw new Error('The tab is not a supported chat conversation');
+      await chrome.storage.local.set({orchestratorTabId: p.tab_id});
+      return {orchestratorTabId: p.tab_id};
+    }
+    case 'desktop_diagnose_tab': {
+      if (!Number.isSafeInteger(p.tab_id) || p.tab_id <= 0) throw new Error('Invalid tab ID');
+      const tab = await chrome.tabs.get(p.tab_id).catch(() => null);
+      if (!tab || !siteOfUrl(tab.url)) throw new Error('The tab is not a supported chat conversation');
+      return tabMessage(p.tab_id, {cmd: 'diagnose'});
+    }
+    case 'desktop_close_legacy_workers': {
+      let closed = 0;
+      let held = 0;
+      for (const tabId of [...workers]) {
+        if ((workerOwners[tabId] || 'legacy') !== 'legacy') continue;
+        try { await handleCall('close_worker', {tab_id: tabId}); closed++; }
+        catch { held++; }
+      }
+      return {closed, held};
+    }
     case 'attest_manager_tab': {
       // Internal proxy utilityProcess request from trusted desktop IPC only.
       if (!Number.isSafeInteger(p.tab_id) || p.tab_id <= 0) throw new Error('Invalid manager tab');
@@ -682,8 +691,12 @@ async function connect() {
     return scheduleReconnect();
   }
 
+  const thisSocket = ws;
   ws.onopen = () => {
+    if (thisSocket !== ws) return;
     wsState = 'connected';
+    proxySettings = null;
+    proxySettingsRevision = 0;
     privateQueueMode = 'unknown';
     attempts = 0;
     clearInterval(keepTimer);
@@ -692,10 +705,21 @@ async function connect() {
   };
 
   ws.onmessage = async (ev) => {
+    if (thisSocket !== ws) return;
     let msg;
     try {
       msg = JSON.parse(ev.data);
     } catch {
+      return;
+    }
+    if (msg.type === 'settings_snapshot') {
+      if (!acceptProxySettings(msg)) {
+        proxySettings = null;
+        wsState = 'invalid proxy settings';
+      }
+      else if (ws?.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({type: 'settings_applied', revision: msg.revision}));
+      }
       return;
     }
     if (msg.type === 'coordination_capabilities') {
@@ -712,7 +736,7 @@ async function connect() {
       return;
     }
     if (msg.type !== 'call') return;
-    const socket = ws;
+    const socket = thisSocket;
     try {
       const result = await handleCall(msg.method, msg.params || {});
       socket.send(JSON.stringify({ type: 'result', id: msg.id, ok: true, result }));
@@ -722,7 +746,10 @@ async function connect() {
   };
 
   ws.onclose = () => {
+    if (thisSocket !== ws) return;
     wsState = 'disconnected';
+    proxySettings = null;
+    proxySettingsRevision = 0;
     privateQueueMode = 'unknown';
     for (const [id, pending] of workerReceiptWaiters) {
       clearTimeout(pending.timer);
@@ -771,9 +798,16 @@ function scheduleReconnect() {
 }
 
 function reconnectNow() {
-  try {
-    ws?.close();
-  } catch {}
+  proxySettings = null;
+  proxySettingsRevision = 0;
+  privateQueueMode = 'unknown';
+  for (const [id, pending] of workerReceiptWaiters) {
+    clearTimeout(pending.timer);
+    pending.reject(new Error('Reconnect invalidated outstanding receipt; outcome UNCERTAIN'));
+    workerReceiptWaiters.delete(id);
+  }
+  try { ws?.close(); } catch {}
+  clearInterval(keepTimer);
   ws = null;
   attempts = 0;
   return connect();
@@ -852,7 +886,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({
           wsState,
           coordinationMode: privateQueueMode,
-          cfg,
+          settingsSynced: Boolean(proxySettings),
+          settingsRevision: proxySettingsRevision,
+          cfg: { serverUrl: cfg.serverUrl, token: cfg.token, orchestratorTabId: cfg.orchestratorTabId },
           workers,
           running: Object.values(tasks).filter((t) => t.status === 'running').length,
         });

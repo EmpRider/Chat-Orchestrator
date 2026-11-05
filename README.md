@@ -50,9 +50,12 @@ Orchestrator chat --MCP/HTTPS (tunnel)--> extention-proxy (server.js)
 3. Extract the extension ZIP. Open `chrome://extensions`, enable **Developer mode**,
    select **Load unpacked**, and choose the extracted folder containing `manifest.json`.
    In the extension popup, set the WebSocket URL to `ws://127.0.0.1:8787/bridge`,
-   copy the **bridge token** from the desktop app, and click **Save & reconnect**.
-4. Open the chat you want as orchestrator and click **Set this tab as orchestrator**
-   in the extension popup. Log in to your chosen worker-chat site in the same browser profile.
+   copy the **Extension-only credential** using the desktop app's separate copy button,
+   and click **Save connection & reconnect**. The ordinary MCP bridge token cannot
+   receive system prompts or proxy settings.
+4. In desktop **Extension settings & system prompts**, select **Advanced browser actions**
+   and enter the chat tab ID (from `list_tabs`) to set the legacy orchestrator.
+   Log in to your worker-chat sites in that browser profile.
 5. Once the app shows the ngrok route as verified, click **Copy Connector URL**.
    Add that URL as the ChatGPT connector endpoint. It uses your dedicated domain and
    has the form `https://YOUR-DOMAIN/mcp?token=YOUR-BRIDGE-TOKEN`.
@@ -71,8 +74,10 @@ npm test
 npm run desktop
 ```
 
-The source desktop app uses the same dedicated-ngrok UI. Do not run it alongside
-the portable EXE, because both use local port `8787`.
+The default profile uses port `8787`. For a separate independent local proxy, launch
+ the EXE with `--profile=work` and choose an unused port in **Tunnel settings**.
+ Each profile keeps separate credentials, prompts, Ngrok configuration and settings.
+ Never run two apps with the same profile and port.
 
 ## Verify the pieces
 
@@ -89,7 +94,10 @@ the portable EXE, because both use local port `8787`.
 
 ## Safety knobs
 
-- Kill switch checkbox, max worker windows, max tasks/hour and task timeout (popup).
+- Proxy Tool **Extension settings & system prompts** owns the kill switch, worker limits,
+  task timeout and editable worker/BA/PM/TL/Specialist/Council A–E/Watchdog prompts.
+  The extension popup owns only the WebSocket URL/token and read-only connection status.
+  Settings sync over the extension-only authenticated WebSocket.
 - Token required on both `/mcp` and `/bridge`; server binds to `127.0.0.1` only.
 - `send_to_tab` refuses the orchestrator tab; `close_worker` only closes tabs it spawned.
 

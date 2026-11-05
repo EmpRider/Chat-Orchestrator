@@ -16,6 +16,7 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const readExtension = (name) => readFileSync(path.join(ROOT, '..', 'extention', name), 'utf8');
 const PORT = 8829;
 const TOKEN = 'e2e-fixture-token';
+const EXTENSION_TOKEN = 'fixture-extension-only-' + 'a'.repeat(40);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const cases = [
   { tabId: 110, site: 'chatgpt', hostname: 'chatgpt.com', url: 'https://chatgpt.com/c/12345678-1234-1234-1234-123456789abc' },
@@ -103,7 +104,7 @@ function createContent(siteInfo, apiFailures, domFallback) {
 
 test('MCP read_chat options survive HTTP, WebSocket, background and content scripts', { timeout: 30000 }, async () => {
   const server = spawn(process.execPath, ['server.js'], {
-    cwd: ROOT, env: { ...process.env, PORT: String(PORT), BRIDGE_TOKEN: TOKEN },
+    cwd: ROOT, env: { ...process.env, PORT: String(PORT), BRIDGE_TOKEN: TOKEN, EXTENSION_BRIDGE_TOKEN: EXTENSION_TOKEN },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let client;
@@ -115,7 +116,7 @@ test('MCP read_chat options survive HTTP, WebSocket, background and content scri
     const chrome = {
       storage: {
         local: { get: async () => ({
-          enabled: true, token: TOKEN, serverUrl: `ws://localhost:${PORT}/bridge`,
+          enabled: true, token: EXTENSION_TOKEN, serverUrl: `ws://localhost:${PORT}/bridge`,
           orchestratorTabId: cases[0].tabId,
         }) },
         session: { get: async () => ({ workers: [111, 112], workerOwners: { 111: 'legacy', 112: 'legacy' } }), set: async () => {} },

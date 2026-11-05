@@ -34,6 +34,9 @@ function render(state) {
     : state.coordinationState === 'private_ready' ? 'Private storage ready'
     : state.coordinationState === 'active' ? 'Queue active' : 'Queue unknown';
   $('extension-detail').textContent = `WebSocket · ${pairing} · ${queue}`;
+  $('extension-settings-sync').textContent = state.extensionConnected && state.agentSettingsSyncRevision
+    ? `Extension applied revision ${state.agentSettingsSyncRevision}`
+    : state.extensionConnected ? 'Awaiting settings acknowledgement' : 'Sync on next authenticated connection';
   $('ngrok-state').textContent = state.routeVerified ? 'Online'
     : state.ngrokPhase === 'error' ? 'Error'
     : state.ngrokPhase === 'starting' ? 'Connecting…'
@@ -247,3 +250,79 @@ $('pair-seat').addEventListener('change', () => {
   $('pair-role').value = seat.startsWith('Council') ? 'council'
     : seat === 'BA Watchdog' ? 'watchdog' : seat.toLowerCase();
 });
+
+// Extension behavior is edited only through trusted desktop IPC, never WebSocket writes.
+let agentDraft = null;
+let agentDefaults = null;
+let activeAgentRole = 'worker';
+function flushPromptDraft() {
+  if (agentDraft) agentDraft.systemPrompts[activeAgentRole] = $('agent-prompt-text').value;
+}
+function displayAgentSettings(settings) {
+  $('agent-enabled').checked = settings.enabled;
+  $('agent-use-prompt').checked = settings.useWorkerSystemPrompt;
+  $('agent-max-workers').value = String(settings.maxWorkers);
+  $('agent-max-tasks').value = String(settings.maxTasksPerHour);
+  $('agent-timeout').value = String(settings.taskTimeoutMin);
+  activeAgentRole = 'worker';
+  $('agent-prompt-role').value = activeAgentRole;
+  $('agent-prompt-text').value = settings.systemPrompts[activeAgentRole];
+}
+async function loadAgentSettings() {
+  [agentDraft, agentDefaults] = await Promise.all([
+    window.bridge.getAgentSettings(), window.bridge.getDefaultAgentSettings(),
+  ]);
+  displayAgentSettings(agentDraft);
+  $('agent-settings-message').textContent = 'Loaded. Changes are local until Save.';
+}
+$('extension-settings-panel').addEventListener('toggle', () => {
+  if ($('extension-settings-panel').open && !agentDraft) perform(loadAgentSettings);
+});
+$('agent-prompt-role').addEventListener('change', () => {
+  if (!agentDraft) return;
+  flushPromptDraft();
+  activeAgentRole = $('agent-prompt-role').value;
+  $('agent-prompt-text').value = agentDraft.systemPrompts[activeAgentRole];
+});
+$('agent-prompt-reset').addEventListener('click', () => {
+  if (!agentDraft || !agentDefaults) return;
+  agentDraft.systemPrompts[activeAgentRole] = agentDefaults.systemPrompts[activeAgentRole];
+  $('agent-prompt-text').value = agentDraft.systemPrompts[activeAgentRole];
+  $('agent-settings-message').textContent = 'Selected prompt reset in editor. Click Save to apply.';
+});
+$('agent-reset-all').addEventListener('click', () => {
+  if (!agentDefaults) return;
+  agentDraft = structuredClone(agentDefaults);
+  displayAgentSettings(agentDraft);
+  $('agent-settings-message').textContent = 'All defaults loaded in editor. Click Save to apply.';
+});
+function selectedAdminTab() {
+  const raw = $('agent-admin-tab').value.trim();
+  if (!/^[1-9][0-9]*$/.test(raw)) throw new Error('Enter a positive browser chat tab ID');
+  return Number(raw);
+}
+async function performAgentAction(action, tabId) {
+  const result = await window.bridge.extensionAction(action, tabId);
+  $('agent-admin-output').hidden = false;
+  $('agent-admin-output').textContent = JSON.stringify(result, null, 2);
+}
+$('agent-set-orchestrator').addEventListener('click', () => perform(() =>
+  performAgentAction('set_orchestrator', selectedAdminTab()), 'Legacy orchestrator tab set.'));
+$('agent-diagnose-tab').addEventListener('click', () => perform(() =>
+  performAgentAction('diagnose', selectedAdminTab()), 'Tab diagnostics received.'));
+$('agent-close-legacy').addEventListener('click', () => perform(() =>
+  performAgentAction('close_legacy_workers'), 'Legacy closure request finished; inspect held count.'));
+$('agent-settings-save').addEventListener('click', () => perform(async () => {
+  if (!agentDraft) throw new Error('Open the panel to load profile settings first');
+  flushPromptDraft();
+  const candidate = {
+    enabled: $('agent-enabled').checked,
+    useWorkerSystemPrompt: $('agent-use-prompt').checked,
+    maxWorkers: Number($('agent-max-workers').value),
+    maxTasksPerHour: Number($('agent-max-tasks').value),
+    taskTimeoutMin: Number($('agent-timeout').value),
+    systemPrompts: agentDraft.systemPrompts,
+  };
+  agentDraft = await window.bridge.saveAgentSettings(candidate);
+  $('agent-settings-message').textContent = 'Saved to this profile. Sync sent to connected extension, otherwise sent on next connection.';
+}, 'Extension settings saved to this proxy profile.'));
