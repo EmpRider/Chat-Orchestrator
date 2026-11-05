@@ -35,7 +35,8 @@ test('dark UI has visible icon assets, setting checkbox and accessible controls'
     'Private queue action/status must not visually run together');
   assert.match(html, /id="minimize-to-tray" type="checkbox" checked/);
   assert.match(html, /Minimize to system tray when closing/);
-  for (const name of ['token-value', 'copy-token', 'import-token', 'domain', 'ngrok-token', 'configure-ngrok', 'connector-url', 'copy-url', 'start', 'stop']) {
+  for (const name of ['proxy-port-label', 'proxy-port', 'save-proxy-port', 'profile-description',
+    'extension-local-url', 'token-value', 'copy-token', 'import-token', 'domain', 'ngrok-token', 'configure-ngrok', 'connector-url', 'copy-url', 'start', 'stop']) {
     assert.ok(html.includes(`id="${name}"`), `existing control ${name} must remain`);
   }
   assert.match(html, /Icons by Icons8/);

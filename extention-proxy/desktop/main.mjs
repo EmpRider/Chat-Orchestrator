@@ -4,7 +4,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { connectorUrl, ensureDesktopToken, ISOLATED_NGROK_CONFIG, normalizeNgrokAuthtoken, normalizeNgrokDomain } from './config.mjs';
+import { connectorUrl, ensureDesktopToken, ISOLATED_NGROK_CONFIG, normalizeNgrokAuthtoken, normalizeNgrokDomain, normalizeProxyPort, normalizeProfileName } from './config.mjs';
 import { createNgrokLogReader } from './ngrok-diagnostics.mjs';
 import { preparePrivateJournal } from './coordination-storage.mjs';
 import { createDesktopTray, installWindowCloseBehavior, minimizeToTrayPreference } from './tray-lifecycle.mjs';
@@ -21,7 +21,7 @@ const appDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PACKAGED_SMOKE_MODE = app.isPackaged && process.env.CHAT_ORCH_PACKAGED_SMOKE === '1';
 const E2E_MODE = process.env.CHAT_ORCH_E2E_MODE === '1' &&
   (!app.isPackaged || PACKAGED_SMOKE_MODE);
-const PORT = E2E_MODE ? Number(process.env.CHAT_ORCH_E2E_PORT || 8897) : 8787;
+let PORT = E2E_MODE ? Number(process.env.CHAT_ORCH_E2E_PORT || 8897) : 8787;
 const PACKAGED_SMOKE_EXIT_MS = PACKAGED_SMOKE_MODE
   ? Number(process.env.CHAT_ORCH_PACKAGED_SMOKE_EXIT_MS || 45000) : 0;
 if (E2E_MODE && (!Number.isSafeInteger(PORT) || PORT < 1024 || PORT > 65535 || PORT === 8787)) {
@@ -64,6 +64,19 @@ if (E2E_MODE && !app.isPackaged && process.env.CHAT_ORCH_E2E_CDP_PORT) {
   }
   app.commandLine.appendSwitch('remote-debugging-address', '127.0.0.1');
   app.commandLine.appendSwitch('remote-debugging-port', String(cdpPort));
+}
+// Explicit profile isolation happens before the single-instance lock.
+// The default profile retains its historical userData directory and port.
+const profileArgs = process.argv.filter((arg) => arg === '--profile' || arg.startsWith('--profile='));
+if (profileArgs.length > 1 || profileArgs[0] === '--profile') {
+  throw new Error('Use one --profile=name argument');
+}
+const PROFILE = normalizeProfileName(profileArgs[0]?.slice('--profile='.length) ?? 'default');
+if (E2E_MODE && PROFILE !== 'default') throw new Error('Isolated E2E cannot override its profile');
+if (!E2E_MODE && PROFILE !== 'default') {
+  const profileDir = path.join(app.getPath('appData'), 'Chat Orchestrator Profiles', PROFILE);
+  fs.mkdirSync(profileDir, { recursive: true });
+  app.setPath('userData', profileDir);
 }
 // Explicit E2E profile prevents single-instance takeover or mutation of live user settings.
 if (E2E_MODE) {
@@ -123,6 +136,7 @@ function state() {
     principalState,
     coordinationSnapshot,
     domain,
+    profile: PROFILE,
     port: PORT,
     routeVerified,
     minimizeToTray,
@@ -142,16 +156,18 @@ function loadSettings() {
     domain = saved.domain ? normalizeNgrokDomain(saved.domain) : '';
     minimizeToTray = minimizeToTrayPreference(saved.minimizeToTray);
     privateCoordinationOptIn = saved.privateCoordinationOptIn === true;
+    if (!E2E_MODE) PORT = normalizeProxyPort(saved.proxyPort ?? 8787);
   } catch {
     domain = '';
     minimizeToTray = true;
     privateCoordinationOptIn = false;
+    if (!E2E_MODE) PORT = 8787;
   }
 }
 
 function writeSettings() {
   fs.mkdirSync(dataDir(), { recursive: true });
-  fs.writeFileSync(settingsFile(), JSON.stringify({ domain, minimizeToTray, privateCoordinationOptIn }, null, 2), 'utf8');
+  fs.writeFileSync(settingsFile(), JSON.stringify({ domain, minimizeToTray, privateCoordinationOptIn, proxyPort: PORT }, null, 2), 'utf8');
 }
 
 async function saveNgrokAuth(value) {
@@ -307,8 +323,10 @@ function startProxy() {
   publishState();
 
   try {
-    token = ensureDesktopToken(tokenFile(), app.isPackaged ? undefined : path.join(appDir, '.token'), process.env.BRIDGE_TOKEN);
-    extensionToken = ensureDesktopToken(extensionTokenFile(), undefined, process.env.EXTENSION_BRIDGE_TOKEN);
+    token = ensureDesktopToken(tokenFile(), app.isPackaged || PROFILE !== 'default'
+      ? undefined : path.join(appDir, '.token'), PROFILE === 'default' ? process.env.BRIDGE_TOKEN : undefined);
+    extensionToken = ensureDesktopToken(extensionTokenFile(), undefined,
+      PROFILE === 'default' ? process.env.EXTENSION_BRIDGE_TOKEN : undefined);
     if (token === extensionToken) throw new Error('Extension and MCP tokens must differ');
     debug(`starting local MCP proxy at 127.0.0.1:${PORT}`);
     const processForThisStart = utilityProcess.fork(path.join(appDir, 'server.js'), [], {
@@ -496,6 +514,20 @@ function registerActions() {
     domain = nextDomain;
     writeSettings();
     await startNgrok();
+    publishState();
+    return state();
+  });
+  ipcMain.handle('bridge:configurePort', (event, value) => {
+    requireTrustedWindow(event);
+    if (E2E_MODE) throw new Error('Isolated test port is fixed by its test profile');
+    const next = normalizeProxyPort(value);
+    if (next === PORT) return state();
+    if (child || ngrokChild || phase === 'starting' || phase === 'stopping' ||
+        ngrokPhase === 'starting' || ngrokPhase === 'stopping') {
+      throw new Error('Stop the local proxy and Ngrok before changing this profile port');
+    }
+    PORT = next;
+    writeSettings();
     publishState();
     return state();
   });

@@ -3,7 +3,21 @@ import { mkdtempSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
-import { normalizeNgrokDomain, normalizeNgrokAuthtoken, connectorUrl, ensureDesktopToken, ISOLATED_NGROK_CONFIG } from '../desktop/config.mjs';
+import { normalizeNgrokDomain, normalizeNgrokAuthtoken, connectorUrl, ensureDesktopToken, ISOLATED_NGROK_CONFIG, normalizeProxyPort, normalizeProfileName } from '../desktop/config.mjs';
+
+test('named profiles and per-profile proxy ports validate before filesystem or socket use', () => {
+  assert.equal(normalizeProfileName('default'), 'default');
+  assert.equal(normalizeProfileName(' Work_1 '), 'work_1');
+  for (const value of ['../work', '', '.hidden', 'space name', '/root', 'ümlaut', 'a'.repeat(33)]) {
+    assert.throws(() => normalizeProfileName(value), /Profile must begin/);
+  }
+  for (const value of ['1024', '8787', '65535', ' 8899 ']) {
+    assert.equal(normalizeProxyPort(value), Number(value));
+  }
+  for (const value of ['', '0', '80', '65536', '8888.5', 'NaN', '-8787', undefined]) {
+    assert.throws(() => normalizeProxyPort(value), /port from 1024 to 65535/);
+  }
+});
 
 test('isolated ngrok configuration contains no credentials', () => {
   assert.equal(ISOLATED_NGROK_CONFIG, 'version: 3\nagent: {}\n');

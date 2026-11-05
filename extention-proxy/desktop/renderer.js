@@ -2,6 +2,7 @@ const $ = (id) => document.getElementById(id);
 let currentState;
 let visibleToken = false;
 let domainDirty = false;
+let proxyPortDirty = false;
 
 function notify(message, isError = false) {
   $('message').textContent = message;
@@ -15,6 +16,13 @@ function render(state) {
   $('overall').textContent = state.phase === 'running' ? 'Server running' : state.phase;
   $('overall').className = 'pill' + (state.phase === 'running' ? '' : state.phase === 'error' ? ' error' : ' muted');
   $('server-state').textContent = state.phase[0].toUpperCase() + state.phase.slice(1);
+  $('proxy-port-label').textContent = `localhost:${state.port ?? 8787}`;
+  const portLocked = state.phase !== 'stopped' || state.ngrokPhase !== 'stopped';
+  $('proxy-port').disabled = portLocked;
+  $('save-proxy-port').disabled = portLocked;
+  if (!proxyPortDirty) $('proxy-port').value = String(state.port ?? 8787);
+  $('profile-description').textContent = `Profile: ${state.profile || 'default'} · Port ${state.port ?? 8787}. Stop proxy and Ngrok to change. Launch another with --profile=name.`;
+  $('extension-local-url').textContent = state.localWebSocketUrl || `ws://127.0.0.1:${state.port ?? 8787}/bridge`;
   $('server-dot').className = 'dot' + (state.phase === 'running' ? ' ok' : state.phase === 'error' ? ' error' : '');
   $('extension-state').textContent = state.extensionConnected ? 'Connected' : 'Disconnected';
   $('extension-dot').className = 'dot' + (state.extensionConnected ? ' ok' : '');
@@ -116,6 +124,13 @@ $('copy-token').addEventListener('click', () => perform(() => window.bridge.copy
 $('copy-extension-token').addEventListener('click', () => perform(() => window.bridge.copyExtensionToken(), 'Extension-only token copied. Paste into the browser extension settings.'));
 $('copy-url').addEventListener('click', () => perform(() => window.bridge.copyUrl(), 'Connector URL copied. Keep it private.'));
 $('domain').addEventListener('input', () => { domainDirty = true; });
+$('proxy-port').addEventListener('input', () => { proxyPortDirty = true; });
+$('save-proxy-port').addEventListener('click', () => perform(async () => {
+  const saved = await window.bridge.configurePort($('proxy-port').value);
+  proxyPortDirty = false;
+  render(saved);
+  notify(`Port ${saved.port} saved for ${saved.profile || 'default'}. Start the proxy to apply it.`);
+}));
 $('configure-ngrok').addEventListener('click', async () => {
   const button = $('configure-ngrok');
   button.disabled = true;

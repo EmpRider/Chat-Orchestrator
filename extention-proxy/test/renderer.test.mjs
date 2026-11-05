@@ -21,10 +21,12 @@ test('status refresh never erases an unsaved ngrok domain while the authtoken fi
   const state = {
     phase: 'running', ngrokPhase: 'stopped', ngrokAuthConfigured: false,
     ngrokError: '', error: '', extensionConnected: false, routeVerified: false,
-    domain: '', publicPath: '/mcp',
+    domain: '', publicPath: '/mcp', port: 8787, profile: 'default',
+    localWebSocketUrl: 'ws://127.0.0.1:8787/bridge',
   };
   let stateListener;
   let submitted;
+  let configuredPort;
   const bridge = {
     status: async () => state,
     onState(callback) { stateListener = callback; },
@@ -36,6 +38,12 @@ test('status refresh never erases an unsaved ngrok domain while the authtoken fi
       state.privateCoordinationOptIn = enabled;
       state.privateCoordinationRestartRequired = true;
       return { ...state };
+    },
+    async configurePort(port) {
+      configuredPort = port;
+      state.port = Number(port);
+      state.localWebSocketUrl = `ws://127.0.0.1:${port}/bridge`;
+      return { ...state, phase: 'stopped', ngrokPhase: 'stopped' };
     },
     async configureNgrok(domain, authToken) {
       submitted = { domain, authToken };
@@ -78,4 +86,16 @@ test('status refresh never erases an unsaved ngrok domain while the authtoken fi
   assert.match(element('configure-private-coordination').textContent, /Disable private queue/);
   await element('configure-private-coordination').dispatch('click');
   assert.equal(state.privateCoordinationOptIn, false);
+  assert.equal(element('proxy-port').disabled, true, 'running proxy port is locked');
+  stateListener({ ...state, phase: 'stopped', ngrokPhase: 'stopped' });
+  assert.equal(element('proxy-port').disabled, false);
+  element('proxy-port').value = '8899';
+  element('proxy-port').dispatch('input');
+  stateListener({ ...state, phase: 'stopped', ngrokPhase: 'stopped' });
+  assert.equal(element('proxy-port').value, '8899', 'status polling preserves unsaved port edits');
+  await element('save-proxy-port').dispatch('click');
+  assert.equal(configuredPort, '8899');
+  assert.equal(element('proxy-port-label').textContent, 'localhost:8899');
+  assert.match(element('extension-local-url').textContent, /8899\/bridge/);
+  assert.match(element('profile-description').textContent, /default/);
 });

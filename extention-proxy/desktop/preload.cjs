@@ -2,6 +2,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('bridge', Object.freeze({
   status: () => ipcRenderer.invoke('bridge:status'),
+  configurePort: (port) => ipcRenderer.invoke('bridge:configurePort', port),
   setMinimizeToTray: (enabled) => ipcRenderer.invoke('bridge:setMinimizeToTray', enabled),
   configurePrivateCoordination: (enabled) => ipcRenderer.invoke('bridge:configurePrivateCoordination', enabled),
   showToken: () => ipcRenderer.invoke('bridge:showToken'),

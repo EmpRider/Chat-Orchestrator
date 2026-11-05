@@ -6,6 +6,24 @@ import path from 'node:path';
 // ngrok.yml. NGROK_AUTHTOKEN is supplied only through the child environment.
 export const ISOLATED_NGROK_CONFIG = 'version: 3\nagent: {}\n';
 
+export function normalizeProxyPort(input) {
+  const value = String(input ?? '').trim();
+  if (!/^[0-9]{4,5}$/.test(value)) throw new Error('Enter a local port from 1024 to 65535');
+  const port = Number(value);
+  if (!Number.isSafeInteger(port) || port < 1024 || port > 65535) {
+    throw new Error('Enter a local port from 1024 to 65535');
+  }
+  return port;
+}
+
+export function normalizeProfileName(input) {
+  const name = String(input ?? 'default').trim().toLowerCase();
+  if (!/^[a-z][a-z0-9_-]{0,31}$/.test(name)) {
+    throw new Error('Profile must begin with a letter and use up to 32 letters, numbers, - or _');
+  }
+  return name;
+}
+
 export function normalizeNgrokDomain(input) {
   const value = String(input || '').trim();
   let url;

@@ -24,7 +24,7 @@
     <section class="status-grid" aria-label="Connection status">
       <article class="status-card">
         <div class="card-title"><span class="status-icon"><img src="assets/server.png" alt="" /></span><span>MCP SERVER</span><span class="dot" id="server-dot"></span></div>
-        <strong id="server-state">Starting</strong><small>localhost:8787</small>
+        <strong id="server-state">Starting</strong><small id="proxy-port-label">localhost:8787</small>
       </article>
       <article class="status-card">
         <div class="card-title"><span class="status-icon"><img src="assets/puzzle.png" alt="" /></span><span>EXTENSION</span><span class="dot" id="extension-dot"></span></div>
@@ -121,6 +121,13 @@
           <h2><img src="assets/network.png" alt="" /> Tunnel settings</h2>
           <span class="hint">NGROK</span>
         </div>
+        <label for="proxy-port">Local proxy port</label>
+        <div class="input-row">
+          <input id="proxy-port" type="number" min="1024" max="65535" step="1" value="8787" inputmode="numeric" />
+          <button id="save-proxy-port" type="button" class="secondary">Save port</button>
+        </div>
+        <p class="help" id="profile-description">Profile: default. Stop the proxy and tunnel before changing port.</p>
+        <p class="help">Extension WebSocket: <code id="extension-local-url">ws://127.0.0.1:8787/bridge</code>. Each profile needs its own extension settings and Ngrok domain.</p>
         <label for="domain">Dedicated HTTPS domain</label>
         <input id="domain" type="text" spellcheck="false" autocomplete="off" placeholder="your-domain.ngrok-free.dev" />
         <label for="ngrok-token">Authtoken <span id="ngrok-token-status" class="hint">(required)</span></label>
