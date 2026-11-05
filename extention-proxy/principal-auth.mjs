@@ -30,6 +30,7 @@ function readRegistry(filename) {
       parsed.credentials.length > MAX_CREDENTIALS) throw new Error('Invalid principal registry schema');
   const ids = new Set();
   const digests = new Set();
+  const activeTabBindings = new Set();
   for (const record of parsed.credentials) {
     if (!record || typeof record !== 'object' || Array.isArray(record) ||
         !UUID.test(record.credentialId) || !UUID.test(record.principalId) ||
@@ -50,6 +51,13 @@ function readRegistry(filename) {
       throw new Error('Invalid principal registry entry');
     }
     ids.add(record.credentialId);
+    if (!record.revokedAt && record.browserSessionId) {
+      const binding = record.browserSessionId + ':' + record.callerTabId;
+      if (activeTabBindings.has(binding)) {
+        throw new Error('Duplicate active principal manager-tab binding');
+      }
+      activeTabBindings.add(binding);
+    }
     digests.add(record.tokenDigest);
   }
   return parsed.credentials;
@@ -92,6 +100,13 @@ export function createPrincipalCredential(filename, input) {
     throw new Error('Trusted extension manager tab attestation required');
   }
   const records = readRegistry(filename);
+  // One physical manager conversation cannot be controlled by two active principals.
+  // A revoked credential may be replaced only through fresh trusted enrollment.
+  if (records.some((record) => !record.revokedAt &&
+      record.browserSessionId === input.browserSessionId &&
+      record.callerTabId === input.callerTabId)) {
+    throw new Error('Manager tab is already paired to an active principal; revoke it first');
+  }
   if (records.length >= MAX_CREDENTIALS) throw new Error('Principal registry capacity reached');
   const token = crypto.randomBytes(32).toString('base64url');
   const record = {

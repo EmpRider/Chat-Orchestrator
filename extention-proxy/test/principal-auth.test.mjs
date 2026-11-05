@@ -35,6 +35,25 @@ test('scoped credentials bind metadata, never persist plaintext, revoke immediat
   assert.equal(revokePrincipalCredential(file, a.principal.credentialId), true);
 });
 
+test('same manager tab cannot be paired to two active principals, including a changed incarnation', (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'chat-orch-exclusive-tab-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const file = path.join(directory, 'coordination-principals.json');
+  const first = createPrincipalCredential(file, enrollment);
+  assert.throws(() => createPrincipalCredential(file, { ...enrollment, role: 'tl' }), /already paired/);
+  assert.throws(() => createPrincipalCredential(file, {
+    ...enrollment, role: 'tl', managerIncarnationId: randomUUID(),
+  }), /already paired/);
+  assert.equal(listPrincipalCredentials(file).length, 1, 'rejected enrollment must not persist');
+  assert.equal(revokePrincipalCredential(file, first.principal.credentialId), true);
+  const next = createPrincipalCredential(file, {
+    ...enrollment, role: 'tl', managerIncarnationId: randomUUID(),
+  });
+  assert.equal(resolvePrincipalCredential(file, first.token), null);
+  assert.equal(resolvePrincipalCredential(file, next.token).role, 'tl');
+  assert.equal(listPrincipalCredentials(file).length, 2);
+});
+
 test('invalid scopes and altered registry fail closed', (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'chat-orch-principal-'));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
