@@ -26,6 +26,7 @@ for (const name of ['CHAT_ORCH_E2E_MODE', 'CHAT_ORCH_E2E_PORT',
   'CHAT_ORCH_E2E_DATA_DIR', 'CHAT_ORCH_E2E_CDP_PORT', 'CHAT_ORCH_PACKAGED_SMOKE']) {
   delete launchEnv[name];
 }
+delete launchEnv.ELECTRON_RUN_AS_NODE; // Start the app in Electron mode, not Node mode.
 const created = [];
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const ping = async (port) => {
