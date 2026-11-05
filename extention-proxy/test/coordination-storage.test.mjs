@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
-import { preparePrivateJournal, PRIVATE_JOURNAL_MAX_BYTES } from '../desktop/coordination-storage.mjs';
+import { preparePrivateJournal, inspectPrivateJournal, PRIVATE_JOURNAL_MAX_BYTES } from '../desktop/coordination-storage.mjs';
 
 test('private journal provisioning is explicit, fsynced, idempotent and non-truncating', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'chat-orch-prep-'));
@@ -37,4 +37,30 @@ test('private journal provisioning fails closed for invalid and oversized target
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('read-only journal inspector flags unknown owner locks without mutating evidence', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'chat-orch-inspect-'));
+  const file = path.join(root, 'coordination.events.journal');
+  try {
+    assert.deepEqual(inspectPrivateJournal(file), {present:false,bytes:0,lockPresent:false,
+      ownerVerified:false,requiresManualOwnerCheck:false});
+    preparePrivateJournal(file);
+    fs.appendFileSync(file,'unchanged journal evidence');
+    const lock = file + '.lock';
+    fs.writeFileSync(lock,'unverified owner');
+    const before = fs.readFileSync(file,'utf8');
+    const locked = inspectPrivateJournal(file);
+    assert.equal(locked.lockPresent, true);
+    assert.equal(locked.ownerVerified, false);
+    assert.equal(locked.requiresManualOwnerCheck, true);
+    assert.equal(locked.bytes, Buffer.byteLength(before));
+    assert.equal(fs.readFileSync(file,'utf8'), before);
+    assert.equal(fs.readFileSync(lock,'utf8'), 'unverified owner');
+    fs.unlinkSync(lock);
+    assert.equal(inspectPrivateJournal(file).lockPresent, false);
+    fs.mkdirSync(lock);
+    assert.throws(() => inspectPrivateJournal(file), /not a regular file/);
+    assert.equal(fs.readFileSync(file,'utf8'), before);
+  } finally {fs.rmSync(root, {recursive:true,force:true});}
 });

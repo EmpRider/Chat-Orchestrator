@@ -3,6 +3,28 @@ import path from 'node:path';
 
 export const PRIVATE_JOURNAL_MAX_BYTES = 32 * 1024 * 1024;
 
+// Read-only: ownership cannot be inferred from a lock file after a Windows crash.
+// Never remove, truncate, replay or repair a journal in this inspector.
+export function inspectPrivateJournal(journalPath) {
+  if (typeof journalPath !== 'string' || !path.isAbsolute(journalPath)) {
+    throw new Error('Private journal inspection requires an absolute path');
+  }
+  const safeStat = (target) => {
+    try { return fs.lstatSync(target); }
+    catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+  };
+  const file = safeStat(journalPath);
+  const lock = safeStat(journalPath + '.lock');
+  if (file && (!file.isFile() || file.size > PRIVATE_JOURNAL_MAX_BYTES)) {
+    throw new Error('Private journal is not a bounded regular file');
+  }
+  if (lock && !lock.isFile()) throw new Error('Private owner lock is not a regular file');
+  return Object.freeze({present: Boolean(file), bytes: file?.size || 0,
+    lockPresent: Boolean(lock), ownerVerified: false,
+    requiresManualOwnerCheck: Boolean(lock)});
+}
+
+
 // Called only by a trusted local desktop action, before a future proxy start.
 // There is deliberately no automatic repair, truncation, or stale-lock removal.
 export function preparePrivateJournal(journalPath) {

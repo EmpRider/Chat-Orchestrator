@@ -6,7 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { connectorUrl, ensureDesktopToken, ISOLATED_NGROK_CONFIG, normalizeNgrokAuthtoken, normalizeNgrokDomain, normalizeProxyPort, normalizeProfileName } from './config.mjs';
 import { createNgrokLogReader } from './ngrok-diagnostics.mjs';
-import { preparePrivateJournal } from './coordination-storage.mjs';
+import { inspectPrivateJournal, preparePrivateJournal } from './coordination-storage.mjs';
 import { createDesktopTray, installWindowCloseBehavior, minimizeToTrayPreference } from './tray-lifecycle.mjs';
 import { createPrincipalCredential, listPrincipalCredentials, resolvePrincipalCredential, revokePrincipalCredential } from '../principal-auth.mjs';
 import { DEFAULT_AGENT_SETTINGS, normalizeAgentSettings, disabledAgentSettings } from '../agent-settings.mjs';
@@ -117,6 +117,11 @@ const privateCoordinationJournalPath = () => path.join(dataDir(), 'coordination.
 function preparePrivateCoordinationJournal() {
   return preparePrivateJournal(privateCoordinationJournalPath());
 }
+function privateJournalInspection() {
+  try { return inspectPrivateJournal(privateCoordinationJournalPath()); }
+  catch { return {present:false,bytes:0,lockPresent:false,ownerVerified:false,
+    requiresManualOwnerCheck:true,error:'Journal/lock needs manual inspection'}; }
+}
 
 function ensureIsolatedNgrokConfig() {
   fs.mkdirSync(dataDir(), { recursive: true });
@@ -136,6 +141,7 @@ function state() {
     coordinationState,
     privateCoordinationOptIn,
     privateCoordinationJournalPresent: fs.existsSync(privateCoordinationJournalPath()),
+    privateJournalInspection: privateJournalInspection(),
     privateCoordinationRestartRequired: Boolean(child && runningPrivateCoordination !== privateCoordinationOptIn),
     principalState,
     coordinationSnapshot,

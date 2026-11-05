@@ -53,6 +53,14 @@ function render(state) {
   $('minimize-to-tray').disabled = state.trayAvailable === false;
   $('configure-private-coordination').textContent = state.privateCoordinationOptIn
     ? 'Disable private queue on next proxy start' : 'Prepare & enable queue on next proxy start';
+  const journal = state.privateJournalInspection;
+  $('private-journal-inspection').textContent = journal?.error
+    ? 'Private journal cannot be inspected safely; keep queue off and reconcile manually.'
+    : journal?.lockPresent
+      ? 'Journal ' + journal.bytes + ' bytes · owner lock exists, liveness unverified. After crash do not remove/replay automatically.'
+      : journal?.present
+        ? 'Journal ' + journal.bytes + ' bytes · no lock. Full integrity is checked by the proxy at startup.'
+        : 'Private journal not provisioned; queue remains off.';
   $('private-coordination-state').textContent = state.privateCoordinationRestartRequired
     ? 'Restart the local proxy to apply this change. UNCERTAIN events need manual reconciliation.'
     : state.privateCoordinationOptIn
