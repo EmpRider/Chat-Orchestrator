@@ -97,3 +97,28 @@ npm run desktop
 ```
 
 Diagnostics print selected, redacted ngrok lifecycle messages. Do not paste your ngrok authtoken or full connector URL into terminal commands or public issue reports.
+
+## Private queue recovery and lock diagnostics
+
+The internal event journal is **disabled by default**. The desktop Coordination
+panel shows a read-only journal inspection (presence, byte size and whether an
+owner lock exists). A lock's presence **does not prove its writer is alive**.
+After a crash or interrupted shutdown, treat any remaining `.lock` file or
+incomplete/checksum-invalid event as **manual reconciliation required**.
+
+1. Do not start a second proxy with the same named profile, port, or user-data
+   directory. Keep other profiles and the running production instance untouched.
+2. Preserve the entire `coordination.events.journal`, its `.lock` file, and the
+   diagnostic error before investigating. Never paste journal payloads or
+   credentials into a public report.
+3. Independently verify process and user-data ownership and reconcile each
+   potentially delivered `UNCERTAIN` event with the manager chat and Saga board.
+   A transport send is **not** proof of manager processing or Saga confirmation.
+4. Until a separate trusted reconciliation mechanism exists, the application
+   **does not automatically remove an owner lock, repair a torn tail, retry
+   ambiguous chat submissions, or close workers**. Leave this profile stopped
+   if the evidence is incomplete; use a distinct profile for other work.
+
+The Windows user-data directory and journal path are profile-specific. This is
+an evidence-preserving recovery procedure, **not** a claim of fully automated
+restart recovery or power-loss durability.

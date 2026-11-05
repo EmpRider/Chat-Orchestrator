@@ -108,6 +108,40 @@ test('one batch can lease B-complete/status-request/D-complete without reorderin
   assert.throws(() => journal.reducePrivateQueueEvents([b, status, d, leases[0], wrong]), /FIFO/);
 });
 
+test('crash replay preserves DISPATCHING and DELIVERED ambiguity with no status overtaking', () => {
+  const result = queued(1, 'CHILD_RESULT');
+  const status = queued(2, 'STATUS_REQUEST', recipient);
+  const nonce = randomUUID();
+  const lease = transition(3, result, 'LEASED', 1, nonce);
+  const dispatched = transition(4, result, 'DISPATCHING', 1, nonce);
+  const delivered = transition(5, result, 'DELIVERED', 1, nonce);
+  for (const [history, originalPhase] of [
+    [[result, status, lease, dispatched], 'DISPATCHING'],
+    [[result, status, lease, dispatched, delivered], 'DELIVERED'],
+  ]) {
+    const bytes = Buffer.concat(history.map(journal.privateJournalFrame));
+    const snapshot = Buffer.from(bytes);
+    const decoded = journal.replayPrivateJournal(bytes);
+    assert.equal(decoded.tail, null);
+    const recovered = journal.reducePrivateQueueEvents(decoded.events, true);
+    const ambiguous = recovered.byRef.get(recovered.fifo[0]);
+    assert.equal(ambiguous.phase, 'UNCERTAIN');
+    assert.equal(ambiguous.previousPhase, originalPhase);
+    assert.equal(ambiguous.recoveryClass, 'DISPATCH_CONSUMER_ACK_UNVERIFIED');
+    assert.equal(recovered.byRef.get(recovered.fifo[1]).phase, 'QUEUED');
+    assert.equal(Buffer.compare(bytes, snapshot), 0, 'recovery must not alter journal evidence');
+    assert.throws(() =>
+      journal.reducePrivateQueueEvents([...decoded.events,
+        transition(history.length + 1, status, 'LEASED')]), /FIFO/,
+      'a status request cannot overtake an unacknowledged child after restart');
+  }
+  const uncertain = transition(6, result, 'UNCERTAIN', 1, nonce);
+  const explicit = journal.reducePrivateQueueEvents([
+    result, status, lease, dispatched, delivered, uncertain,
+  ], true);
+  assert.equal(explicit.byRef.get(explicit.fifo[0]).recoveryClass, 'PREEXISTING_UNCERTAIN');
+});
+
 test('desktop readiness is fresh, authenticated and fail-closed across disconnects', () => {
   const now = 50000;
   const base = { revoked: false, registered: true, connected: true, now };
