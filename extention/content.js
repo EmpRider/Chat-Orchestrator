@@ -376,24 +376,70 @@
       },
     };
   }
-
   // ------------------------------------------------------------- run loop
   let busy = false;
+  let completionReceiptUncertain = false;
+  function observeState() {
+    const input = q(A.input);
+    const generating = isGenerating();
+    const occupied = !!composerText(input);
+    const state = completionReceiptUncertain ? 'uncertain'
+      : !input ? 'unknown' : busy || generating ? 'busy' : occupied ? 'draft' : 'idle';
+    return { site, state, busy: state === 'busy', ready: state === 'idle' };
+  }
 
-  async function runPrompt({ taskId, text, timeoutMs }) {
+  // Retry only the same completion receipt, NEVER the external chat submission.
+  // The background listener treats an identical terminal receipt as idempotent.
+  async function reportTaskCompletion(report) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const response = await chrome.runtime.sendMessage(report);
+        if (response?.ok === true) return;
+        if (response?.error === 'Unverified worker completion source') break;
+      } catch { /* service worker may be restarting */ }
+      if (attempt < 2) await sleep(600 * (attempt + 1));
+    }
+    throw new Error('Worker completion transport acknowledgment is uncertain');
+  }
+
+  async function runPrompt({ taskId, receiptNonce, text, timeoutMs }) {
     busy = true;
+    let report;
     try {
       const baseline = assistantNodes().length;
       await sendPrompt(text);
       const result = await waitForResponse(baseline, timeoutMs || 600000, text);
-      chrome.runtime.sendMessage({ type: 'task_done', taskId, ok: true, text: result });
+      report = { type: 'task_done', taskId, receiptNonce, ok: true, text: result };
     } catch (err) {
-      chrome.runtime.sendMessage({
-        type: 'task_done',
-        taskId,
-        ok: false,
+      report = {
+        type: 'task_done', taskId, receiptNonce, ok: false,
         error: String(err?.message || err),
-      });
+      };
+    }
+    try {
+      await reportTaskCompletion(report);
+    } catch {
+      // Fail closed: block the next prompt until a human reconciles/reloads.
+      completionReceiptUncertain = true;
+    } finally {
+      busy = false;
+    }
+  }
+
+  // Manager wake: transport submission only. Never treat it as consumer
+  // processing or Saga acknowledgment; a timeout might have submitted.
+  async function submitManagerBatch(text) {
+    if (typeof text !== 'string' || !text.trim() || text.length > 60000 ||
+        observeState().state !== 'idle') {
+      return { ok: false, uncertain: false, error: 'Manager tab is not idle or batch is invalid' };
+    }
+    busy = true;
+    try {
+      await sendPrompt(text);
+      return { ok: true, submitted: true };
+    } catch {
+      completionReceiptUncertain = true;
+      return { ok: false, uncertain: true, error: 'Manager submission outcome requires reconciliation' };
     } finally {
       busy = false;
     }
@@ -402,16 +448,27 @@
   function onMessage(msg, _sender, sendResponse) {
     switch (msg?.cmd) {
       case 'ping':
-        sendResponse({ ok: true, site, ready: !!q(A.input), busy });
+        sendResponse({ ok: true, ...observeState() });
         break;
-      case 'run_prompt':
-        if (busy) {
-          sendResponse({ ok: false, error: 'This tab is still working on a previous task' });
+      case 'observe_state':
+        sendResponse({ ok: true, ...observeState() });
+        break;
+      case 'run_prompt': {
+        const observed = observeState();
+        if (!observed.ready) {
+          sendResponse({ ok: false, error: `Tab is not safely idle (${observed.state})` });
         } else {
           runPrompt(msg);
           sendResponse({ ok: true });
         }
         break;
+      }
+      case 'submit_manager_batch': {
+        submitManagerBatch(msg.text).then(sendResponse).catch(() => {
+          sendResponse({ ok: false, uncertain: true, error: 'Manager submission failed' });
+        });
+        return true;
+      }
       case 'read_chat':
         if (typeof self !== 'undefined' && self.__chatOrchStructuredReader) {
           let readTimer;

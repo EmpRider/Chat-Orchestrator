@@ -12,9 +12,10 @@ async function refresh(fillFields) {
   $('status').textContent = `Server: ${s.wsState}`;
   $('status').className = `status ${connected ? 'ok' : 'bad'}`;
   $('info').textContent =
-    `Orchestrator tab: ${s.cfg.orchestratorTabId ?? 'not set'} · Workers open: ${s.workers.length} · Running tasks: ${s.running}`;
+    `Orchestrator tab: ${s.cfg.orchestratorTabId ?? 'not set'} · Workers: ${s.workers.length} · Running: ${s.running} · Private storage: ${s.coordinationMode || 'unknown'}`;
   $('enabled').checked = s.cfg.enabled;
-  $('autoClose').checked = s.cfg.autoCloseWorkers;
+  $('autoClose').checked = false;
+  $('autoClose').disabled = true;
   $('useSysPrompt').checked = s.cfg.useWorkerSystemPrompt;
   if (fillFields) FIELDS.forEach((f) => ($(f).value = s.cfg[f]));
 }
@@ -29,9 +30,7 @@ $('enabled').addEventListener('change', async (e) => {
   refresh(false);
 });
 
-$('autoClose').addEventListener('change', async (e) => {
-  await chrome.storage.local.set({ autoCloseWorkers: e.target.checked });
-});
+$('autoClose').addEventListener('change', () => { $('autoClose').checked = false; });
 
 $('useSysPrompt').addEventListener('change', async (e) => {
   await chrome.storage.local.set({ useWorkerSystemPrompt: e.target.checked });
@@ -46,9 +45,9 @@ $('save').addEventListener('click', async () => {
   const values = {
     serverUrl: $('serverUrl').value.trim(),
     token: $('token').value.trim(),
-    maxWorkers: Number($('maxWorkers').value) || 4,
-    maxTasksPerHour: Number($('maxTasksPerHour').value) || 30,
-    taskTimeoutMin: Number($('taskTimeoutMin').value) || 10,
+    maxWorkers: Number($('maxWorkers').value) || 10,
+    maxTasksPerHour: Number($('maxTasksPerHour').value) || 100,
+    taskTimeoutMin: Number($('taskTimeoutMin').value) || 60,
     workerSystemPrompt: $('workerSystemPrompt').value,
   };
   await chrome.storage.local.set(values);
@@ -72,7 +71,8 @@ $('diagnose').addEventListener('click', async () => {
 });
 
 $('closeAll').addEventListener('click', async () => {
-  await chrome.runtime.sendMessage({ type: 'close_all_workers' });
+  const result = await chrome.runtime.sendMessage({ type: 'close_all_workers' });
+  show(`Closed ${result.closed || 0} legacy workers; protected/active tabs held: ${result.held || 0}.`);
   refresh(false);
 });
 

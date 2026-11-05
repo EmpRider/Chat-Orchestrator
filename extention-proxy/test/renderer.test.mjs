@@ -32,6 +32,11 @@ test('status refresh never erases an unsaved ngrok domain while the authtoken fi
       state.minimizeToTray = enabled;
       return { ...state };
     },
+    async configurePrivateCoordination(enabled) {
+      state.privateCoordinationOptIn = enabled;
+      state.privateCoordinationRestartRequired = true;
+      return { ...state };
+    },
     async configureNgrok(domain, authToken) {
       submitted = { domain, authToken };
       return { ...state, domain: `https://${domain}`, ngrokAuthConfigured: true, ngrokPhase: 'starting' };
@@ -66,4 +71,11 @@ test('status refresh never erases an unsaved ngrok domain while the authtoken fi
   element('minimize-to-tray').checked = true;
   await element('minimize-to-tray').dispatch('change');
   assert.equal(state.minimizeToTray, true);
+  assert.match(element('configure-private-coordination').textContent, /enable queue/i);
+  await element('configure-private-coordination').dispatch('click');
+  assert.equal(state.privateCoordinationOptIn, true);
+  assert.match(element('private-coordination-state').textContent, /Restart the local proxy/);
+  assert.match(element('configure-private-coordination').textContent, /Disable private queue/);
+  await element('configure-private-coordination').dispatch('click');
+  assert.equal(state.privateCoordinationOptIn, false);
 });

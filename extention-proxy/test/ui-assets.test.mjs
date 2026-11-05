@@ -31,6 +31,8 @@ test('dark UI has visible icon assets, setting checkbox and accessible controls'
   assert.equal(manifest.build.win.icon, 'desktop/assets/app.ico');
   assert.match(css, /background:\s*#070708/);
   assert.match(css, /grid-template-columns:\s*repeat\(3/);
+  assert.match(css, /\.coordination-control\s*\{[^}]*display:\s*flex;[^}]*column-gap:\s*10px;/,
+    'Private queue action/status must not visually run together');
   assert.match(html, /id="minimize-to-tray" type="checkbox" checked/);
   assert.match(html, /Minimize to system tray when closing/);
   for (const name of ['token-value', 'copy-token', 'import-token', 'domain', 'ngrok-token', 'configure-ngrok', 'connector-url', 'copy-url', 'start', 'stop']) {

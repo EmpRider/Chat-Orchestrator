@@ -4,17 +4,22 @@
     <meta charset="utf-8" />
     <title>Chat Orchestrator</title>
     <style>
-      body { font: 13px/1.4 system-ui, sans-serif; width: 340px; margin: 12px; color: #222; }
+      :root { color-scheme: dark; --ink: #e7e8ed; --muted: #9b9eab; --line: #34353d; --panel: #1a1b21; }
+      body { font: 12px/1.4 system-ui, sans-serif; width: 340px; margin: 10px; background: #0d0e12; color: var(--ink); }
+      input, textarea { background: #121318; color: var(--ink); border: 1px solid var(--line); border-radius: 5px; }
+      button { background: #232630; color: var(--ink); border: 1px solid #3c4253; border-radius: 5px; }
+      button:disabled { opacity: .5; cursor: not-allowed; }
+      button:hover:not(:disabled) { background: #303b50; }
       h1 { font-size: 15px; margin: 0 0 8px; }
       label { display: block; margin: 8px 0 2px; font-weight: 600; }
       input[type="text"], input[type="password"], input[type="number"] { width: 100%; box-sizing: border-box; padding: 4px 6px; }
       .row { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
       button { padding: 5px 8px; cursor: pointer; }
-      .status { padding: 6px 8px; border-radius: 4px; background: #eee; margin-bottom: 6px; }
-      .ok { background: #d9f7d9; }
-      .bad { background: #fbdcdc; }
-      pre { background: #f5f5f5; padding: 6px; max-height: 180px; overflow: auto; font-size: 11px; white-space: pre-wrap; }
-      .kill { margin-top: 8px; padding: 6px 8px; background: #fff4d6; border-radius: 4px; }
+      .status { padding: 6px 8px; border-radius: 6px; background: var(--panel); margin-bottom: 6px; }
+      .ok { background: #173b2d; color: #9de3c3; }
+      .bad { background: #44242c; color: #ffc1c9; }
+      pre { background: #151821; padding: 6px; max-height: 180px; overflow: auto; font-size: 11px; white-space: pre-wrap; }
+      .kill { margin-top: 8px; padding: 6px 8px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
       .kill label { display: inline; font-weight: 600; }
     </style>
   </head>
@@ -28,12 +33,12 @@
       <label for="enabled">Automation enabled (kill switch)</label>
     </div>
 
-    <div class="kill" style="background: #e8f1ff">
+    <div class="kill">
       <input type="checkbox" id="autoClose" />
-      <label for="autoClose">Auto-close worker windows by themselves (leave OFF so the orchestrator closes them with close_worker)</label>
+      <label for="autoClose">Auto-close held until verified Saga completion</label>
     </div>
 
-    <div class="kill" style="background: #f1ecff">
+    <div class="kill">
       <input type="checkbox" id="useSysPrompt" />
       <label for="useSysPrompt">Send the worker system prompt with each new worker</label>
     </div>
@@ -41,12 +46,12 @@
     <div class="row">
       <button id="setOrch">Set this tab as orchestrator</button>
       <button id="diagnose">Diagnose this tab</button>
-      <button id="closeAll">Close all workers</button>
+      <button id="closeAll">Close legacy workers</button>
     </div>
 
     <label>Server WebSocket URL</label>
     <input type="text" id="serverUrl" />
-    <label>Token</label>
+    <label>WebSocket token (use desktop Extension-only token for private coordination)</label>
     <input type="password" id="token" />
     <label>Max worker tabs</label>
     <input type="number" id="maxWorkers" min="1" max="10" />

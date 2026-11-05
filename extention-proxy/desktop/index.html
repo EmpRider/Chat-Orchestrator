@@ -28,13 +28,24 @@
       </article>
       <article class="status-card">
         <div class="card-title"><span class="status-icon"><img src="assets/puzzle.png" alt="" /></span><span>EXTENSION</span><span class="dot" id="extension-dot"></span></div>
-        <strong id="extension-state">Disconnected</strong><small>Browser WebSocket</small>
+        <strong id="extension-state">Disconnected</strong><small id="extension-detail">WebSocket · Identity unknown · Queue unknown</small>
       </article>
       <article class="status-card">
         <div class="card-title"><span class="status-icon"><img src="assets/cloud.png" alt="" /></span><span>NGROK TUNNEL</span><span class="dot" id="ngrok-dot"></span></div>
         <strong id="ngrok-state">Not configured</strong><small id="ngrok-detail">Dedicated domain</small>
       </article>
     </section>
+
+    <details class="panel coordination-panel" id="coordination-panel">
+      <summary>Agent coordination <span id="coordination-summary" class="hint">Queue unavailable</span></summary>
+      <div class="coordination-grid">
+        <div><h2>REUSABLE SEATS</h2><div id="agent-seats" class="coordination-scroll">No paired seats</div></div>
+        <div><h2>QUEUED EVENTS</h2><div id="queue-items" class="coordination-scroll">No active queue</div></div>
+        <div><h2>REDACTED TOOLS</h2><div id="tool-call-log" class="coordination-scroll">No activity</div></div>
+      </div>
+      <div class="coordination-control"><button id="configure-private-coordination" type="button" class="link-button">Prepare &amp; enable queue on next proxy start</button><span id="private-coordination-state" class="hint">Private coordination is off by default.</span></div>
+      <p class="help">Read-only proxy snapshot. DELIVERED is not PROCESSED; Saga confirmation is separate. UNCERTAIN requires manual reconciliation.</p>
+    </details>
 
     <div class="workspace-grid">
       <div class="column-stack">
@@ -50,6 +61,8 @@
             <button id="copy-token" class="icon-button" type="button" aria-label="Copy bridge token" title="Copy bridge token"><img src="assets/copy.png" alt="" /></button>
           </div>
           <button id="import-token" type="button" class="link-button"><img src="assets/upload.png" alt="" /> Import existing token</button>
+          <div class="input-row"><span class="hint">Extension-only credential</span><button id="copy-extension-token" class="icon-button" type="button" aria-label="Copy extension bridge token" title="Copy extension bridge token"><img src="assets/copy.png" alt="" /></button></div>
+          <p class="help">Use the extension-only token in the browser extension popup for private coordination. Keep the MCP connector token unchanged.</p>
         </section>
 
         <section class="panel connector-panel">
@@ -63,6 +76,44 @@
           </div>
           <p class="help">Share this URL only with your own connector. Its access token stays masked here.</p>
         </section>
+        <details class="panel pairing-panel" id="principal-panel">
+          <summary>Scoped agent pairing <span class="hint">LOCAL ADMIN</span></summary>
+          <p class="help">Create a separately revocable connector identity. Choose the actual manager tab ID; never share the scoped URL with another agent.</p>
+          <label for="pair-seat">Reusable agent seat</label>
+          <select id="pair-seat">
+            <option value="">Custom role</option>
+            <option value="BA">BA · Orchestrator</option>
+            <option value="PM">PM · Epic manager</option>
+            <option value="TL">TL · Task lead</option>
+            <option value="Council A">Council A · Systems</option>
+            <option value="Council B">Council B · Security</option>
+            <option value="Council C">Council C · Architecture</option>
+            <option value="Council D">Council D · QA</option>
+            <option value="Council E">Council E · Devil's advocate</option>
+            <option value="BA Watchdog">BA Watchdog</option>
+          </select>
+          <label for="pair-role">Role</label>
+          <select id="pair-role">
+            <option value="pm">PM</option><option value="tl">TL</option>
+            <option value="ba">BA</option><option value="specialist">Specialist</option>
+            <option value="council">Council</option><option value="watchdog">Watchdog</option>
+          </select>
+          <label for="pair-workspace">Workspace</label>
+          <input id="pair-workspace" value="web-chat-automation" autocomplete="off" />
+          <label for="pair-project">Saga project</label>
+          <input id="pair-project" value="4" autocomplete="off" />
+          <label for="pair-orchestrator">Orchestrator</label>
+          <input id="pair-orchestrator" value="chat-orchestrator-p0" autocomplete="off" />
+          <label for="pair-parent-task">Parent task</label>
+          <input id="pair-parent-task" value="65" autocomplete="off" />
+          <label for="pair-tab">Manager tab ID</label>
+          <input id="pair-tab" type="number" min="0" placeholder="From list_tabs" />
+          <div class="input-row">
+            <button id="pair-principal" type="button" class="primary">Pair identity</button>
+            <button id="copy-principal-url" type="button" class="secondary" disabled>Copy one-time URL</button>
+          </div>
+          <div id="principal-list" class="principal-list" aria-live="polite"></div>
+        </details>
       </div>
 
       <section class="panel ngrok-panel">

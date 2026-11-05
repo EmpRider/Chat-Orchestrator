@@ -118,7 +118,7 @@ test('MCP read_chat options survive HTTP, WebSocket, background and content scri
           enabled: true, token: TOKEN, serverUrl: `ws://localhost:${PORT}/bridge`,
           orchestratorTabId: cases[0].tabId,
         }) },
-        session: { get: async () => ({}) },
+        session: { get: async () => ({ workers: [111, 112], workerOwners: { 111: 'legacy', 112: 'legacy' } }), set: async () => {} },
         onChanged: { addListener() {} },
       },
       tabs: {

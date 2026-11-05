@@ -1,11 +1,14 @@
 import { app, BrowserWindow, Menu, Tray, clipboard, dialog, ipcMain, nativeImage, safeStorage, shell, utilityProcess } from 'electron';
 import { spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { connectorUrl, ensureDesktopToken, ISOLATED_NGROK_CONFIG, normalizeNgrokAuthtoken, normalizeNgrokDomain } from './config.mjs';
 import { createNgrokLogReader } from './ngrok-diagnostics.mjs';
+import { preparePrivateJournal } from './coordination-storage.mjs';
 import { createDesktopTray, installWindowCloseBehavior, minimizeToTrayPreference } from './tray-lifecycle.mjs';
+import { createPrincipalCredential, listPrincipalCredentials, resolvePrincipalCredential, revokePrincipalCredential } from '../principal-auth.mjs';
 
 // Set CHAT_ORCH_DIAGNOSTICS=1 for lifecycle messages (never credentials).
 const debug = (message) => {
@@ -13,18 +16,32 @@ const debug = (message) => {
 };
 
 const appDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-// Test mode uses an isolated port; normal application behavior stays on 8787.
-const E2E_MODE = !app.isPackaged && process.env.CHAT_ORCH_E2E_MODE === '1';
+// A two-key, test-only packaged smoke mode preserves the production port/profile.
+// It is never enabled in ordinary packaged app launches.
+const PACKAGED_SMOKE_MODE = app.isPackaged && process.env.CHAT_ORCH_PACKAGED_SMOKE === '1';
+const E2E_MODE = process.env.CHAT_ORCH_E2E_MODE === '1' &&
+  (!app.isPackaged || PACKAGED_SMOKE_MODE);
 const PORT = E2E_MODE ? Number(process.env.CHAT_ORCH_E2E_PORT || 8897) : 8787;
+const PACKAGED_SMOKE_EXIT_MS = PACKAGED_SMOKE_MODE
+  ? Number(process.env.CHAT_ORCH_PACKAGED_SMOKE_EXIT_MS || 45000) : 0;
+if (E2E_MODE && (!Number.isSafeInteger(PORT) || PORT < 1024 || PORT > 65535 || PORT === 8787)) {
+  throw new Error('Isolated E2E must use a non-production loopback port');
+}
+if (PACKAGED_SMOKE_MODE && (!Number.isSafeInteger(PACKAGED_SMOKE_EXIT_MS) ||
+    PACKAGED_SMOKE_EXIT_MS < 15000 || PACKAGED_SMOKE_EXIT_MS > 120000)) {
+  throw new Error('Packaged smoke requires a bounded automatic exit timer');
+}
 let window;
 let tray;
 let minimizeToTray = true;
 let exitStarted = false;
 let exitReady = false;
 let child;
+const managerAttestations = new Map(); // trusted utilityProcess replies, never HTTP
 let ngrokChild;
 let ngrokGeneration = 0;
 let token = '';
+let extensionToken = '';
 let domain = '';
 let phase = 'stopped';
 let ngrokPhase = 'stopped';
@@ -32,19 +49,57 @@ let errorMessage = '';
 let ngrokError = '';
 let routeVerified = false;
 let extensionConnected = false;
+let coordinationState = 'unknown';
+let privateCoordinationOptIn = false;
+let runningPrivateCoordination = null;
+let principalState = 'unknown';
+let coordinationSnapshot = null; // Owned utilityProcess emits redacted, read-only state.
 let stopping = false;
 
-app.setName('Chat Orchestrator');
-if (process.platform === 'win32') app.setAppUserModelId('com.empirerider.chat-orchestrator');
+// Optional loopback CDP is test-only; packaged releases never expose DevTools.
+if (E2E_MODE && !app.isPackaged && process.env.CHAT_ORCH_E2E_CDP_PORT) {
+  const cdpPort = Number(process.env.CHAT_ORCH_E2E_CDP_PORT);
+  if (!Number.isSafeInteger(cdpPort) || cdpPort < 1024 || cdpPort > 65535) {
+    throw new Error('Invalid isolated E2E DevTools port');
+  }
+  app.commandLine.appendSwitch('remote-debugging-address', '127.0.0.1');
+  app.commandLine.appendSwitch('remote-debugging-port', String(cdpPort));
+}
+// Explicit E2E profile prevents single-instance takeover or mutation of live user settings.
+if (E2E_MODE) {
+  const isolatedDir = process.env.CHAT_ORCH_E2E_DATA_DIR;
+  if (!isolatedDir || !path.isAbsolute(isolatedDir)) {
+    throw new Error('E2E mode requires an absolute isolated data directory');
+  }
+  if (PACKAGED_SMOKE_MODE &&
+      !path.basename(isolatedDir).toLowerCase().startsWith('chat-orchestrator-smoke-')) {
+    throw new Error('Packaged smoke profile requires an explicit disposable directory name');
+  }
+  fs.mkdirSync(isolatedDir, { recursive: true });
+  app.setPath('userData', isolatedDir);
+}
+app.setName(E2E_MODE ? 'Chat Orchestrator E2E' : 'Chat Orchestrator');
+if (process.platform === 'win32') app.setAppUserModelId(E2E_MODE
+  ? 'com.empirerider.chat-orchestrator.e2e' : 'com.empirerider.chat-orchestrator');
 const hasInstanceLock = app.requestSingleInstanceLock();
 debug(`single-instance lock=${hasInstanceLock}`);
 if (!hasInstanceLock) app.quit();
 
 const dataDir = () => app.getPath('userData');
 const tokenFile = () => path.join(dataDir(), 'bridge.token');
+const extensionTokenFile = () => path.join(dataDir(), 'extension-bridge.token');
 const settingsFile = () => path.join(dataDir(), 'settings.json');
 const ngrokAuthFile = () => path.join(dataDir(), 'ngrok-auth.bin');
 const ngrokConfigFile = () => path.join(dataDir(), 'ngrok-isolated.yml');
+const principalRegistryFile = () => path.join(dataDir(), 'coordination-principals.json');
+const privateCoordinationJournalPath = () => path.join(dataDir(), 'coordination.events.journal');
+
+// Provision only from trusted desktop IPC. A future start may use the journal,
+// but no record is ACKed merely because this file was created. On Windows,
+// power-loss directory-entry durability is not claimed; recovery stays fail-closed.
+function preparePrivateCoordinationJournal() {
+  return preparePrivateJournal(privateCoordinationJournalPath());
+}
 
 function ensureIsolatedNgrokConfig() {
   fs.mkdirSync(dataDir(), { recursive: true });
@@ -61,6 +116,12 @@ function state() {
     ngrokAuthConfigured: fs.existsSync(ngrokAuthFile()),
     error: errorMessage,
     extensionConnected,
+    coordinationState,
+    privateCoordinationOptIn,
+    privateCoordinationJournalPresent: fs.existsSync(privateCoordinationJournalPath()),
+    privateCoordinationRestartRequired: Boolean(child && runningPrivateCoordination !== privateCoordinationOptIn),
+    principalState,
+    coordinationSnapshot,
     domain,
     port: PORT,
     routeVerified,
@@ -80,15 +141,17 @@ function loadSettings() {
     const saved = JSON.parse(fs.readFileSync(settingsFile(), 'utf8'));
     domain = saved.domain ? normalizeNgrokDomain(saved.domain) : '';
     minimizeToTray = minimizeToTrayPreference(saved.minimizeToTray);
+    privateCoordinationOptIn = saved.privateCoordinationOptIn === true;
   } catch {
     domain = '';
     minimizeToTray = true;
+    privateCoordinationOptIn = false;
   }
 }
 
 function writeSettings() {
   fs.mkdirSync(dataDir(), { recursive: true });
-  fs.writeFileSync(settingsFile(), JSON.stringify({ domain, minimizeToTray }, null, 2), 'utf8');
+  fs.writeFileSync(settingsFile(), JSON.stringify({ domain, minimizeToTray, privateCoordinationOptIn }, null, 2), 'utf8');
 }
 
 async function saveNgrokAuth(value) {
@@ -245,6 +308,8 @@ function startProxy() {
 
   try {
     token = ensureDesktopToken(tokenFile(), app.isPackaged ? undefined : path.join(appDir, '.token'), process.env.BRIDGE_TOKEN);
+    extensionToken = ensureDesktopToken(extensionTokenFile(), undefined, process.env.EXTENSION_BRIDGE_TOKEN);
+    if (token === extensionToken) throw new Error('Extension and MCP tokens must differ');
     debug(`starting local MCP proxy at 127.0.0.1:${PORT}`);
     const processForThisStart = utilityProcess.fork(path.join(appDir, 'server.js'), [], {
       serviceName: 'Chat Orchestrator MCP',
@@ -255,9 +320,12 @@ function startProxy() {
         PORT: String(PORT),
         HOST: '127.0.0.1',
         BRIDGE_TOKEN_FILE: tokenFile(),
+        EXTENSION_BRIDGE_TOKEN_FILE: extensionTokenFile(),
+        CHAT_ORCH_PRIVATE_COORDINATION: privateCoordinationOptIn ? '1' : '0',
       },
     });
     child = processForThisStart;
+    runningPrivateCoordination = privateCoordinationOptIn;
     // Keep child output out of UI and routine logs: it may contain diagnostic data.
     processForThisStart.stdout?.resume();
     processForThisStart.stderr?.resume();
@@ -267,6 +335,18 @@ function startProxy() {
         debug('local MCP proxy ready');
         phase = 'running';
         errorMessage = '';
+      } else if (message?.type === 'manager_attestation') {
+        const pending = managerAttestations.get(message.request_id);
+        if (pending) {
+          clearTimeout(pending.timer);
+          managerAttestations.delete(message.request_id);
+          if (message.ok) pending.resolve(message.result);
+          else pending.reject(new Error(message.error || 'Manager attestation failed'));
+        }
+      } else if (message?.type === 'coordination_snapshot') {
+        if (message.snapshot && typeof message.snapshot === 'object') {
+          coordinationSnapshot = message.snapshot;
+        }
       } else if (message?.type === 'error') {
         debug('local MCP proxy reported an error');
         phase = 'error';
@@ -283,7 +363,14 @@ function startProxy() {
       debug(`local MCP proxy exited (code=${code})`);
       if (child !== processForThisStart) return;
       child = null;
+      for (const [id, pending] of managerAttestations) {
+        clearTimeout(pending.timer);
+        pending.reject(new Error('Proxy stopped during manager attestation'));
+        managerAttestations.delete(id);
+      }
+      runningPrivateCoordination = null;
       extensionConnected = false;
+      coordinationSnapshot = null;
       if (stopping) {
         phase = 'stopped';
       } else if (phase !== 'error') {
@@ -337,8 +424,15 @@ async function pollHealth() {
     if (!response.ok) throw new Error('Health request failed');
     const health = await response.json();
     extensionConnected = Boolean(health.extensionConnected);
+    coordinationState = health.coordination?.enabled === true ? 'active'
+      : health.coordination?.storageReady === true ? 'private_ready'
+      : health.coordination?.enabled === false ? 'disabled' : 'unknown';
+    principalState = ['enrolled', 'not_enrolled', 'error'].includes(health.coordination?.principalState)
+      ? health.coordination.principalState : 'unknown';
   } catch {
     extensionConnected = false;
+    coordinationState = 'unknown';
+    principalState = 'unknown';
   }
   publishState();
 }
@@ -347,6 +441,24 @@ function requireTrustedWindow(event) {
   if (!window || event.sender !== window.webContents || event.senderFrame !== window.webContents.mainFrame) {
     throw new Error('Unauthorized desktop request');
   }
+}
+
+function attestManagerTab(tabId) {
+  if (!child || phase !== 'running') return Promise.reject(new Error('Start the local proxy and extension before pairing'));
+  if (!Number.isSafeInteger(tabId) || tabId <= 0) return Promise.reject(new Error('Invalid manager tab'));
+  const owned = child;
+  const requestId = crypto.randomUUID();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      managerAttestations.delete(requestId);
+      reject(new Error('Manager tab attestation timed out; check extension connection'));
+    }, 12000);
+    managerAttestations.set(requestId, { resolve, reject, timer });
+    try { owned.postMessage({ type: 'attest_manager_tab', request_id: requestId, tab_id: tabId }); }
+    catch (error) {
+      clearTimeout(timer); managerAttestations.delete(requestId); reject(error);
+    }
+  });
 }
 
 function registerActions() {
@@ -363,6 +475,11 @@ function registerActions() {
   ipcMain.handle('bridge:copyToken', (event) => {
     requireTrustedWindow(event);
     clipboard.writeText(token);
+  });
+  ipcMain.handle('bridge:copyExtensionToken', (event) => {
+    requireTrustedWindow(event);
+    if (!extensionToken) throw new Error('Start the proxy to create an extension bridge token');
+    clipboard.writeText(extensionToken);
   });
   ipcMain.handle('bridge:copyUrl', (event) => {
     requireTrustedWindow(event);
@@ -410,6 +527,44 @@ function registerActions() {
     token = imported;
     startProxy();
     return true;
+  });
+  ipcMain.handle('bridge:configurePrivateCoordination', (event, enabled) => {
+    requireTrustedWindow(event);
+    if (typeof enabled !== 'boolean') throw new Error('Invalid private coordination setting');
+    if (enabled) preparePrivateCoordinationJournal();
+    privateCoordinationOptIn = enabled;
+    writeSettings();
+    publishState();
+    return state();
+  });
+  ipcMain.handle('bridge:enrollPrincipal', async (event, input) => {
+    requireTrustedWindow(event);
+    const attestation = await attestManagerTab(input?.callerTabId);
+    if (attestation.tab_id !== input.callerTabId ||
+        !/^[0-9a-f-]{36}$/i.test(attestation.browser_session_id || '') ||
+        !/^[0-9a-f-]{36}$/i.test(attestation.incarnation_id || '')) {
+      throw new Error('Extension manager tab attestation mismatch; do not enroll');
+    }
+    return createPrincipalCredential(principalRegistryFile(), {
+      ...input, browserSessionId: attestation.browser_session_id,
+      managerIncarnationId: attestation.incarnation_id,
+    });
+  });
+  ipcMain.handle('bridge:listPrincipals', (event) => {
+    requireTrustedWindow(event);
+    return listPrincipalCredentials(principalRegistryFile());
+  });
+  ipcMain.handle('bridge:revokePrincipal', (event, credentialId) => {
+    requireTrustedWindow(event);
+    return revokePrincipalCredential(principalRegistryFile(), credentialId);
+  });
+  ipcMain.handle('bridge:copyScopedUrl', (event, scopedToken) => {
+    requireTrustedWindow(event);
+    if (!domain) throw new Error('Save your ngrok domain first');
+    if (!resolvePrincipalCredential(principalRegistryFile(), scopedToken)) {
+      throw new Error('Scoped credential is invalid or revoked');
+    }
+    clipboard.writeText(connectorUrl(domain, scopedToken));
   });
 }
 
@@ -517,6 +672,10 @@ if (hasInstanceLock) {
     void startNgrok();
     setInterval(pollHealth, 2000);
     setInterval(pollNgrok, 5000);
+    if (PACKAGED_SMOKE_MODE) {
+      setTimeout(() => { debug('isolated packaged smoke auto-exit'); app.quit(); },
+        PACKAGED_SMOKE_EXIT_MS);
+    }
   }).catch((error) => debug(`app ready failed: ${error.message}`));
   app.on('window-all-closed', () => { debug('all windows closed'); app.quit(); });
   app.on('before-quit', (event) => {
