@@ -10,7 +10,7 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 const origin = 'http://127.0.0.1:8899';
 const edgeCdp = 'http://127.0.0.1:9341';
 const desktopCdp = 'http://127.0.0.1:9339';
-const testProfile = 'D:\\web-chat-automation\\test-output\\p0-ui-profile';
+const testProfile = process.env.CHAT_ORCH_SMOKE_PROFILE || 'D:\\web-chat-automation\\test-output\\p0-ui-profile';
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const wait = async (fn, label, maxMs = 18000) => {
   const end = Date.now() + maxMs;
