@@ -134,7 +134,9 @@ try {
         /^chrome-extension:\/\//.test(t.url || '') && t.url.endsWith('/background.js'));
     } catch { return false; }
   }, 'Isolated Edge extension readiness', 35000);
-  const smokeEnv = { ...process.env, CHAT_ORCH_LIVE_WORKER_SMOKE: '1', CHAT_ORCH_SMOKE_PROFILE: profile };
+  const smokeEnv = { ...process.env,
+    CHAT_ORCH_LIVE_WORKER_SMOKE: process.env.CHAT_ORCH_LIVE_WORKER_SMOKE ?? '1',
+    CHAT_ORCH_SMOKE_PROFILE: profile };
   const smoke = spawn(process.execPath, [
     path.join(root, 'test', 'isolated-edge-extension-smoke.mjs'),
   ], { cwd: root, env: smokeEnv, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -174,8 +176,8 @@ try {
     }
   }
   if (safeToRemove) {
-    await pause(1200);
-    try { fs.rmSync(tempRoot, { recursive: true, force: true, maxRetries: 6, retryDelay: 350 }); }
+    await pause(5000);
+    try { fs.rmSync(tempRoot, { recursive: true, force: true, maxRetries: 16, retryDelay: 500 }); }
     catch (error) { process.stderr.write('Isolated profile cleanup pending: ' + error.message + '\n'); }
   }
   else process.stderr.write('Preserved isolated test profile for process inspection: ' + tempRoot + '\n');

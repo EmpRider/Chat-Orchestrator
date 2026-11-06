@@ -147,16 +147,30 @@ try {
   });
   assert.equal(repeated.event_id, queued.event_id);
   let wakeDelivered = false;
-  if (fullThreeChildSmoke && process.env.CHAT_ORCH_LIVE_WAKE === '1') {
+  if (process.env.CHAT_ORCH_LIVE_WAKE === '1') {
+    const expected = fullThreeChildSmoke
+      ? ['CHILD_RESULT', 'STATUS_REQUEST', 'CHILD_RESULT', 'CHILD_RESULT']
+      : liveCount === 1 ? ['CHILD_RESULT', 'STATUS_REQUEST'] : ['STATUS_REQUEST'];
     assert.equal((await call('coordination_start_delivery')).armed, true);
     const sent = await wait(async () => {
       const now = await call('coordination_pending');
-      return now.events.length === 4 && now.events.every((item) => item.phase === 'DELIVERED')
-        ? now : null;
+      return now.events.length === expected.length &&
+        now.events.every((item) => item.phase === 'DELIVERED') ? now : null;
     }, 'live Edge manager did not receive one combined batch', 30000);
-    assert.deepEqual(sent.events.map((item) => item.entryType),
-      ['CHILD_RESULT', 'STATUS_REQUEST', 'CHILD_RESULT', 'CHILD_RESULT']);
+    assert.deepEqual(sent.events.map((item) => item.entryType), expected);
     wakeDelivered = true;
+  }
+  let queuePromptVisible = false;
+  if (wakeDelivered) {
+    for (let i = 0; i < 12; i++) {
+      const chat = await call('read_chat', {tab_id:manager.id,last_n:10}).catch(() => null);
+      const transcript = chat?.transcript || '';
+      if (transcript.includes('<queue_batch') && transcript.includes('STATUS_REQUEST')) {
+        queuePromptVisible = true;
+        break;
+      }
+      await sleep(250);
+    }
   }
   const pending = await call('coordination_pending');
   assert.ok(pending.events.some((item) => item.ref === queued.event_id));
@@ -173,7 +187,7 @@ try {
     realEdge: true, realElectron45: true, extensionConnected: true,
     managerTabId: manager.id, paired: true, durableStatus: true,
     deduplicated: true, ownScopeOnly: true, revokedDenied: true,
-    managerChatIdle: registered.observation === 'idle', liveWorker, liveCount, wakeDelivered,
+    managerChatIdle: registered.observation === 'idle', liveWorker, liveCount, wakeDelivered, queuePromptVisible,
   }));
 } finally {
   if (enrolled?.principal?.credentialId) await desktop.evaluate('window.bridge.revokePrincipal(' +
