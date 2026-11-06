@@ -14,8 +14,8 @@ import { WebSocketServer } from 'ws';
 import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { disabledAgentSettings, normalizeAgentSettings, replaceObsoletePromptSettings, composeAgentPrompt } from './agent-settings.mjs';
 import { listPrincipalCredentials, resolvePrincipalCredential } from './principal-auth.mjs';
-import { disabledAgentSettings, normalizeAgentSettings } from './agent-settings.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 8787);
@@ -61,7 +61,7 @@ function reloadAgentSettings() {
     } else {
       if (fs.statSync(AGENT_SETTINGS_FILE).size > 128000) throw new Error('settings file too large');
       const stored = JSON.parse(fs.readFileSync(AGENT_SETTINGS_FILE, 'utf8'));
-      agentSettings = normalizeAgentSettings(stored.agentSettings || {});
+      agentSettings = replaceObsoletePromptSettings(stored.agentSettings || {});
     }
   } catch (error) {
     console.error('[settings] invalid profile settings; automation remains disabled:', error.message);
@@ -238,7 +238,7 @@ const PRIVATE_QUEUE_PHASES = new Set([
   'QUEUED', 'LEASED', 'DISPATCHING', 'DELIVERED',
   'PROCESSED', 'SAGA_CONFIRMED', 'UNCERTAIN',
 ]);
-const PRIVATE_QUEUE_ENTRY_TYPES = new Set(['CHILD_RESULT', 'STATUS_REQUEST']);
+const PRIVATE_QUEUE_ENTRY_TYPES = new Set(['CHILD_RESULT', 'STATUS_REQUEST', 'CHILD_TAB_LOST']);
 
 // This identity is derived only from a verified PrincipalContext, never owner_id
 // in an MCP request. Length-prefixing prevents composite-key collisions.
@@ -869,6 +869,20 @@ wss.on('connection', (ws) => {
       ws.send(JSON.stringify({ type: 'pong' }));
       return;
     }
+    if (msg.type === 'worker_lost') {
+      if (!PRIVATE_EVENT_ID.test(msg.request_id || '')) return;
+      void acceptPrivateWorkerLoss(msg).then((receipt) => {
+        if (ws.readyState === 1 && ws === bridge) ws.send(JSON.stringify({
+          type:'worker_event_receipt',request_id:msg.request_id,ok:true,receipt,
+        }));
+      }).catch(() => {
+        if (ws.readyState === 1 && ws === bridge) ws.send(JSON.stringify({
+          type:'worker_event_receipt',request_id:msg.request_id,ok:false,
+          error:'Durable lost-child event unavailable; reconcile without blind replay',
+        }));
+      });
+      return;
+    }
     if (msg.type === 'worker_done') {
       if (!PRIVATE_EVENT_ID.test(msg.request_id || '')) return;
       void acceptPrivateWorkerCompletion(msg).then((receipt) => {
@@ -1146,6 +1160,57 @@ async function acceptPrivateWorkerCompletion(packet) {
     result_sha256: data.resultSha256, seq: record.seq, durably_recorded: true };
 }
 
+// Closed workers can no longer be verified through live list_tabs. Accept only
+// an authenticated extension receipt that matches an existing scoped task.
+async function acceptPrivateWorkerLoss(packet) {
+  if (!privateCoordinationEnabled || !privateJournal) throw new Error('Private child-loss queue unavailable');
+  if (!packet || !PRIVATE_EVENT_ID.test(packet.task_id || '') ||
+      !PRIVATE_EVENT_ID.test(packet.worker_incarnation_id || '') ||
+      !PRIVATE_EVENT_ID.test(packet.credential_id || '') ||
+      !PRIVATE_EVENT_ID.test(packet.event_key || '') ||
+      !Number.isSafeInteger(packet.tab_id) || packet.tab_id <= 0 ||
+      typeof packet.saved_url !== 'string' || packet.saved_url.length > 2048) {
+    throw new Error('Invalid child-loss receipt');
+  }
+  const url = new URL(packet.saved_url);
+  if (url.protocol !== 'https:' ||
+      !['chatgpt.com','chat.openai.com','claude.ai','gemini.google.com'].includes(url.hostname) ||
+      url.username || url.password || url.search || url.hash) {
+    throw new Error('Unsafe child conversation URL');
+  }
+  const principal = activePrivateManagers.get(packet.credential_id);
+  if (!principal) throw new Error('Parent manager not registered');
+  const active = registeredPrivateManager(principal);
+  const task = await callExtension('get_result', {__trustedPrincipal:active,task_id:packet.task_id});
+  if (task.tab_id !== packet.tab_id ||
+      task.source_incarnation_id !== packet.worker_incarnation_id ||
+      !['done','failed'].includes(task.status)) {
+    throw new Error('Child-loss receipt does not match owned task history');
+  }
+  const scope = Object.freeze({
+    ownerPrincipalId:active.principalId,
+    workspaceId:active.workspaceId,projectId:active.projectId,
+    orchestratorId:active.orchestratorId,parentTaskId:active.parentTaskId,
+    ownerTabId:active.callerTabId,workerTabId:packet.tab_id,
+    connectionGeneration:active.connectionGeneration,
+    recipientTabId:active.callerTabId,
+    recipientIncarnationId:active.sessionIncarnationId,
+    recipientGeneration:active.connectionGeneration,
+    workerIncarnationId:packet.worker_incarnation_id,workerGeneration:1,
+  });
+  verifiedCoordinationScopes.add(scope);
+  registeredPrivateManager(active);
+  const record = await privateJournal.append(active,scope,'queue.transition',{
+    phase:'QUEUED',entryType:'CHILD_TAB_LOST',leaseGeneration:0,leaseNonce:null,
+    data:{taskId:packet.task_id,workerTabId:packet.tab_id,
+      workerIncarnationId:packet.worker_incarnation_id,
+      savedUrl:packet.saved_url,status:'UNKNOWN',
+      originalTaskStatus:task.status,
+      reason:'Tab removed or unavailable; browser cause not proven'},
+  },packet.event_key);
+  return {event_id:record.id,seq:record.seq,state:'QUEUED',durably_recorded:true};
+}
+
 // A manager opts into automatic wake only after its token-verified registration.
 // This volatile arm state deliberately vanishes on restart; no blind replay.
 const armedPrivateDelivery = new Set();
@@ -1174,6 +1239,25 @@ function privateRecordedScope(principal, event) {
   return scope;
 }
 
+// Queue notifications are bounded previews. The complete, checksummed report
+// remains immutable in the journal and retrievable through coordination_get_report.
+function privateQueueSummary(original) {
+  const data = original.payload.data;
+  if (original.payload.entryType === 'STATUS_REQUEST') return data.summary;
+  if (original.payload.entryType === 'CHILD_TAB_LOST') {
+    return JSON.stringify({task_id:data.taskId,child_tab_id:data.workerTabId,
+      saved_url:data.savedUrl,status:data.status,reason:data.reason,
+      original_task_status:data.originalTaskStatus});
+  }
+  const body = data.result ?? data.error ?? null;
+  const text = typeof body === 'string' ? body : JSON.stringify(body);
+  return JSON.stringify({
+    task_id:data.taskId,worker_tab_id:data.workerTabId,status:data.status,
+    full_report_ref:original.id,result_sha256:data.resultSha256,
+    result_preview:text.slice(0,3000),preview_truncated:text.length>3000,
+  });
+}
+
 async function pumpOnePrivateManager(principal) {
   if (!privateCoordinationEnabled || !privateJournal ||
       !armedPrivateDelivery.has(principal.credentialId) ||
@@ -1195,20 +1279,26 @@ async function pumpOnePrivateManager(principal) {
     const firstEvents = new Map(recorded.filter((event) =>
       event.payload.phase === 'QUEUED').map((event) => [event.id, event]));
     const events = [];
+    const batchId = crypto.randomUUID();
     let size = 0;
     for (const item of batchItems) {
       const original = firstEvents.get(item.ref);
       if (!original) throw new Error('Queued event source missing from durable journal');
-      const data = original.payload.data;
-      const summary = item.entryType === 'STATUS_REQUEST'
-        ? data.summary
-        : JSON.stringify({ task_id: data.taskId, worker_tab_id: data.workerTabId,
-          status: data.status, result: data.result, error: data.error });
+      const summary = privateQueueSummary(original);
       if (typeof summary !== 'string') throw new Error('Invalid durable event summary');
-      if (summary.length > 20000 || size + summary.length > 52000) break; // Defer whole event, never truncate it.
+      const candidate = { event_id: original.id, type: item.entryType,
+        summary, recorded_at: original.recordedAt };
+      if (summary.length > 20000 || size + summary.length > 52000) break;
+      // A rich prompt may expand JSON escapes; check its actual size BEFORE
+      // reserving durable leases, so the oldest FIFO event cannot deadlock.
+      try {
+        composeAgentPrompt(agentSettings,{kind:'queue',batchId,events:[...events,candidate]});
+      } catch (error) {
+        if (!events.length) throw error;
+        break;
+      }
       size += summary.length;
-      events.push({ event_id: original.id, type: item.entryType,
-        summary, recorded_at: original.recordedAt });
+      events.push(candidate);
     }
     if (!events.length) return; // Oversized immutable event requires manual handling.
     const ready = await callExtension('manager_state', { __trustedPrincipal: principal });
@@ -1221,11 +1311,10 @@ async function pumpOnePrivateManager(principal) {
     if (events.some((event, i) =>
       pendingQueue[i]?.ref !== event.event_id || pendingQueue[i].phase !== 'QUEUED')) return;
 
-    const batchId = crypto.randomUUID();
     const scopes = [];
     for (const event of events) {
       const original = firstEvents.get(event.event_id);
-      if (original.source.type === 'worker_tab') {
+      if (original.source.type === 'worker_tab' && original.payload.entryType !== 'CHILD_TAB_LOST') {
         const verified = await verifiedPrivateWorkerScope(principal, original.source.tabId);
         if (verified.workerIncarnationId !== original.source.incarnationId) {
           throw new Error('Queued child source incarnation no longer matches');
@@ -1250,6 +1339,7 @@ async function pumpOnePrivateManager(principal) {
       registeredPrivateManager(principal); // No stale credential may submit a browser prompt.
       const outcome = await callExtension('wake_manager', {
         __trustedPrincipal: principal, batch_id: batchId, events,
+        prompt_text: composeAgentPrompt(agentSettings,{kind:'queue',batchId,events}),
       });
       submitted = outcome?.submitted === true && outcome.uncertain !== true;
     } catch { /* Submitted status may be ambiguous; never retry. */ }
@@ -1323,7 +1413,9 @@ function forward(method, principal) {
     const startedAt = Date.now();
     try {
       // Trust boundary: ignore any caller-supplied identity; the server owns it.
-      const result = await callExtension(method, { ...(args || {}), __trustedPrincipal: principal });
+      const params = { ...(args || {}), __trustedPrincipal: principal };
+      if (method === 'spawn_worker') params.prompt_text = composeAgentPrompt(agentSettings,{kind:'task',operation:args.operation||'task',task:args.task});
+      const result = await callExtension(method, params);
       recordToolActivity(principal, method, true, startedAt);
       return textResult(result);
     } catch (err) {
@@ -1362,12 +1454,13 @@ function buildServer(principal) {
     {
       title: 'Start a worker chat',
       description:
-        'Open a NEW chat session in a separate browser window on the given site and send it a task. It works like a sub-agent: the worker has no memory of this conversation unless you pass context. Returns a task_id (and the result if it finishes within wait_seconds). Use get_result to collect the answer. The worker window stays open after it finishes, so you can send follow-ups with send_to_tab. YOU are responsible for closing it with close_worker (using the tab_id) once you have the result and no longer need that worker.',
+        'Open a new worker chat on the selected site and send a self-contained task, or continue an authorized reusable seat when a matching role_scope is supplied. Returns task_id and, when wait_seconds permits, a result; use get_result for later results. Worker tabs are held for reconciliation and follow-ups. Before calling close_worker, independently verify authorized ownership, every child incarnation and the required Saga effects; UNCERTAIN or failed Saga reconciliation must keep the tab open.',
       inputSchema: {
         site: z.enum(['chatgpt', 'claude', 'gemini']).describe('Which chat site the worker runs on.'),
+        operation: z.enum(['task','workspace','delegation']).optional().describe('Operation-specific instructions to include.'),
         role: z.enum(['ba', 'pm', 'tl', 'specialist', 'council_a', 'council_b',
           'council_c', 'council_d', 'council_e', 'watchdog']).optional()
-          .describe('Reusable role-seat prompt; defaults to specialist.'),
+          .describe('Optional existing authenticated seat metadata for tab reuse, not an injected role prompt.'),
         role_scope: z.string().optional().describe('Opt-in reusable seat within this authenticated caller: PM/Watchdog epic:N, TL task:N, Council parent:N. Subsequent spawn_worker with the same role+scope continues the SAME idle chat; it never closes or replaces a running worker.'),
         task: z
           .string()
@@ -1383,7 +1476,7 @@ function buildServer(principal) {
           .boolean()
           .optional()
           .describe(
-            'Optional. If true, the extension closes this worker window by itself shortly after the task succeeds (no follow-ups possible). Default false: the window stays open until you call close_worker.'
+             'Automatic worker closure is currently disabled: true is rejected. Keep the worker tab open and close it explicitly only after independent ownership, child-result and Saga verification.'
           ),
         wait_seconds: waitSeconds,
       },
@@ -1391,6 +1484,15 @@ function buildServer(principal) {
     forward('spawn_worker', principal)
   );
 
+  server.registerTool(
+    'reopen_child',
+    {
+      title:'Recover a lost child conversation',
+      description:'Reopen a saved child conversation by its original task_id; owner-scoped. Returns a newly attached child tab. Execution is NOT automatically resumed. Inspect read_chat and get_result first.',
+      inputSchema:{task_id:z.string().uuid().describe('Original task_id from CHILD_TAB_LOST notification.')},
+    },
+    forward('reopen_child',principal)
+  );
   server.registerTool(
     'send_to_tab',
     {

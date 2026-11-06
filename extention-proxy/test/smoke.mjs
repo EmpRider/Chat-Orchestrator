@@ -55,6 +55,7 @@ try {
     'get_result',
     'list_tabs',
     'read_chat',
+    'reopen_child',
     'send_to_tab',
     'spawn_worker',
   ]);

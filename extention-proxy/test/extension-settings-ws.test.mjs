@@ -45,7 +45,7 @@ test('settings sync only to locally authenticated extension-only token and refus
   const settingsFile = path.join(dir, 'settings.json');
   writeFileSync(bridgeFile, bridgeToken);
   writeFileSync(extensionFile, extensionToken);
-  writeFileSync(settingsFile, JSON.stringify({agentSettings:{enabled:true, systemPrompts:{worker:'Private worker instructions',ba:'User-owned BA guidance'}}}));
+  writeFileSync(settingsFile, JSON.stringify({agentSettings:{enabled:true,promptSchema:2,promptModules:{queue:'Private queue processing instructions'}}}));
   const child = spawn(process.execPath, ['server.js'], {cwd:root,
     env:{...process.env, PORT:String(port), HOST:'127.0.0.1', BRIDGE_TOKEN:'', EXTENSION_BRIDGE_TOKEN:'',
       BRIDGE_TOKEN_FILE:bridgeFile, EXTENSION_BRIDGE_TOKEN_FILE:extensionFile, CHAT_ORCH_PRIVATE_COORDINATION:'0'},
@@ -64,13 +64,13 @@ test('settings sync only to locally authenticated extension-only token and refus
     const snapshot = trusted.messages.find((m) => m.type === 'settings_snapshot');
     assert.ok(snapshot, 'Authenticated extension receives snapshot on connect');
     assert.equal(snapshot.schema, 1);
-    assert.equal(snapshot.settings.systemPrompts.worker, 'Private worker instructions');
-    assert.equal(snapshot.settings.systemPrompts.ba, 'User-owned BA guidance');
+    assert.equal(snapshot.settings.promptModules.queue, 'Private queue processing instructions');
+    assert.equal(snapshot.settings.promptModules.core.length>10, true);
     trusted.ws.send(JSON.stringify({type:'settings_snapshot',schema:1,revision:300,
-      settings:{enabled:false,systemPrompts:{worker:'Unauthorized overwrite'}}}));
+      settings:{enabled:false,promptSchema:2,promptModules:{queue:'Unauthorized overwrite'}}}));
     await delay(100);
-    assert.equal(JSON.parse(readFileSync(settingsFile,'utf8')).agentSettings.systemPrompts.worker,
-      'Private worker instructions', 'Extension cannot write proxy-owned settings over WebSocket');
+    assert.equal(JSON.parse(readFileSync(settingsFile,'utf8')).agentSettings.promptModules.queue,
+      'Private queue processing instructions', 'Extension cannot write proxy-owned settings over WebSocket');
   } finally {
     for (const ws of sockets) ws.terminate();
     child.kill();

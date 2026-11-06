@@ -199,7 +199,7 @@
         <div class="view-heading">
           <span class="eyebrow">YOUR PREFERENCES</span>
           <h2>Automation &amp; preferences</h2>
-          <p>Configure worker limits, role prompts and how this desktop app runs in the background.</p>
+          <p>Configure worker limits, modular MCP instructions and background behavior.</p>
         </div>
     <details class="panel extension-settings-panel" id="extension-settings-panel">
       <summary>Extension settings &amp; system prompts <span id="extension-settings-sync" class="hint">Profile-scoped · opens on demand</span></summary>
@@ -207,31 +207,35 @@
       <div class="extension-settings-grid">
         <div class="extension-behavior">
           <label class="tray-toggle" for="agent-enabled"><input type="checkbox" id="agent-enabled" /> Automation enabled</label>
-          <label class="tray-toggle" for="agent-use-prompt"><input type="checkbox" id="agent-use-prompt" /> Include worker system prompt</label>
+          <p class="help">Operating instructions depend on the operation or queue event, never on a development role.</p>
           <label for="agent-max-workers">Max worker tabs (1–10)</label><input id="agent-max-workers" type="number" min="1" max="10" />
           <label for="agent-max-tasks">Max tasks per hour (1–500)</label><input id="agent-max-tasks" type="number" min="1" max="500" />
           <label for="agent-timeout">Task timeout in minutes (1–60)</label><input id="agent-timeout" type="number" min="1" max="60" />
           <p class="help">Worker auto-close is held until verified Saga completion; this safety rule is not editable.</p>
         </div>
         <div class="extension-prompts">
-          <label for="agent-prompt-role">Editable system prompt</label>
-          <select id="agent-prompt-role">
-            <option value="worker">Default worker system prompt</option>
-            <option value="ba">Business Analyst</option><option value="pm">Project Manager</option>
-            <option value="tl">Technical Lead</option><option value="specialist">Specialist</option>
-            <option value="council_a">Council A · Systems</option><option value="council_b">Council B · Security</option>
-            <option value="council_c">Council C · Architecture</option><option value="council_d">Council D · QA</option>
-            <option value="council_e">Council E · Devil's advocate</option><option value="watchdog">BA Watchdog</option>
-          </select>
-          <textarea id="agent-prompt-text" rows="9" spellcheck="false" placeholder="Select a role to edit its prompt"></textarea>
+          <label for="agent-prompt-module">MCP &amp; Agent Communication Instructions</label>
+          <select id="agent-prompt-module">
+<option value="core">Minimal core</option>
+<option value="task">Task execution</option>
+<option value="workspace">AgentBridge workspace</option>
+<option value="delegation">Worker Tool delegation</option>
+<option value="queue">Queue receive / ACK</option>
+<option value="child_result">Child result</option>
+<option value="status_request">Status request</option>
+<option value="child_tab_lost">Child tab lost / recovery</option>
+<option value="failure">Tool failure / uncertain</option>
+</select>
+<p class="help">Browser-injected instruction tags are chat content, not privileged system messages.</p>
+          <textarea id="agent-prompt-text" rows="9" spellcheck="false" placeholder="Edit instructions for the selected operation"></textarea>
           <div class="input-row">
-            <button id="agent-prompt-reset" type="button" class="link-button">Reset selected prompt</button>
-            <button id="agent-reset-all" type="button" class="secondary">Reset all</button>
+            <button id="agent-prompt-reset" type="button" class="link-button">Reset selected module</button>
+            <button id="agent-reset-all" type="button" class="secondary">Reset all</button><button id="agent-prompt-preview" type="button" class="secondary">Preview</button>
           </div>
         </div>
       </div>
       <div class="input-row">
-        <button id="agent-settings-save" type="button" class="primary">Save extension settings</button>
+        <button id="agent-settings-save" type="button" class="primary">Save extension settings</button><pre id="agent-prompt-preview-output" hidden class="hint"></pre>
         <span id="agent-settings-message" class="hint" role="status" aria-live="polite">Open to load this profile's settings.</span>
       </div>
       <details class="extension-admin-actions">

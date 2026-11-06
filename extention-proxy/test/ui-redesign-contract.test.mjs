@@ -22,7 +22,7 @@ test('redesigned navigation keeps each trusted desktop control and one page per 
     'server-state', 'extension-state', 'ngrok-state', 'copy-extension-token', 'copy-url',
     'connector-url', 'token-value', 'import-token', 'domain', 'ngrok-token',
     'configure-ngrok', 'proxy-port', 'save-proxy-port', 'minimize-to-tray',
-    'start', 'stop', 'agent-settings-save', 'agent-prompt-role', 'agent-prompt-text',
+    'start', 'stop', 'agent-settings-save', 'agent-prompt-module', 'agent-prompt-text',
     'pair-principal', 'principal-list', 'queue-items', 'agent-seats', 'tool-call-log',
   ]) assert.ok(ids.includes(id), 'trusted control missing: ' + id);
   assert.match(html, /Content-Security-Policy/);

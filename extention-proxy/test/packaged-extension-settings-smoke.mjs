@@ -55,8 +55,8 @@ try {
   const msg = await snapshot;
   assert.equal(msg.schema,1);
   assert.ok(msg.revision>0);
-  assert.ok(msg.settings.systemPrompts.worker.length>10);
-  assert.ok(msg.settings.systemPrompts.council_e.length>10);
+  assert.ok(msg.settings.promptModules.core.length>10);
+  assert.ok(msg.settings.promptModules.queue.length>10);
   ws.send(JSON.stringify({type:'settings_applied',revision:msg.revision}));
   ws.close();
   let stopped=false;

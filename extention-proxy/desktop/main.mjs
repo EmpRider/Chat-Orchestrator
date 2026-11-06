@@ -9,7 +9,7 @@ import { createNgrokLogReader } from './ngrok-diagnostics.mjs';
 import { inspectPrivateJournal, preparePrivateJournal } from './coordination-storage.mjs';
 import { createDesktopTray, installWindowCloseBehavior, minimizeToTrayPreference } from './tray-lifecycle.mjs';
 import { createPrincipalCredential, listPrincipalCredentials, resolvePrincipalCredential, revokePrincipalCredential } from '../principal-auth.mjs';
-import { DEFAULT_AGENT_SETTINGS, normalizeAgentSettings, disabledAgentSettings } from '../agent-settings.mjs';
+import { DEFAULT_AGENT_SETTINGS, normalizeAgentSettings, replaceObsoletePromptSettings, disabledAgentSettings, composeAgentPrompt } from '../agent-settings.mjs';
 
 // Set CHAT_ORCH_DIAGNOSTICS=1 for lifecycle messages (never credentials).
 const debug = (message) => {
@@ -171,8 +171,9 @@ function loadSettings() {
     domain = saved.domain ? normalizeNgrokDomain(saved.domain) : '';
     minimizeToTray = minimizeToTrayPreference(saved.minimizeToTray);
     privateCoordinationOptIn = saved.privateCoordinationOptIn === true;
-    agentSettings = normalizeAgentSettings(saved.agentSettings || {});
+    agentSettings = replaceObsoletePromptSettings(saved.agentSettings || {});
     if (!E2E_MODE) PORT = normalizeProxyPort(saved.proxyPort ?? 8787);
+    if (saved.agentSettings?.systemPrompts !== undefined || saved.agentSettings?.useWorkerSystemPrompt !== undefined) writeSettings();
   } catch {
     domain = '';
     minimizeToTray = true;
@@ -537,6 +538,10 @@ function registerActions() {
   ipcMain.handle('bridge:extensionAction', (event, action, tabId) => {
     requireTrustedWindow(event);
     return desktopExtensionAction(action, tabId);
+  });
+  ipcMain.handle('bridge:previewPrompt', (event, input) => {
+    requireTrustedWindow(event);
+    return composeAgentPrompt(agentSettings, input);
   });
   ipcMain.handle('bridge:getAgentSettings', (event) => {
     requireTrustedWindow(event);

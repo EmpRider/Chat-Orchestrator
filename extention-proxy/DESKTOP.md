@@ -51,10 +51,13 @@ The desktop app reads its own credential-free ngrok configuration, so your exist
 ## Extension settings and editable system prompts
 
 Open the desktop **Extension settings & system prompts** panel. It controls the
-extension automation toggle, worker tab cap, hourly task cap, timeout and every
-application-managed system prompt: default worker, BA, PM, TL, Specialist,
-Council A–E and BA Watchdog. Select a role, edit its prompt and choose **Save
-extension settings**. Reset buttons affect only the draft until Save.
+extension automation toggle, worker tab cap, hourly task cap, timeout and the
+operation-specific MCP/agent communication instruction modules (core, task,
+workspace, delegation, queue receipt/ACK, child result, status, lost tab and failure).
+Select an operation, edit its instructions, and choose **Save extension settings**.
+Role policies (BA, PM, TL, specialists, Council, Watchdog) come from SKILL.md,
+not these proxy-managed prompts. **Preview** composes a draft locally without
+submitting a chat message. Reset buttons affect only the draft until Save.
 Settings are stored in this profile's `settings.json` and sent to the extension
 when it connects/reconnects or when changed. A revision indicator appears after
 extension acknowledgement. Legacy shared-MCP-token connections cannot receive

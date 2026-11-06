@@ -3,6 +3,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('bridge', Object.freeze({
   extensionAction: (action, tabId) => ipcRenderer.invoke('bridge:extensionAction', action, tabId),
   getAgentSettings: () => ipcRenderer.invoke('bridge:getAgentSettings'),
+  previewPrompt: (input) => ipcRenderer.invoke('bridge:previewPrompt', input),
   getDefaultAgentSettings: () => ipcRenderer.invoke('bridge:getDefaultAgentSettings'),
   saveAgentSettings: (settings) => ipcRenderer.invoke('bridge:saveAgentSettings', settings),
   status: () => ipcRenderer.invoke('bridge:status'),

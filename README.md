@@ -117,10 +117,12 @@ The default profile uses port `8787`. For a separate independent local proxy, la
 
 ## Safety knobs
 
-- Proxy Tool **Extension settings & system prompts** owns the kill switch, worker limits,
-  task timeout and editable worker/BA/PM/TL/Specialist/Council A–E/Watchdog prompts.
-  The extension popup owns only the WebSocket URL/token and read-only connection status.
-  Settings sync over the extension-only authenticated WebSocket.
+- Proxy Tool **Extension settings & system prompts** controls the automation kill switch, worker limits,
+  task timeout, and editable **operation-specific MCP/agent communication instructions** (task,
+  workspace, delegation, queue receipt/ACK, child result, status request, tab loss, and failures).
+  BA/PM/TL/Council/Watchdog role policies belong in SKILL.md, never in these proxy prompts.
+  The extension popup owns only its WebSocket URL/token and read-only connection status;
+  settings sync over the extension-only authenticated WebSocket.
 - Token required on both `/mcp` and `/bridge`; server binds to `127.0.0.1` only.
 - `send_to_tab` refuses the orchestrator tab; `close_worker` only closes tabs it spawned.
 
@@ -134,3 +136,6 @@ The default profile uses port `8787`. For a separate independent local proxy, la
   enabled. Legacy DOM-only reads can still lose formatting and older virtualized turns.
 - Automating the web UIs may conflict with each site's terms; keep it to personal use.
 - Anyone with your token and tunnel URL can drive your logged-in chats: keep the token secret.
+
+## Modular proxy instructions (development)
+Operation-specific prompt modules: core, task, workspace, delegation, queue, child_result, status_request, child_tab_lost, failure. The proxy chooses modules by operation/event; roles stay in SKILL.md. Browser chat prompt tags are not privileged model system messages. A recovered child tab gets a new tab ID; the parent must use read_chat and get_result to reconcile the original task. The legacy role-prompt catalog was replaced; the legacy authentication system and orchestrator recovery dialog remain separate workstreams. Private queue delivery needs a registered owner; offline loss requires manual reconciliation. These changes are not a verified packaged release.

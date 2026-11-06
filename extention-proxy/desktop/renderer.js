@@ -262,42 +262,51 @@ $('pair-seat').addEventListener('change', () => {
 // Extension behavior is edited only through trusted desktop IPC, never WebSocket writes.
 let agentDraft = null;
 let agentDefaults = null;
-let activeAgentRole = 'worker';
+let activePromptModule = 'core';
 function flushPromptDraft() {
-  if (agentDraft) agentDraft.systemPrompts[activeAgentRole] = $('agent-prompt-text').value;
+  if(agentDraft)agentDraft.promptModules[activePromptModule]=$('agent-prompt-text').value;
 }
 function displayAgentSettings(settings) {
-  $('agent-enabled').checked = settings.enabled;
-  $('agent-use-prompt').checked = settings.useWorkerSystemPrompt;
-  $('agent-max-workers').value = String(settings.maxWorkers);
-  $('agent-max-tasks').value = String(settings.maxTasksPerHour);
-  $('agent-timeout').value = String(settings.taskTimeoutMin);
-  activeAgentRole = 'worker';
-  $('agent-prompt-role').value = activeAgentRole;
-  $('agent-prompt-text').value = settings.systemPrompts[activeAgentRole];
+  $('agent-enabled').checked=settings.enabled;
+  $('agent-max-workers').value=String(settings.maxWorkers);
+  $('agent-max-tasks').value=String(settings.maxTasksPerHour);
+  $('agent-timeout').value=String(settings.taskTimeoutMin);
+  activePromptModule='core';
+  $('agent-prompt-module').value=activePromptModule;
+  $('agent-prompt-text').value=settings.promptModules[activePromptModule];
 }
 async function loadAgentSettings() {
-  [agentDraft, agentDefaults] = await Promise.all([
-    window.bridge.getAgentSettings(), window.bridge.getDefaultAgentSettings(),
-  ]);
+  [agentDraft,agentDefaults]=await Promise.all([window.bridge.getAgentSettings(),window.bridge.getDefaultAgentSettings()]);
   displayAgentSettings(agentDraft);
-  $('agent-settings-message').textContent = 'Loaded. Changes are local until Save.';
+  $('agent-settings-message').textContent='Loaded. Changes are local until Save.';
 }
-$('extension-settings-panel').addEventListener('toggle', () => {
-  if ($('extension-settings-panel').open && !agentDraft) perform(loadAgentSettings);
+$('extension-settings-panel').addEventListener('toggle',()=>{
+  if($('extension-settings-panel').open&&!agentDraft)perform(loadAgentSettings);
 });
-$('agent-prompt-role').addEventListener('change', () => {
-  if (!agentDraft) return;
+$('agent-prompt-module').addEventListener('change',()=>{
+  if(!agentDraft)return;
   flushPromptDraft();
-  activeAgentRole = $('agent-prompt-role').value;
-  $('agent-prompt-text').value = agentDraft.systemPrompts[activeAgentRole];
+  activePromptModule=$('agent-prompt-module').value;
+  $('agent-prompt-text').value=agentDraft.promptModules[activePromptModule];
 });
-$('agent-prompt-reset').addEventListener('click', () => {
-  if (!agentDraft || !agentDefaults) return;
-  agentDraft.systemPrompts[activeAgentRole] = agentDefaults.systemPrompts[activeAgentRole];
-  $('agent-prompt-text').value = agentDraft.systemPrompts[activeAgentRole];
-  $('agent-settings-message').textContent = 'Selected prompt reset in editor. Click Save to apply.';
+$('agent-prompt-reset').addEventListener('click',()=>{
+  if(!agentDraft||!agentDefaults)return;
+  agentDraft.promptModules[activePromptModule]=agentDefaults.promptModules[activePromptModule];
+  $('agent-prompt-text').value=agentDraft.promptModules[activePromptModule];
+  $('agent-settings-message').textContent='Module reset in editor. Click Save to apply.';
 });
+$('agent-prompt-preview').addEventListener('click',()=>perform(async()=>{
+  if(!agentDraft)throw Error('Load settings before preview');
+  flushPromptDraft();
+  const output=$('agent-prompt-preview-output');
+  const kind=['queue','child_result','status_request','child_tab_lost','failure'].includes(activePromptModule)?'queue':'task';
+  const eventType={child_result:'CHILD_RESULT',status_request:'STATUS_REQUEST',child_tab_lost:'CHILD_TAB_LOST',failure:'TOOL_FAILURE'}[activePromptModule]||'STATUS_REQUEST';
+  output.textContent=await window.bridge.previewPrompt(
+    kind==='queue' ? {kind:'queue',batchId:'preview-only',events:[{event_id:'preview-only',type:eventType,summary:'Example event'}],promptModules:agentDraft.promptModules} :
+    {kind:'task',operation:activePromptModule==='workspace'?'workspace':activePromptModule==='delegation'?'delegation':'task',
+    task:'Example task; no action is executed.',promptModules:agentDraft.promptModules});
+  output.hidden=false;
+},'Preview generated without browser submission.'));
 $('agent-reset-all').addEventListener('click', () => {
   if (!agentDefaults) return;
   agentDraft = structuredClone(agentDefaults);
@@ -325,11 +334,11 @@ $('agent-settings-save').addEventListener('click', () => perform(async () => {
   flushPromptDraft();
   const candidate = {
     enabled: $('agent-enabled').checked,
-    useWorkerSystemPrompt: $('agent-use-prompt').checked,
     maxWorkers: Number($('agent-max-workers').value),
     maxTasksPerHour: Number($('agent-max-tasks').value),
     taskTimeoutMin: Number($('agent-timeout').value),
-    systemPrompts: agentDraft.systemPrompts,
+    promptSchema: agentDraft.promptSchema,
+    promptModules: agentDraft.promptModules,
   };
   agentDraft = await window.bridge.saveAgentSettings(candidate);
   $('agent-settings-message').textContent = 'Saved to this profile. Sync sent to connected extension, otherwise sent on next connection.';

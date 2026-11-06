@@ -280,15 +280,96 @@ test('private opt-in batches three child results around status, with scope, Saga
   assert.equal(sagaConfirmed.events.find((x) =>
     x.ref === first.receipt.event_id).phase, 'SAGA_CONFIRMED');
 
+  // Real proxy-originated child-loss event: one durable receipt, one scoped manager wake,
+  // and a concise event-specific instruction (no workspace/delegation boilerplate).
+  const childLossRequestId = randomUUID();
+  const childLossReceipt = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      receipts.delete(childLossRequestId);
+      reject(new Error('Child-loss journal receipt timed out'));
+    }, 4000);
+    receipts.set(childLossRequestId, (message) => {
+      clearTimeout(timer);
+      resolve(message);
+    });
+  });
+  bridge.send(JSON.stringify({
+    type: 'worker_lost', request_id: childLossRequestId,
+    event_key: randomUUID(), task_id: TASK_FIXTURES[1].id,
+    tab_id: TASK_FIXTURES[1].tabId,
+    credential_id: a.principal.credentialId,
+    worker_incarnation_id: TASK_FIXTURES[1].incarnation,
+    saved_url: 'https://chatgpt.com/c/recover-child-two',
+  }));
+  const lossReceipt = await childLossReceipt;
+  assert.equal(lossReceipt.ok, true, JSON.stringify(lossReceipt));
+  assert.equal(lossReceipt.receipt.durably_recorded, true);
+  let childLossDelivered = false;
+  for (let attempt = 0; attempt < 80; attempt++) {
+    const pending = await call(A, 'coordination_pending');
+    childLossDelivered = pending.events.some((x) =>
+      x.ref === lossReceipt.receipt.event_id && x.phase === 'DELIVERED');
+    if (childLossDelivered) break;
+    await sleep(50);
+  }
+  assert.equal(childLossDelivered, true, 'child-loss event must reach real manager wake');
+  assert.equal(wakes.length, 2);
+  assert.deepEqual(wakes[1].events.map((x) => x.type), ['CHILD_TAB_LOST']);
+  assert.match(wakes[1].prompt_text, /read_chat/);
+  assert.match(wakes[1].prompt_text, /get_result/);
+  assert.match(wakes[1].prompt_text, /saved_url/);
+  assert.match(wakes[1].prompt_text, /recover-child-two/);
+  assert.doesNotMatch(wakes[1].prompt_text, /@AgentBridge|When a task requires files/);
+  const lossAck = await call(A, 'coordination_ack_batch', {
+    batch_id: wakes[1].batch_id,
+    event_ids: wakes[1].events.map((x) => x.event_id),
+  });
+  assert.deepEqual(lossAck.processed, [lossReceipt.receipt.event_id]);
+
+  // A journal-accepted 32 KB worker report must NOT block FIFO at the
+  // extension's 20 KB per-summary boundary: queue a bounded preview + immutable ref.
+  const large = { id: randomUUID(), tabId: 205, incarnation: randomUUID(),
+    result: 'Long verified worker report: ' + 'R'.repeat(32000) };
+  TASK_FIXTURES.push(large);
+  const largeReceipt = await workerReceipt(large);
+  assert.equal(largeReceipt.ok, true, JSON.stringify(largeReceipt));
+  let largeDelivered = false;
+  for (let attempt = 0; attempt < 80; attempt++) {
+    const pending = await call(A, 'coordination_pending');
+    largeDelivered = pending.events.some((x) =>
+      x.ref === largeReceipt.receipt.event_id && x.phase === 'DELIVERED');
+    if (largeDelivered) break;
+    await sleep(50);
+  }
+  assert.equal(largeDelivered, true, 'large immutable report must not starve oldest FIFO dispatch');
+  assert.equal(wakes.length, 3);
+  assert.deepEqual(wakes[2].events.map((x) => x.type), ['CHILD_RESULT']);
+  const summary = JSON.parse(wakes[2].events[0].summary);
+  assert.equal(summary.full_report_ref, largeReceipt.receipt.full_report_ref);
+  assert.equal(summary.preview_truncated, true);
+  assert.ok(summary.result_preview.length <= 3000);
+  assert.ok(wakes[2].events[0].summary.length <= 20000);
+  assert.match(wakes[2].prompt_text, /coordination_get_report/);
+  assert.doesNotMatch(wakes[2].prompt_text, /@AgentBridge|@Worker Tool/);
+  const restored = await call(A, 'coordination_get_report', {
+    event_id: largeReceipt.receipt.full_report_ref,
+  });
+  assert.equal(restored.report.result, large.result, 'immutable full report remains retrievable');
+  const largeAck = await call(A, 'coordination_ack_batch', {
+    batch_id: wakes[2].batch_id,
+    event_ids: wakes[2].events.map((x) => x.event_id),
+  });
+  assert.deepEqual(largeAck.processed, [largeReceipt.receipt.event_id]);
+
   await sleep(200);
-  assert.equal(wakes.length, 1, 'ACK does not replay a completed batch');
+  assert.equal(wakes.length, 3, 'ACK does not replay a completed batch');
   const oldBridge = bridge;
   const bridgeClosed = new Promise((resolve) => oldBridge.once('close', resolve));
   oldBridge.close();
   await bridgeClosed;
   const disconnectedHealth = await (await fetch('http://127.0.0.1:' + port + '/health')).json();
   assert.equal(disconnectedHealth.extensionConnected, false, 'disconnected bridge must be visible as disconnected');
-  assert.equal((await call(A, 'coordination_pending')).events.length, 4,
+  assert.equal((await call(A, 'coordination_pending')).events.length, 6,
     'disconnect must not lose committed pending journal state');
   queueCapability = undefined;
   bridge = new WebSocket('ws://127.0.0.1:' + port + '/bridge?token=' + EXTENSION_SECRET);
@@ -296,9 +377,9 @@ test('private opt-in batches three child results around status, with scope, Saga
   await new Promise((resolve, reject) => { bridge.once('open', resolve); bridge.once('error', reject); });
   for (let i = 0; queueCapability === undefined && i < 50; i++) await sleep(20);
   assert.equal(queueCapability, true, 'extension reconnect restores private capability handshake');
-  assert.equal((await call(A, 'coordination_pending')).events.length, 4);
+  assert.equal((await call(A, 'coordination_pending')).events.length, 6);
   await sleep(150);
-  assert.equal(wakes.length, 1, 'reconnect must not replay an acknowledged batch');
+  assert.equal(wakes.length, 3, 'reconnect must not replay an acknowledged batch');
   failNextWake = true;
   const held = await call(A, 'coordination_status_request', {
     idempotency_key: randomUUID(), summary: 'Second status needs manual reconciliation',
@@ -311,12 +392,12 @@ test('private opt-in batches three child results around status, with scope, Saga
     await sleep(50);
   }
   assert.equal(uncertain, true, 'ambiguous submission becomes durable UNCERTAIN');
-  assert.equal(wakes.length, 2);
+  assert.equal(wakes.length, 4);
   await call(A, 'coordination_status_request', {
     idempotency_key: randomUUID(), summary: 'Must not overtake uncertain status',
   });
   await sleep(300);
-  assert.equal(wakes.length, 2, 'uncertain predecessor blocks all later automatic wakes');
+  assert.equal(wakes.length, 4, 'uncertain predecessor blocks all later automatic wakes');
 
   await assert.rejects(call(A, 'coordination_status_request', {
     idempotency_key: randomUUID(), summary: 'x'.repeat(4001),

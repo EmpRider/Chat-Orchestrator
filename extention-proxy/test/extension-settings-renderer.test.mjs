@@ -4,65 +4,62 @@ import {fileURLToPath} from 'node:url';
 import path from 'node:path';
 import {runInNewContext} from 'node:vm';
 import {test} from 'node:test';
+import {normalizeAgentSettings} from '../agent-settings.mjs';
 
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const initial = {
-  enabled: true, useWorkerSystemPrompt: true, maxWorkers: 10,
-  maxTasksPerHour: 100, taskTimeoutMin: 60,
-  systemPrompts: {worker:'Default worker',ba:'Default BA',pm:'Default PM',tl:'Default TL',
-    specialist:'Default specialist',council_a:'Default A',council_b:'Default B',
-    council_c:'Default C',council_d:'Default D',council_e:'Default E',watchdog:'Default watchdog'},
-};
-const clone = (x) => JSON.parse(JSON.stringify(x));
+const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
+const clone=(x)=>JSON.parse(JSON.stringify(x));
 
-test('proxy settings editor persists edits to selected role without clobbering other prompts', async () => {
-  const items = new Map();
-  const element = (id) => {
-    if (!items.has(id)) {
-      const events = new Map();
-      items.set(id, {
-        value:'', textContent:'', className:'', checked:false, disabled:false, hidden:false,
-        open:false, style:{}, src:'', title:'', children:[],
-        addEventListener(type, handler) {events.set(type, handler);},
-        dispatch(type) {return events.get(type)?.();},
-        setAttribute() {}, append(...children) {this.children.push(...children);},
-      });
-    }
-    return items.get(id);
-  };
-  const state = {phase:'stopped',ngrokPhase:'stopped',ngrokAuthConfigured:false,
-    ngrokError:'',error:'',extensionConnected:false,routeVerified:false,domain:'',
-    publicPath:'/mcp',port:8799,profile:'qa',localWebSocketUrl:'ws://127.0.0.1:8799/bridge'};
-  let persisted;
-  const window = {
-    addEventListener() {},
-    bridge: {
-      status: async () => state, onState() {},
-      getAgentSettings: async () => clone(initial),
-      getDefaultAgentSettings: async () => clone(initial),
-      saveAgentSettings: async (value) => {persisted=clone(value);return clone(value);},
-    },
-  };
-  const document = {getElementById: element, createElement: () => ({textContent:'',className:'',append(){}})};
-  const code = readFileSync(path.join(root,'desktop','renderer.js'),'utf8');
-  runInNewContext(code,{window,document,structuredClone:clone,console});
-  await new Promise((resolve) => setImmediate(resolve));
-  element('extension-settings-panel').open = true;
-  element('extension-settings-panel').dispatch('toggle');
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(element('agent-prompt-text').value,'Default worker');
-  element('agent-prompt-text').value='Edited worker system prompt';
-  element('agent-prompt-role').value='council_b';
-  element('agent-prompt-role').dispatch('change');
-  element('agent-prompt-text').value='User security Council instructions';
-  element('agent-max-tasks').value='33';
-  await element('agent-settings-save').dispatch('click');
-  assert.equal(persisted.systemPrompts.worker,'Edited worker system prompt');
-  assert.equal(persisted.systemPrompts.council_b,'User security Council instructions');
-  assert.equal(persisted.systemPrompts.pm,'Default PM');
-  assert.equal(persisted.maxTasksPerHour,33);
-  const html = readFileSync(path.join(root,'..','extention','popup.html'),'utf8');
-  assert.ok(html.includes('id="serverUrl"') && html.includes('id="token"'));
-  assert.equal(html.includes('id="workerSystemPrompt"'),false,
-    'Extension popup must no longer edit app prompts');
+test('operation module editor persists edits independently and previews without submitting',async()=>{
+ const initial=normalizeAgentSettings({});
+ const items=new Map();
+ const element=(id)=>{
+  if(!items.has(id)){
+   const handlers=new Map();
+   items.set(id,{value:'',textContent:'',checked:false,disabled:false,hidden:false,open:false,
+    style:{},children:[],className:'',src:'',title:'',
+    addEventListener:(event,cb)=>handlers.set(event,cb),
+    dispatch:(event)=>handlers.get(event)?.(),
+    setAttribute(){},append(...a){this.children.push(...a);}});
+  }
+  return items.get(id);
+ };
+ const state={phase:'stopped',ngrokPhase:'stopped',ngrokAuthConfigured:false,
+  ngrokError:'',error:'',extensionConnected:false,routeVerified:false,domain:'',
+  publicPath:'/mcp',port:8799,profile:'qa',localWebSocketUrl:'ws://127.0.0.1:8799/bridge'};
+ let persisted,previewed;
+ const window={addEventListener(){},bridge:{
+  status:async()=>state,onState(){},
+  getAgentSettings:async()=>clone(initial),getDefaultAgentSettings:async()=>clone(initial),
+  saveAgentSettings:async(value)=>{persisted=clone(value);return clone(value);},
+  previewPrompt:async(value)=>{previewed=clone(value);return '<system_instructions>Preview</system_instructions>';},
+ }};
+ const document={getElementById:element,createElement:()=>({textContent:'',className:'',append(){}})};
+ runInNewContext(readFileSync(path.join(root,'desktop','renderer.js'),'utf8'),
+  {window,document,structuredClone:clone,console});
+ await new Promise(resolve=>setImmediate(resolve));
+ element('extension-settings-panel').open=true;
+ element('extension-settings-panel').dispatch('toggle');
+ await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(element('agent-prompt-text').value,initial.promptModules.core);
+ element('agent-prompt-text').value='Updated core instruction';
+ element('agent-prompt-module').value='queue';
+ element('agent-prompt-module').dispatch('change');
+ assert.equal(element('agent-prompt-text').value,initial.promptModules.queue);
+ element('agent-prompt-text').value='Custom queue guidance';
+ element('agent-prompt-preview').dispatch('click');
+ await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(previewed.kind,'queue');
+ assert.equal(previewed.promptModules.queue,'Custom queue guidance');
+ assert.equal(element('agent-prompt-preview-output').hidden,false);
+ element('agent-max-tasks').value='33';
+ await element('agent-settings-save').dispatch('click');
+ assert.equal(persisted.promptSchema,2);
+ assert.equal(persisted.promptModules.core,'Updated core instruction');
+ assert.equal(persisted.promptModules.queue,'Custom queue guidance');
+ assert.equal(persisted.promptModules.delegation,initial.promptModules.delegation);
+ assert.equal(persisted.maxTasksPerHour,33);
+ const html=readFileSync(path.join(root,'..','extention','popup.html'),'utf8');
+ assert.match(html,/id="serverUrl"/);
+ assert.match(html,/id="token"/);
+ assert.equal(html.includes('id="workerSystemPrompt"'),false);
 });

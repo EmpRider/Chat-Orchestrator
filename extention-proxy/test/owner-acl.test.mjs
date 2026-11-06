@@ -6,6 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createContext, runInContext } from 'node:vm';
 import { webcrypto } from 'node:crypto';
+import {composeAgentPrompt,normalizeAgentSettings} from '../agent-settings.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const source = fs.readFileSync(path.join(ROOT, 'extention', 'background.js'), 'utf8');
@@ -42,6 +43,7 @@ test('all six Worker Tool operations enforce credential and tab ownership', asyn
   let managerSubmitCount = 0;
   let submittedBatchText = '';
   let nextWorkerTabId = 301;
+  let removedCb, updatedCb;
   const chrome = {
     storage: {
       session: { get: async () => storage, set: async (next) => Object.assign(storage, next) },
@@ -59,7 +61,8 @@ test('all six Worker Tool operations enforce credential and tab ownership', asyn
           ? (managerSubmitCount++, submittedBatchText = msg.text, { ok: true, submitted: true })
           : { ok: true, transcript: 'transcript for ' + id },
       remove: async (id) => { tabById.delete(id); },
-      onRemoved: { addListener() {} },
+      onRemoved: { addListener(fn) { removedCb=fn; } },
+      onUpdated: { addListener(fn) { updatedCb=fn; } },
     },
     windows: { create: async ({ url }) => {
       const tabId = nextWorkerTabId++;
@@ -70,23 +73,22 @@ test('all six Worker Tool operations enforce credential and tab ownership', asyn
     runtime: { onInstalled: { addListener() {} }, onStartup: { addListener() {} }, onMessage: { addListener() {} } },
     alarms: { onAlarm: { addListener() {} }, create() {} },
   };
-  const ctx = createContext({ chrome, crypto: webcrypto, console, setTimeout, clearTimeout, setInterval, clearInterval });
+  const ctx = createContext({ chrome, crypto: webcrypto, URL, console, setTimeout, clearTimeout, setInterval, clearInterval });
   runInContext(source, ctx);
-  const handleCall = runInContext('handleCall', ctx);
+  const rawHandleCall = runInContext('handleCall', ctx);
+  const settings=normalizeAgentSettings({});
+  const handleCall=(method,args={})=>rawHandleCall(method,method==='spawn_worker'?
+    {...args,prompt_text:composeAgentPrompt(settings,{kind:'task',task:args.task,operation:args.operation||'task'})}:
+    method==='wake_manager'?{...args,prompt_text:composeAgentPrompt(settings,{kind:'queue',batchId:args.batch_id,events:args.events})}:args);
   const defaults = runInContext('DEFAULTS', ctx);
   assert.match(defaults.serverUrl, /\/bridge$/);
   assert.equal(runInContext('proxySettings', ctx), null, 'Extension starts fail-closed without proxy snapshot');
-  runInContext("proxySettings = { enabled: true, maxWorkers: 10, maxTasksPerHour: 100, taskTimeoutMin: 60, useWorkerSystemPrompt: true, systemPrompts: { worker: 'Worker default', specialist: 'Specialist guidance', council_a: 'Council A / Systems guidance', watchdog: 'BA Watchdog guidance' } }", ctx);
+  runInContext("proxySettings = { enabled: true, maxWorkers: 10, maxTasksPerHour: 100, taskTimeoutMin: 60, promptSchema: 2, promptModules: {} }", ctx);
   assert.equal(runInContext('SITES.gemini.newChatUrl', ctx), 'https://gemini.google.com/app');
   const buildPrompt = runInContext('buildWorkerPrompt', ctx);
-  const editable = buildPrompt({ useWorkerSystemPrompt: true,
-    systemPrompts: { council_a: 'Council A / Systems guidance',
-      watchdog: 'BA Watchdog guidance', worker: 'User-edited instructions remain intact.' } },
-    'Investigate one scope', '', 'council_a');
-  assert.match(editable, /Council A \/ Systems/);
-  assert.match(editable, /<system_instructions>\nUser-edited instructions remain intact\./);
-  assert.match(buildPrompt({ useWorkerSystemPrompt: false,
-    systemPrompts: {watchdog: 'BA Watchdog guidance'} }, 'Check', '', 'watchdog'), /BA Watchdog/);
+  const composed=composeAgentPrompt(settings,{kind:'task',task:'Investigate one scope'});
+  assert.match(buildPrompt({},'Investigate one scope','','any-role',composed),/<task>/);
+  assert.doesNotMatch(composed,/Council A|BA Watchdog|@AgentBridge|@Worker Tool/);
   const withOwner = (p, principal) => ({ ...p, __trustedPrincipal: principal });
 
   const ownTabs = await handleCall('list_tabs', withOwner({}, principalA));
@@ -222,9 +224,9 @@ test('all six Worker Tool operations enforce credential and tab ownership', asyn
   }, principalA));
   assert.equal(wake.submitted, true);
   assert.equal(managerSubmitCount, 1);
-  assert.match(submittedBatchText, /ALL CHILD_RESULT events/);
-  assert.match(submittedBatchText, /Then answer STATUS_REQUEST/);
-  assert.match(submittedBatchText, /original event-id FIFO sequence/);
+  assert.match(submittedBatchText, /For each CHILD_RESULT/);
+  assert.match(submittedBatchText, /ordered batch/);
+  assert.match(submittedBatchText, /event identifiers and original FIFO order/);
   await assert.rejects(handleCall('wake_manager', withOwner({
     batch_id: batchId, events: [event],
   }, principalA)), /pending or uncertain/);
@@ -235,6 +237,29 @@ test('all six Worker Tool operations enforce credential and tab ownership', asyn
   assert.equal((await handleCall('manager_processed', withOwner({
     batch_id: batchId,
   }, principalA))).processed, true);
+  // CHILD_TAB_LOST is a durable manager event, not a worker task or a new role.
+  const lostBatchId = '55555555-5555-4555-8555-555555555555';
+  const lostEvent = {
+    event_id: '66666666-6666-4666-8666-666666666666',
+    type: 'CHILD_TAB_LOST',
+    summary: JSON.stringify({task_id:'original-child-task', child_tab_id:202,
+      saved_url:'https://chatgpt.com/c/worker-b', status:'UNKNOWN',
+      reason:'Tab removed; crash not proven'}),
+    recorded_at: new Date().toISOString(),
+  };
+  const lostWake = await handleCall('wake_manager', withOwner({
+    batch_id: lostBatchId, events: [lostEvent],
+  }, principalA));
+  assert.equal(lostWake.submitted, true);
+  assert.equal(managerSubmitCount, 2);
+  assert.match(submittedBatchText, /CHILD_TAB_LOST/);
+  assert.match(submittedBatchText, /saved_url/);
+  assert.match(submittedBatchText, /read_chat/);
+  assert.match(submittedBatchText, /get_result/);
+  assert.doesNotMatch(submittedBatchText, /@AgentBridge|When a task requires files/);
+  assert.equal((await handleCall('manager_processed', withOwner({
+    batch_id: lostBatchId,
+  }, principalA))).processed, true);
   const competing = await Promise.allSettled([
     handleCall('wake_manager', withOwner({
       batch_id: '33333333-3333-4333-8333-333333333333', events: [event],
@@ -244,7 +269,7 @@ test('all six Worker Tool operations enforce credential and tab ownership', asyn
     }, principalA)),
   ]);
   assert.equal(competing.filter((outcome) => outcome.status === 'fulfilled').length, 1);
-  assert.equal(managerSubmitCount, 2, 'concurrent wakes submit only one additional batch');
+  assert.equal(managerSubmitCount, 3, 'concurrent wakes submit only one additional batch');
   await assert.rejects(handleCall('close_verified_worker', withOwner({
     tab_id: 201, worker_incarnation_id: storage.workerIncarnations[201],
     saga_event_id: '77777777-7777-4777-8777-777777777777',
@@ -263,9 +288,25 @@ test('all six Worker Tool operations enforce credential and tab ownership', asyn
   assert.equal(closure.saga_verified, true);
   assert.equal(tabById.has(201), false, 'verified closure removed only owned worker tab');
   assert.equal((await handleCall('attest_manager_tab', { tab_id: 101 })).incarnation_id, MANAGER_A);
+  // Integration smoke: unexpected child loss retains URL and owner-scoped task,
+  // and reopens the original conversation without resuming work automatically.
+  storage.tasks[taskB.id].workerIncarnationId = storage.workerIncarnations[202];
+  await updatedCb(202,{url:'https://chatgpt.com/c/worker-b'},tabById.get(202));
+  tabById.delete(202);
+  await removedCb(202);
+  await assert.rejects(handleCall('reopen_child',withOwner({task_id:taskB.id},principalA)),/caller scope/);
+  const recovery=await handleCall('reopen_child',withOwner({task_id:taskB.id},principalB));
+  assert.equal(recovery.status,'REATTACHED');
+  assert.equal(recovery.old_tab_id,202);
+  assert.equal(recovery.execution_resumed,false);
+  assert.equal(recovery.saved_url,'https://chatgpt.com/c/worker-b');
+  assert.ok(tabById.has(recovery.tab_id));
+  assert.equal((await handleCall('read_chat',withOwner({tab_id:recovery.tab_id},principalB))).transcript,'transcript for '+recovery.tab_id);
+  assert.equal((await handleCall('get_result',withOwner({task_id:taskB.id},principalB))).status,'done');
+  assert.equal((await handleCall('reopen_child',withOwner({task_id:taskB.id},principalB))).reused,true);
   storage.managerIncarnations[101] = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
   await assert.rejects(handleCall('list_tabs', withOwner({}, principalA)), /incarnation changed/);
-  assert.deepEqual(Array.from(await handleCall('list_tabs', withOwner({}, principalB)), (t) => t.tab_id), [102, 202, tlSeat.tab_id]);
+  assert.deepEqual(Array.from(await handleCall('list_tabs', withOwner({}, principalB)), (t) => t.tab_id), [102, tlSeat.tab_id, recovery.tab_id]);
   runInContext("browserSessionId = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'", ctx);
   await assert.rejects(handleCall('list_tabs', withOwner({}, principalB)), /incarnation changed/);
 

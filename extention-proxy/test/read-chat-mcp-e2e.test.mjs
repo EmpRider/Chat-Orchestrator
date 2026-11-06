@@ -130,6 +130,7 @@ test('MCP read_chat options survive HTTP, WebSocket, background and content scri
           return tabReceivers.get(tabId)(msg);
         },
         onRemoved: { addListener() {} },
+        onUpdated: { addListener() {} },
       },
       runtime: {
         onInstalled: { addListener() {} }, onStartup: { addListener() {} },
