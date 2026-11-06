@@ -155,6 +155,8 @@ test('all six Worker Tool operations enforce credential and tab ownership', asyn
   }, principalA));
   assert.equal(pmSeat.reused_tab, false);
   assert.equal(pmSeat.status, 'running');
+  assert.ok(storage.roleSeats['credential:' + A + '|pm|epic:15'],
+    'existing scoped seat keys must remain reusable after extension update');
   await assert.rejects(handleCall('spawn_worker', withOwner({
     site: 'chatgpt', role: 'pm', role_scope: 'epic:15',
     task: 'Overtaking PM while active', keep_open: true,
@@ -200,8 +202,21 @@ test('all six Worker Tool operations enforce credential and tab ownership', asyn
   assert.equal(councilStage2.reused_tab, true);
   assert.equal(councilStage2.tab_id, councilSeat.tab_id);
   runInContext('finishTask', ctx)(councilStage2.task_id, { status: 'done', result: 'Peer review' });
+  const customSeat = await handleCall('spawn_worker', withOwner({
+    site: 'chatgpt', role: 'ux_designer', role_scope: 'project:alpha/feature',
+    task: 'Inspect a UI issue', keep_open: true,
+  }, principalA));
+  assert.equal(customSeat.reused_tab, false, 'arbitrary skill-defined roles must be accepted');
+  runInContext('finishTask', ctx)(customSeat.task_id, { status: 'done', result: 'UI issue inspected' });
+  const customAgain = await handleCall('spawn_worker', withOwner({
+    site: 'chatgpt', role: 'ux_designer', role_scope: 'project:alpha/feature',
+    task: 'Recheck UI issue', keep_open: true,
+  }, principalA));
+  assert.equal(customAgain.tab_id, customSeat.tab_id);
+  assert.equal(customAgain.reused_tab, true);
+  runInContext('finishTask', ctx)(customAgain.task_id, { status: 'done', result: 'UI issue rechecked' });
   await assert.rejects(handleCall('spawn_worker', withOwner({
-    site: 'chatgpt', role: 'pm', role_scope: 'task:68', task: 'Wrong Saga scope',
+    site: 'chatgpt', role: 'pm', role_scope: '\ninvalid', task: 'Malformed seat key',
   }, principalA)), /Invalid role_scope/);
   await assert.rejects(handleCall('spawn_worker', {
     site: 'chatgpt', role: 'pm', role_scope: 'epic:15', task: 'No trusted owner',

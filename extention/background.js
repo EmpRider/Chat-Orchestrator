@@ -100,19 +100,22 @@ function ownedWorker(tabId, owner) {
   return workers.includes(tabId) && (workerOwners[tabId] || 'legacy') === owner;
 }
 
-// Role scopes are explicit Saga references. A role seat is only reusable by
-// the SAME authenticated principal; it grants no new project/tab permissions.
+// A reusable seat is an opaque label owned by one authenticated caller.
+// Skills define roles and task hierarchy; the proxy must not hardcode PM/TL/Council policy.
+function reusableSeatLabel(value, field) {
+  if (typeof value !== 'string' || !value.trim() || value.length > 128 ||
+      /[\u0000-\u001f\u007f|]/.test(value)) {
+    throw new Error('Invalid ' + field + ': use a non-empty label without control characters');
+  }
+  return value.trim();
+}
 function roleSeatKey(p, owner) {
   if (p.role_scope == null) return null;
-  if (owner === 'legacy') throw new Error('Role-seat reuse requires a scoped principal');
-  const pattern = p.role === 'pm' || p.role === 'watchdog' ? /^epic:[1-9]\d*$/
-    : p.role === 'tl' ? /^task:[1-9]\d*$/
-    : /^council_[a-e]$/.test(p.role || '') ? /^parent:[1-9]\d*$/
-    : null;
-  if (!pattern || typeof p.role_scope !== 'string' || !pattern.test(p.role_scope)) {
-    throw new Error('Invalid role_scope: PM/Watchdog use epic:N, TL uses task:N, Council uses parent:N');
-  }
-  return owner + '|' + p.role + '|' + p.role_scope;
+  if (owner === 'legacy') throw new Error('Reusable seat requires a scoped principal');
+  const role = reusableSeatLabel(p.role, 'role');
+  const scope = reusableSeatLabel(p.role_scope, 'role_scope');
+  // Preserve existing role|scope seat keys across extension updates.
+  return owner + '|' + role + '|' + scope;
 }
 
 function clearRoleSeatsForTab(tabId) {

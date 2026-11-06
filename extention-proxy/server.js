@@ -1458,10 +1458,10 @@ function buildServer(principal) {
       inputSchema: {
         site: z.enum(['chatgpt', 'claude', 'gemini']).describe('Which chat site the worker runs on.'),
         operation: z.enum(['task','workspace','delegation']).optional().describe('Operation-specific instructions to include.'),
-        role: z.enum(['ba', 'pm', 'tl', 'specialist', 'council_a', 'council_b',
-          'council_c', 'council_d', 'council_e', 'watchdog']).optional()
-          .describe('Optional existing authenticated seat metadata for tab reuse, not an injected role prompt.'),
-        role_scope: z.string().optional().describe('Opt-in reusable seat within this authenticated caller: PM/Watchdog epic:N, TL task:N, Council parent:N. Subsequent spawn_worker with the same role+scope continues the SAME idle chat; it never closes or replaces a running worker.'),
+        role: z.string().trim().min(1).max(128).optional()
+          .describe('Optional reusable seat label; any project role is allowed. This is metadata, never authorization or an injected role prompt.'),
+        role_scope: z.string().trim().min(1).max(128).optional()
+          .describe('Opaque, owner-scoped stable seat key chosen by your skill/task context. Same label and scope reuse the SAME idle chat; no role-specific Saga hierarchy is imposed.'),
         task: z
           .string()
           .min(1)
