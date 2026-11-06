@@ -25,6 +25,9 @@ test('redesigned navigation keeps each trusted desktop control and one page per 
     'start', 'stop', 'agent-settings-save', 'agent-prompt-module', 'agent-prompt-text',
     'pair-principal', 'principal-list', 'queue-items', 'agent-seats', 'tool-call-log',
   ]) assert.ok(ids.includes(id), 'trusted control missing: ' + id);
+  assert.match(html, /id="principal-panel" hidden>/, 'manual pairing must not appear in normal agent view');
+  assert.match(html, /id="show-identity-recovery"/, 'trusted advanced recovery control must remain available');
+  assert.match(desktop('renderer.js'), /show-identity-recovery.*addEventListener/, 'advanced recovery must be explicit');
   assert.match(html, /Content-Security-Policy/);
   assert.match(html, /navigation\.js/);
   assert.match(html, /redesign\.css/);

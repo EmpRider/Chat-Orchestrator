@@ -259,6 +259,17 @@ $('pair-seat').addEventListener('change', () => {
     : seat === 'BA Watchdog' ? 'watchdog' : seat.toLowerCase();
 });
 
+// Keep the legacy enrollment form out of normal agent management. The fallback
+// is reachable only through the explicit advanced recovery control.
+$('show-identity-recovery').addEventListener('click', () => {
+  const panel = $('principal-panel');
+  panel.hidden = false;
+  panel.open = true;
+  document.querySelector('[data-view="agents"]')?.click();
+  panel.scrollIntoView({ block: 'nearest' });
+  notify('Manual identity recovery opened. Verify ownership before enrolling.');
+});
+
 // Extension behavior is edited only through trusted desktop IPC, never WebSocket writes.
 let agentDraft = null;
 let agentDefaults = null;

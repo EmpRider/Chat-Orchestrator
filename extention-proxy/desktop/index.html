@@ -156,7 +156,7 @@
       <p id="private-journal-inspection" class="help">Journal owner state unknown until inspected locally.</p>
       <p class="help">Read-only proxy snapshot. DELIVERED is not PROCESSED; Saga confirmation is separate. UNCERTAIN requires manual reconciliation.</p>
     </details>
-        <details class="panel pairing-panel" id="principal-panel">
+        <details class="panel pairing-panel" id="principal-panel" hidden>
           <summary>Scoped agent pairing <span class="hint">LOCAL ADMIN</span></summary>
           <p class="help">Create a separately revocable connector identity. Choose the actual manager tab ID; never share the scoped URL with another agent.</p>
           <label for="pair-seat">Reusable agent seat</label>
@@ -240,6 +240,8 @@
       </div>
       <details class="extension-admin-actions">
         <summary>Advanced browser actions</summary>
+        <button id="show-identity-recovery" type="button" class="link-button">Open manual identity recovery</button>
+        <p class="help">Only use this temporary fallback if automatic scoped identity is unavailable. It does not grant privileges to a shared connector.</p>
         <p class="help">Provide a supported ChatGPT / Claude / Gemini tab ID from list_tabs. Scoped worker tabs remain protected from legacy closure.</p>
         <label for="agent-admin-tab">Browser chat tab ID</label><input id="agent-admin-tab" type="number" min="1" placeholder="e.g. 101" />
         <div class="input-row">

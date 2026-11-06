@@ -115,6 +115,14 @@ try {
   }
   assert.equal(await evaluate(
     'document.querySelector("[data-view=settings]").getAttribute("aria-current")'), 'page');
+  assert.equal(await evaluate('document.getElementById("principal-panel").hidden'), true,
+    'manual identity enrollment must stay hidden in the normal desktop UI');
+  await evaluate('document.querySelector(".extension-admin-actions").open = true');
+  await evaluate('document.getElementById("show-identity-recovery").click()');
+  assert.equal(await evaluate('document.getElementById("principal-panel").hidden'), false);
+  assert.equal(await evaluate('document.getElementById("principal-panel").open'), true);
+  assert.equal(await evaluate('document.querySelector("[data-view=agents]").getAttribute("aria-current")'), 'page');
+  await evaluate('document.querySelector("[data-view=settings]").click()');
   await evaluate('document.querySelector("[data-open-view=connections]").click()');
   assert.equal(await evaluate('document.getElementById("view-connections").hidden'), false);
   console.log('UI_REDESIGN_RUNTIME_PASS ' + JSON.stringify(results));
