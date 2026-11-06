@@ -74,12 +74,23 @@ export function replaceObsoletePromptSettings(input) {
   return normalizeAgentSettings(next);
 }
 export function disabledAgentSettings(){return {...normalizeAgentSettings({}),enabled:false};}
+function redactConnectorSecrets(value) {
+  return String(value??'')
+    .replace(/([?&](?:token|access_token|bridge_token)=)[^&#\s"'<>]+/gi, '$1[REDACTED]')
+    .replace(/(\b(?:BRIDGE_TOKEN|EXTENSION_BRIDGE_TOKEN|MCP_TOKEN|API_KEY)\s*[:=]\s*["']?)[\w.+/=~-]{8,}/gi, '$1[REDACTED]')
+    .replace(/(\bAuthorization\s*:\s*Bearer\s+)[^\s"'<>]+/gi, '$1[REDACTED]');
+}
 function escapeXml(value){
-  return String(value??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+  return redactConnectorSecrets(value).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
     .replace(/"/g,'&quot;').replace(/'/g,'&apos;');
 }
 function safeJson(value){
-  return JSON.stringify(value).replace(/</g,'\\u003c').replace(/>/g,'\\u003e').replace(/&/g,'\\u0026');
+  const payload=JSON.stringify(value,(key,item)=>{
+    if(typeof item==='string' && /^(?:token|access_token|bridge_token|extension_bridge_token|authorization|api_key|secret)$/i.test(key))
+      return '[REDACTED]';
+    return typeof item==='string' ? redactConnectorSecrets(item) : item;
+  });
+  return payload.replace(/</g,'\\u003c').replace(/>/g,'\\u003e').replace(/&/g,'\\u0026');
 }
 export function composeAgentPrompt(settings,input){
   if(!input||typeof input!=='object') throw new Error('Missing prompt input');
@@ -104,7 +115,7 @@ export function composeAgentPrompt(settings,input){
       '\n</queue_batch>';
   }else throw new Error('Unknown prompt kind');
   const selectedKeys=['core',...PROMPT_MODULE_KEYS.filter(k=>selected.includes(k))];
-  const prompt='<system_instructions>\n'+selectedKeys.map(k=>modules[k]).join('\n\n')+
+  const prompt='<system_instructions>\n'+selectedKeys.map(k=>redactConnectorSecrets(modules[k])).join('\n\n')+
     '\n</system_instructions>\n\n'+context;
   if(prompt.length>60000) throw new Error('Composed prompt exceeds limit');
   return prompt;

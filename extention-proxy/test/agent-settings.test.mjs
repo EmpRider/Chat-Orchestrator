@@ -64,3 +64,24 @@ test('queue prompts include only pertinent modules, not unrelated tools',()=>{
  assert.match(loss,/\\u003c\/system_instructions\\u003e/);
  assert.throws(()=>composeAgentPrompt(cfg,{kind:'queue',batchId:batch,events:[{type:'EVIL'}]}));
 });
+
+test('task and queue composition redact connector credentials without losing event structure',()=>{
+ const bridgeToken='ZXCV1234567890qwertyASDF';
+ const bearer='BEARER1234567890abcdef';
+ const cfg=normalizeAgentSettings({promptModules:{core:'Connector wss://127.0.0.1:8899/mcp?token='+bridgeToken}});
+ const task=composeAgentPrompt(cfg,{kind:'task',task:'Use Authorization: Bearer '+bearer+' and BRIDGE_TOKEN='+bridgeToken});
+ assert.ok(!task.includes(bridgeToken));
+ assert.ok(!task.includes(bearer));
+ assert.match(task,/\[REDACTED\]/);
+ const queue=composeAgentPrompt(cfg,{kind:'queue',batchId:'batch-1',events:[{
+   type:'CHILD_RESULT',event_id:'evt-1',token:bridgeToken,
+   summary:'Inspect https://example.invalid/mcp?token='+bearer,
+   full_report_ref:'report-1',
+ }]});
+ assert.ok(!queue.includes(bridgeToken));
+ assert.ok(!queue.includes(bearer));
+ assert.match(queue,/evt-1/);
+ assert.match(queue,/report-1/);
+ assert.match(queue,/\[REDACTED\]/);
+ assert.throws(()=>composeAgentPrompt(cfg,{kind:'task',task:'x'.repeat(61000)}),/exceeds limit/);
+});
