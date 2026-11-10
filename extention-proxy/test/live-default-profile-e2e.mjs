@@ -1,0 +1,1 @@
+console.log('LIVE_DEFAULT_PROFILE_SCRIPT_READY');

@@ -36,21 +36,15 @@
   <header>
     <span class="eyebrow">BROWSER EXTENSION</span>
     <h1>Connect to Orchestrator</h1>
-    <p class="muted">A secure local connection to your desktop proxy</p>
+    <p class="muted">Connection to your local desktop proxy</p>
   </header>
   <main>
     <div id="status" class="status" role="status" aria-live="polite">Checking connection…</div>
-    <p id="next-step" class="hint">Checking the extension-only credential and settings sync.</p>
+    <p id="next-step" class="hint">Checking connection and settings sync.</p>
     <div class="divider"></div>
     <label for="serverUrl">Local proxy URL</label>
     <input id="serverUrl" type="url" spellcheck="false" autocomplete="off" placeholder="ws://127.0.0.1:8787/bridge" />
-    <label for="token">Extension-only credential</label>
-    <input id="token" type="password" spellcheck="false" autocomplete="new-password" placeholder="Paste from desktop Connections page" />
     <button id="save" type="button">Save and reconnect</button>
-    <div class="callout">
-      <strong>Which credential should I use?</strong>
-      <p>In the desktop app, open <b>Connections</b> and copy the <b>Extension-only credential</b>. The MCP connector token is different and cannot sync settings.</p>
-    </div>
     <div id="info"></div>
   </main>
   <script src="popup.js"></script>

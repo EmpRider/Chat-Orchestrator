@@ -35,12 +35,16 @@ function ensure(condition, description) {
 await import('../desktop/main.mjs');
 app.on('will-quit', () => {
   const value = globalThis.__chatOrchE2E?.state();
+  const lockPath = path.join(app.getPath('userData'),'coordination.events.journal.lock');
+  const lockReleased = !fs.existsSync(lockPath);
   report.shutdown = {
     proxyPhase: value?.phase,
     ngrokPhase: value?.ngrokPhase,
     trayAvailable: value?.trayAvailable,
+    journalLockReleased: lockReleased,
   };
-  report.passed = !report.error && value?.phase === 'stopped' && value?.ngrokPhase === 'stopped';
+  report.passed = !report.error && value?.phase === 'stopped' &&
+    value?.ngrokPhase === 'stopped' && lockReleased;
   fs.writeFileSync(outFile, JSON.stringify(report, null, 2));
 });
 
@@ -74,8 +78,10 @@ if (mode === 'duplicate') {
       hasCheckbox: Boolean(document.querySelector('#minimize-to-tray')),
       checkboxChecked: document.querySelector('#minimize-to-tray')?.checked,
     }))()`);
-    ensure(ui.background === 'rgb(7, 7, 8)', 'Black theme did not render');
-    ensure(ui.images >= 12 && ui.missingImages.length === 0, 'Icons8 UI images failed to render');
+    ensure(['rgb(7, 7, 8)','rgb(11, 16, 24)'].includes(ui.background),
+      'Configured dark desktop theme did not render');
+    ensure(ui.images >= 10 && ui.missingImages.length === 0,
+      'Desktop navigation/status icons failed to render');
     ensure(ui.contentWidth <= ui.viewportWidth, 'UI overflows horizontally');
     ensure(ui.hasCheckbox, 'Tray checkbox missing from UI');
     report.ui = ui;
@@ -85,8 +91,7 @@ if (mode === 'duplicate') {
       fs.writeFileSync(path.join(dir, 'dark-ui.png'), screenshot.toPNG());
       const port = test.state().port;
       ensure((await fetch(`http://127.0.0.1:${port}/health`)).ok, 'Proxy health unavailable before hide');
-      const token = fs.readFileSync(path.join(dir, 'bridge.token'), 'utf8').trim();
-      const connection = new WebSocket(`ws://127.0.0.1:${port}/bridge?token=${encodeURIComponent(token)}`);
+      const connection = new WebSocket(`ws://127.0.0.1:${port}/bridge`);
       await new Promise((resolve, reject) => {
         connection.once('open', resolve);
         connection.once('error', reject);

@@ -13,10 +13,8 @@ function launch(directory) {
   const proc = spawn(process.execPath, ['server.js'], {
     cwd: ROOT,
     env: {
-      ...process.env, PORT: '0', BRIDGE_TOKEN: 'fixture-private-token',
-      BRIDGE_TOKEN_FILE: path.join(directory, 'bridge.token'),
+      ...process.env, PORT: '0', HOST: '127.0.0.1', CHAT_ORCH_PROFILE_DIR: directory,
       CHAT_ORCH_PRIVATE_COORDINATION: '1',
-      EXTENSION_BRIDGE_TOKEN: 'private-extension-disk-test-token-0123456789',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -33,7 +31,6 @@ test('private disk preflight opens only preprovisioned journal and refuses crash
   t.after(() => fs.rmSync(folder, { recursive: true, force: true }));
   const file = path.join(folder, 'coordination.events.journal');
   const lock = file + '.lock';
-  fs.writeFileSync(path.join(folder, 'bridge.token'), 'fixture-private-token');
   // Explicit provisioning is a prerequisite, not a durable power-loss guarantee.
   fs.writeFileSync(file, '');
   const first = launch(folder);
@@ -62,4 +59,40 @@ test('private disk preflight opens only preprovisioned journal and refuses crash
   assert.notEqual(code, 0, 'stale owner refuses startup');
   assert.match(second.output(), /owner lock exists|owner unknown|PRIVATE_JOURNAL_OWNER_UNKNOWN/i);
   assert.ok(fs.existsSync(lock), 'stale lock was NOT automatically deleted');
+});
+
+test('explicit graceful stop flushes journal and releases only its own lock', {
+  timeout: 25000,
+}, async (t) => {
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'chat-orch-graceful-lock-'));
+  t.after(() => fs.rmSync(folder, {recursive:true,force:true}));
+  const journal = path.join(folder,'coordination.events.journal');
+  const lock = journal + '.lock';
+  fs.writeFileSync(journal,'');
+  const script = [
+    "import {startServer, stopServer} from './server.js';",
+    "import fs from 'node:fs';",
+    "import path from 'node:path';",
+    "const address=await startServer();",
+    "const lock=path.join(process.env.CHAT_ORCH_PROFILE_DIR,'coordination.events.journal.lock');",
+    "if(!fs.existsSync(lock)) throw new Error('Private journal lock not acquired');",
+    "const response=await fetch('http://127.0.0.1:'+address.port+'/health');",
+    "if(!response.ok) throw new Error('Health endpoint unavailable');",
+    "await stopServer();",
+    "if(fs.existsSync(lock)) throw new Error('Graceful stop left owner lock');",
+    "console.log('JOURNAL_GRACEFUL_STOP_OK');",
+  ].join('\n');
+  const proc=spawn(process.execPath,['--input-type=module','-e',script],{
+    cwd:ROOT,env:{...process.env,PORT:'0',HOST:'127.0.0.1',
+      CHAT_ORCH_PROFILE_DIR:folder,CHAT_ORCH_PRIVATE_COORDINATION:'1'},
+    stdio:['ignore','pipe','pipe'],
+  });
+  t.after(()=>proc.kill());
+  let output='';
+  proc.stdout.on('data',(chunk)=>{output+=chunk;});
+  proc.stderr.on('data',(chunk)=>{output+=chunk;});
+  const code=await new Promise((resolve)=>proc.once('exit',resolve));
+  assert.equal(code,0,output);
+  assert.match(output,/JOURNAL_GRACEFUL_STOP_OK/);
+  assert.equal(fs.existsSync(lock),false,'graceful stop releases its own owner lock');
 });

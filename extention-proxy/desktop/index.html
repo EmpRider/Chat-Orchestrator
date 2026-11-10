@@ -70,13 +70,12 @@
           <article class="panel quick-card">
             <div class="quick-card-top"><span class="step-number">01</span><span id="quick-extension-status" class="step-state">Waiting</span></div>
             <h3>Connect the extension</h3>
-            <p>Copy the extension-only credential, then paste it into the browser extension popup.</p>
-            <button id="quick-extension-token" type="button" class="secondary">Copy extension credential</button>
+            <p>Copy the local WebSocket URL into your browser extension settings.</p>
           </article>
           <article class="panel quick-card">
             <div class="quick-card-top"><span class="step-number">02</span><span id="quick-connector-status" class="step-state">Waiting</span></div>
             <h3>Connect ChatGPT</h3>
-            <p>Copy the MCP connector URL after the tunnel is online. This credential is different.</p>
+            <p>Copy the MCP connector URL after the tunnel is online.</p>
             <button id="quick-copy-url" type="button" class="secondary">Copy connector URL</button>
           </article>
         </div>
@@ -90,14 +89,14 @@
         <div class="view-heading">
           <span class="eyebrow">STEP 1 / CONNECTION SETUP</span>
           <h2>Connect your tools</h2>
-          <p>Configure your private tunnel, then copy the correct credentials to the extension and ChatGPT.</p>
+          <p>Configure the Ngrok tunnel, then use the local WebSocket URL in the extension and the MCP URL in your chat agent.</p>
         </div>
         <div class="workspace-grid connection-layout">
-          <div class="column-stack">      <section class="panel ngrok-panel">
-        <div class="section-heading">
-          <h2><img src="assets/network.png" alt="" /> Tunnel settings</h2>
-          <span class="hint">NGROK</span>
-        </div>
+          <div class="column-stack"><section class="panel ngrok-panel">
+          <div class="section-heading">
+            <h2><img src="assets/network.png" alt="" /> Tunnel settings</h2>
+            <span class="hint">NGROK</span>
+          </div>
         <label for="proxy-port">Local proxy port</label>
         <div class="input-row">
           <input id="proxy-port" type="number" min="1024" max="65535" step="1" value="8787" inputmode="numeric" />
@@ -112,21 +111,7 @@
         <p class="help">Credentials are encrypted locally. Leave the token blank to reuse the saved value. Your AgentBridge tunnel is unaffected.</p>
         <button id="configure-ngrok" type="button" class="primary wide"><img src="assets/checkmark.png" alt="" /> Save &amp; connect</button>
       </section></div>
-          <div class="column-stack">        <section class="panel">
-          <div class="section-heading">
-            <h2><img src="assets/key.png" alt="" /> Bridge credentials</h2>
-            <span class="hint">PRIVATE</span>
-          </div>
-          <label for="token-value">Bridge token</label>
-          <div class="input-row">
-            <code id="token-value">••••••••••••••••••••••••••••</code>
-            <button id="toggle-token" class="icon-button" type="button" aria-label="Reveal token" title="Reveal token"><img id="token-visibility-icon" src="assets/visible.png" alt="" /></button>
-            <button id="copy-token" class="icon-button" type="button" aria-label="Copy bridge token" title="Copy bridge token"><img src="assets/copy.png" alt="" /></button>
-          </div>
-          <button id="import-token" type="button" class="link-button"><img src="assets/upload.png" alt="" /> Import existing token</button>
-          <div class="input-row"><span class="hint">Extension-only credential</span><button id="copy-extension-token" class="icon-button" type="button" aria-label="Copy extension bridge token" title="Copy extension bridge token"><img src="assets/copy.png" alt="" /></button></div>
-          <p class="help">Use the extension-only token in the browser extension popup for private coordination. Keep the MCP connector token unchanged.</p>
-        </section>        <section class="panel connector-panel">
+          <div class="column-stack"><section class="panel connector-panel">
           <div class="section-heading">
             <h2><img src="assets/link.png" alt="" /> Connector URL</h2>
             <span class="hint">CHATGPT MCP</span>
@@ -135,7 +120,7 @@
             <code id="connector-url">Enter your domain above</code>
             <button id="copy-url" class="icon-button" type="button" aria-label="Copy connector URL" title="Copy connector URL"><img src="assets/copy.png" alt="" /></button>
           </div>
-          <p class="help">Share this URL only with your own connector. Its access token stays masked here.</p>
+          <p class="help">Use this MCP URL to connect your chat agent. The tunnel itself is managed by Ngrok.</p>
         </section></div>
         </div>
       </section>
@@ -148,7 +133,8 @@
     <details class="panel coordination-panel" id="coordination-panel" open>
       <summary>Agent coordination <span id="coordination-summary" class="hint">Queue unavailable</span></summary>
       <div class="coordination-grid">
-        <div><h2>REUSABLE SEATS</h2><div id="agent-seats" class="coordination-scroll">No paired seats</div></div>
+        <div><h2>REUSABLE SEATS</h2><div id="agent-seats" class="coordination-scroll">No active seats</div></div>
+        <div><h2>TAB RELATIONSHIPS</h2><p id="tab-presence-summary" class="help">Checking open browser tabs…</p><button id="toggle-tab-history" type="button" class="link-button" hidden>Show saved registrations</button><div id="tab-hierarchy" class="coordination-scroll">No registered tabs</div></div>
         <div><h2>QUEUED EVENTS</h2><div id="queue-items" class="coordination-scroll">No active queue</div></div>
         <div><h2>REDACTED TOOLS</h2><div id="tool-call-log" class="coordination-scroll">No activity</div></div>
       </div>
@@ -156,44 +142,6 @@
       <p id="private-journal-inspection" class="help">Journal owner state unknown until inspected locally.</p>
       <p class="help">Read-only proxy snapshot. DELIVERED is not PROCESSED; Saga confirmation is separate. UNCERTAIN requires manual reconciliation.</p>
     </details>
-        <details class="panel pairing-panel" id="principal-panel" hidden>
-          <summary>Scoped agent pairing <span class="hint">LOCAL ADMIN</span></summary>
-          <p class="help">Create a separately revocable connector identity. Choose the actual manager tab ID; never share the scoped URL with another agent.</p>
-          <label for="pair-seat">Reusable agent seat</label>
-          <select id="pair-seat">
-            <option value="">Custom role</option>
-            <option value="BA">BA · Orchestrator</option>
-            <option value="PM">PM · Epic manager</option>
-            <option value="TL">TL · Task lead</option>
-            <option value="Council A">Council A · Systems</option>
-            <option value="Council B">Council B · Security</option>
-            <option value="Council C">Council C · Architecture</option>
-            <option value="Council D">Council D · QA</option>
-            <option value="Council E">Council E · Devil's advocate</option>
-            <option value="BA Watchdog">BA Watchdog</option>
-          </select>
-          <label for="pair-role">Role</label>
-          <select id="pair-role">
-            <option value="pm">PM</option><option value="tl">TL</option>
-            <option value="ba">BA</option><option value="specialist">Specialist</option>
-            <option value="council">Council</option><option value="watchdog">Watchdog</option>
-          </select>
-          <label for="pair-workspace">Workspace</label>
-          <input id="pair-workspace" value="web-chat-automation" autocomplete="off" />
-          <label for="pair-project">Saga project</label>
-          <input id="pair-project" value="4" autocomplete="off" />
-          <label for="pair-orchestrator">Orchestrator</label>
-          <input id="pair-orchestrator" value="chat-orchestrator-p0" autocomplete="off" />
-          <label for="pair-parent-task">Parent task</label>
-          <input id="pair-parent-task" value="65" autocomplete="off" />
-          <label for="pair-tab">Manager tab ID</label>
-          <input id="pair-tab" type="number" min="0" placeholder="From list_tabs" />
-          <div class="input-row">
-            <button id="pair-principal" type="button" class="primary">Pair identity</button>
-            <button id="copy-principal-url" type="button" class="secondary" disabled>Copy one-time URL</button>
-          </div>
-          <div id="principal-list" class="principal-list" aria-live="polite"></div>
-        </details>
       </section>
       <section id="view-settings" class="app-view" hidden>
         <div class="view-heading">
@@ -203,7 +151,7 @@
         </div>
     <details class="panel extension-settings-panel" id="extension-settings-panel">
       <summary>Extension settings &amp; system prompts <span id="extension-settings-sync" class="hint">Profile-scoped · opens on demand</span></summary>
-      <p class="help">Proxy-managed settings synchronize to the extension when connected with this profile's extension-only token. The extension popup keeps only WebSocket URL and token.</p>
+      <p class="help">Proxy-managed settings synchronize over the local WebSocket when the extension connects. The extension popup configures only the WebSocket URL.</p>
       <div class="extension-settings-grid">
         <div class="extension-behavior">
           <label class="tray-toggle" for="agent-enabled"><input type="checkbox" id="agent-enabled" /> Automation enabled</label>
@@ -211,7 +159,7 @@
           <label for="agent-max-workers">Max worker tabs (1–10)</label><input id="agent-max-workers" type="number" min="1" max="10" />
           <label for="agent-max-tasks">Max tasks per hour (1–500)</label><input id="agent-max-tasks" type="number" min="1" max="500" />
           <label for="agent-timeout">Task timeout in minutes (1–60)</label><input id="agent-timeout" type="number" min="1" max="60" />
-          <p class="help">Worker auto-close is held until verified Saga completion; this safety rule is not editable.</p>
+          <p class="help">Worker auto-close is disabled. A parent reviews the result and any fixing tasks, then explicitly closes the worker. Saga IDs are optional references.</p>
         </div>
         <div class="extension-prompts">
           <label for="agent-prompt-module">MCP &amp; Agent Communication Instructions</label>
@@ -240,13 +188,13 @@
       </div>
       <details class="extension-admin-actions">
         <summary>Advanced browser actions</summary>
-        <button id="show-identity-recovery" type="button" class="link-button">Open manual identity recovery</button>
-        <p class="help">Only use this temporary fallback if automatic scoped identity is unavailable. It does not grant privileges to a shared connector.</p>
-        <p class="help">Provide a supported ChatGPT / Claude / Gemini tab ID from list_tabs. Scoped worker tabs remain protected from legacy closure.</p>
+        <p class="help">Provide a supported ChatGPT / Claude / Gemini tab ID from list_tabs for local diagnostics.</p>
         <label for="agent-admin-tab">Browser chat tab ID</label><input id="agent-admin-tab" type="number" min="1" placeholder="e.g. 101" />
         <div class="input-row">
           <button id="agent-set-orchestrator" type="button" class="secondary">Set legacy orchestrator</button>
           <button id="agent-diagnose-tab" type="button" class="secondary">Diagnose tab</button>
+          <button id="agent-inspect-root" type="button" class="secondary">Inspect root recovery</button>
+          <button id="agent-confirm-root" type="button" class="secondary" disabled>Confirm safe root recovery</button>
           <button id="agent-close-legacy" type="button" class="secondary">Close idle legacy workers</button>
         </div>
         <pre id="agent-admin-output" class="coordination-scroll" hidden></pre>

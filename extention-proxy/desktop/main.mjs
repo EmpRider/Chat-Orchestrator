@@ -1,15 +1,16 @@
-import { app, BrowserWindow, Menu, Tray, clipboard, dialog, ipcMain, nativeImage, safeStorage, shell, utilityProcess } from 'electron';
+import { app, BrowserWindow, Menu, Tray, clipboard, ipcMain, nativeImage, safeStorage, shell, utilityProcess } from 'electron';
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { connectorUrl, ensureDesktopToken, ISOLATED_NGROK_CONFIG, normalizeNgrokAuthtoken, normalizeNgrokDomain, normalizeProxyPort, normalizeProfileName } from './config.mjs';
+import { connectorUrl, ISOLATED_NGROK_CONFIG, normalizeNgrokAuthtoken, normalizeNgrokDomain, normalizeProxyPort, normalizeProfileName, PRIVATE_QUEUE_PREFERENCE_SCHEMA, resolvePrivateQueuePreference } from './config.mjs';
 import { createNgrokLogReader } from './ngrok-diagnostics.mjs';
+import { findReusableNgrokTunnel, describeNgrokExit } from './ngrok-reuse.mjs';
 import { inspectPrivateJournal, preparePrivateJournal } from './coordination-storage.mjs';
 import { createDesktopTray, installWindowCloseBehavior, minimizeToTrayPreference } from './tray-lifecycle.mjs';
-import { createPrincipalCredential, listPrincipalCredentials, resolvePrincipalCredential, revokePrincipalCredential } from '../principal-auth.mjs';
 import { DEFAULT_AGENT_SETTINGS, normalizeAgentSettings, replaceObsoletePromptSettings, disabledAgentSettings, composeAgentPrompt } from '../agent-settings.mjs';
+import { createDiagnostics } from '../diagnostics.mjs';
 
 // Set CHAT_ORCH_DIAGNOSTICS=1 for lifecycle messages (never credentials).
 const debug = (message) => {
@@ -38,12 +39,11 @@ let minimizeToTray = true;
 let exitStarted = false;
 let exitReady = false;
 let child;
-const managerAttestations = new Map(); // trusted utilityProcess replies, never HTTP
+let stopProxyPromise = null; // Serialize overlapping tray Exit / Stop requests.
 const desktopExtensionActions = new Map(); // local admin requests only
 let ngrokChild;
+let ngrokReused = null; // external locally verified tunnel; never owned or terminated
 let ngrokGeneration = 0;
-let token = '';
-let extensionToken = '';
 let domain = '';
 let phase = 'stopped';
 let ngrokPhase = 'stopped';
@@ -52,9 +52,8 @@ let ngrokError = '';
 let routeVerified = false;
 let extensionConnected = false;
 let coordinationState = 'unknown';
-let privateCoordinationOptIn = false;
+let privateCoordinationOptIn = true;
 let runningPrivateCoordination = null;
-let principalState = 'unknown';
 let coordinationSnapshot = null; // Owned utilityProcess emits redacted, read-only state.
 let stopping = false;
 let agentSettings = normalizeAgentSettings({});
@@ -103,15 +102,13 @@ debug(`single-instance lock=${hasInstanceLock}`);
 if (!hasInstanceLock) app.quit();
 
 const dataDir = () => app.getPath('userData');
-const tokenFile = () => path.join(dataDir(), 'bridge.token');
-const extensionTokenFile = () => path.join(dataDir(), 'extension-bridge.token');
+const diagnostics = createDiagnostics({component:'desktop',directory:dataDir()});
 const settingsFile = () => path.join(dataDir(), 'settings.json');
 const ngrokAuthFile = () => path.join(dataDir(), 'ngrok-auth.bin');
 const ngrokConfigFile = () => path.join(dataDir(), 'ngrok-isolated.yml');
-const principalRegistryFile = () => path.join(dataDir(), 'coordination-principals.json');
 const privateCoordinationJournalPath = () => path.join(dataDir(), 'coordination.events.journal');
 
-// Provision only from trusted desktop IPC. A future start may use the journal,
+// Provision from trusted desktop startup or IPC. A future start may use the journal,
 // but no record is ACKed merely because this file was created. On Windows,
 // power-loss directory-entry durability is not claimed; recovery stays fail-closed.
 function preparePrivateCoordinationJournal() {
@@ -134,6 +131,7 @@ function state() {
   return {
     phase,
     ngrokPhase,
+    ngrokReused: Boolean(ngrokReused),
     ngrokError,
     ngrokAuthConfigured: fs.existsSync(ngrokAuthFile()),
     error: errorMessage,
@@ -143,7 +141,6 @@ function state() {
     privateCoordinationJournalPresent: fs.existsSync(privateCoordinationJournalPath()),
     privateJournalInspection: privateJournalInspection(),
     privateCoordinationRestartRequired: Boolean(child && runningPrivateCoordination !== privateCoordinationOptIn),
-    principalState,
     coordinationSnapshot,
     agentSettingsSyncRevision,
     domain,
@@ -170,10 +167,11 @@ function loadSettings() {
     const saved = JSON.parse(fs.readFileSync(settingsFile(), 'utf8'));
     domain = saved.domain ? normalizeNgrokDomain(saved.domain) : '';
     minimizeToTray = minimizeToTrayPreference(saved.minimizeToTray);
-    privateCoordinationOptIn = saved.privateCoordinationOptIn === true;
+    privateCoordinationOptIn = resolvePrivateQueuePreference(saved);
     agentSettings = replaceObsoletePromptSettings(saved.agentSettings || {});
     if (!E2E_MODE) PORT = normalizeProxyPort(saved.proxyPort ?? 8787);
-    if (saved.agentSettings?.systemPrompts !== undefined || saved.agentSettings?.useWorkerSystemPrompt !== undefined) writeSettings();
+    if (saved.privateQueuePreferenceSchema !== PRIVATE_QUEUE_PREFERENCE_SCHEMA ||
+        saved.agentSettings?.systemPrompts !== undefined || saved.agentSettings?.useWorkerSystemPrompt !== undefined) writeSettings();
   } catch {
     domain = '';
     minimizeToTray = true;
@@ -185,7 +183,7 @@ function loadSettings() {
 
 function writeSettings() {
   fs.mkdirSync(dataDir(), { recursive: true });
-  fs.writeFileSync(settingsFile(), JSON.stringify({ domain, minimizeToTray, privateCoordinationOptIn, proxyPort: PORT, agentSettings }, null, 2), { encoding: 'utf8', mode: 0o600 });
+  fs.writeFileSync(settingsFile(), JSON.stringify({ domain, minimizeToTray, privateCoordinationOptIn, privateQueuePreferenceSchema: PRIVATE_QUEUE_PREFERENCE_SCHEMA, proxyPort: PORT, agentSettings }, null, 2), { encoding: 'utf8', mode: 0o600 });
 }
 
 async function saveNgrokAuth(value) {
@@ -213,8 +211,8 @@ async function loadNgrokAuth() {
 }
 
 async function startNgrok() {
-  if (ngrokChild || ngrokPhase === 'starting') return;
-  if (!domain || !fs.existsSync(ngrokAuthFile())) {
+  if (ngrokChild || ngrokReused || ngrokPhase === 'starting') return;
+  if (!domain) {
     ngrokPhase = 'stopped';
     routeVerified = false;
     publishState();
@@ -227,6 +225,25 @@ async function startNgrok() {
   debug(`ngrok start requested (generation=${generation}, domain=${domain}, port=${PORT})`);
   publishState();
   try {
+    // An app crash may leave its ngrok subprocess running. The new app must
+    // not start a competing tunnel for the same dedicated domain. Match BOTH
+    // exact public origin and loopback target port via the local ngrok API.
+    const existing = await findReusableNgrokTunnel(domain,PORT);
+    if (generation !== ngrokGeneration) return;
+    if (existing) {
+      ngrokReused=existing;
+      debug('ngrok: using matching existing local tunnel; ownership remains external');
+      diagnostics.info('ngrok.reused',{port:PORT,reused:true});
+      publishState();
+      void pollNgrok();
+      return;
+    }
+    if (!fs.existsSync(ngrokAuthFile())) {
+      ngrokPhase='stopped';
+      ngrokError='Save your ngrok authtoken to start a new tunnel.';
+      publishState();
+      return;
+    }
     const auth = await loadNgrokAuth();
     if (generation !== ngrokGeneration) return;
     const configPath = ensureIsolatedNgrokConfig();
@@ -247,13 +264,14 @@ async function startNgrok() {
       debug(`ngrok: ${diagnostic}`);
     };
     // Parse selected ngrok JSON fields; never print its raw output or auth data.
-    const stdout = createNgrokLogReader(onRecord, [auth, token]);
-    const stderr = createNgrokLogReader(onRecord, [auth, token]);
+    const stdout = createNgrokLogReader(onRecord, [auth]);
+    const stderr = createNgrokLogReader(onRecord, [auth]);
     owned.stdout?.on('data', (chunk) => stdout.write(chunk));
     owned.stderr?.on('data', (chunk) => stderr.write(chunk));
     owned.on('error', (error) => {
       if (ngrokChild !== owned || generation !== ngrokGeneration) return;
       ngrokPhase = 'error';
+      diagnostics.error('ngrok.start_failed',{errorClass:'process_launch'});
       ngrokError = error.code === 'ENOENT'
         ? 'ngrok is not installed or not on PATH. Install ngrok CLI and reopen the app.'
         : 'The ngrok agent could not start.';
@@ -265,16 +283,42 @@ async function startNgrok() {
       stdout.flush();
       stderr.flush();
       debug(`ngrok exited (code=${Number.isInteger(code) ? code : 'none'}, signal=${signal || 'none'}, error=${ngrokErrorCode || 'none'})`);
+      diagnostics.warn('ngrok.exited',{exitCode:Number.isInteger(code)?code:undefined,
+        reason:ngrokErrorCode || 'process_closed'});
       if (ngrokChild !== owned || generation !== ngrokGeneration) return;
       ngrokChild = null;
       routeVerified = false;
-      if (ngrokPhase !== 'stopping' && ngrokPhase !== 'error') {
-        ngrokPhase = 'error';
-        ngrokError = ngrokErrorCode === 'ERR_NGROK_320'
-          ? 'ngrok says this domain belongs to another account (ERR_NGROK_320). Check the authtoken for the account that owns this domain.'
-          : `ngrok stopped. Check the dedicated domain and authtoken${ngrokErrorCode ? ` (${ngrokErrorCode})` : ''}.`;
-      } else if (ngrokPhase === 'stopping') ngrokPhase = 'stopped';
-      publishState();
+      if (ngrokPhase === 'stopping') {
+        ngrokPhase='stopped';
+        publishState();
+        return;
+      }
+      // Resolve a race where the previous agent becomes discoverable just
+      // after our attempted launch reports ERR_NGROK_334.
+      void (async () => {
+        if (ngrokErrorCode === 'ERR_NGROK_334') {
+          const matching = await findReusableNgrokTunnel(domain,PORT);
+          if (generation !== ngrokGeneration || ngrokChild || ngrokReused) return;
+          if (matching) {
+            ngrokReused=matching;
+            ngrokPhase='starting';
+            ngrokError='';
+            diagnostics.info('ngrok.reused_after_conflict',{port:PORT,reused:true});
+            publishState();
+            void pollNgrok();
+            return;
+          }
+        }
+        if (generation !== ngrokGeneration || ngrokChild || ngrokReused) return;
+        ngrokPhase='error';
+        ngrokError=describeNgrokExit(ngrokErrorCode);
+        publishState();
+      })().catch(() => {
+        if (generation !== ngrokGeneration) return;
+        ngrokPhase='error';
+        ngrokError=describeNgrokExit(ngrokErrorCode);
+        publishState();
+      });
     });
   } catch (error) {
     if (generation !== ngrokGeneration) return;
@@ -290,6 +334,9 @@ async function stopNgrok() {
   ++ngrokGeneration;
   const owned = ngrokChild;
   ngrokChild = null;
+  // A reused tunnel belongs to another process. The app may detach, but may
+  // never terminate that process, stop its endpoint, or rewrite its config.
+  ngrokReused = null;
   ngrokPhase = 'stopping';
   routeVerified = false;
   publishState();
@@ -307,11 +354,18 @@ async function stopNgrok() {
 }
 
 async function pollNgrok() {
-  if (!ngrokChild || !domain || ngrokPhase === 'stopping') return;
+  if ((!ngrokChild && !ngrokReused) || !domain || ngrokPhase === 'stopping') return;
   const owned = ngrokChild;
+  const reused = ngrokReused;
   const checkedDomain = domain;
   let verified = false;
   try {
+    if (reused) {
+      const stillPresent = await findReusableNgrokTunnel(checkedDomain,PORT,{
+        ports:[reused.apiPort],
+      });
+      if (!stillPresent) throw new Error('Existing ngrok tunnel is no longer present');
+    }
     const response = await fetch(`${checkedDomain}/health`, {
       headers: { 'ngrok-skip-browser-warning': '1' },
       signal: AbortSignal.timeout(3500),
@@ -319,7 +373,8 @@ async function pollNgrok() {
     if (!response.ok || !(await response.json()).ok) throw new Error('Tunnel is not ready');
     verified = true;
   } catch {}
-  if (ngrokChild !== owned || domain !== checkedDomain || ngrokPhase === 'stopping') return;
+  if (ngrokChild !== owned || ngrokReused !== reused ||
+      domain !== checkedDomain || ngrokPhase === 'stopping') return;
   if (verified) {
     if (!routeVerified) debug('ngrok public health endpoint verified');
     routeVerified = true;
@@ -342,12 +397,9 @@ function startProxy() {
   publishState();
 
   try {
-    token = ensureDesktopToken(tokenFile(), app.isPackaged || PROFILE !== 'default'
-      ? undefined : path.join(appDir, '.token'), PROFILE === 'default' ? process.env.BRIDGE_TOKEN : undefined);
-    extensionToken = ensureDesktopToken(extensionTokenFile(), undefined,
-      PROFILE === 'default' ? process.env.EXTENSION_BRIDGE_TOKEN : undefined);
-    if (token === extensionToken) throw new Error('Extension and MCP tokens must differ');
+    if (privateCoordinationOptIn) preparePrivateCoordinationJournal();
     debug(`starting local MCP proxy at 127.0.0.1:${PORT}`);
+    diagnostics.info('proxy.start_requested',{port:PORT});
     const processForThisStart = utilityProcess.fork(path.join(appDir, 'server.js'), [], {
       serviceName: 'Chat Orchestrator MCP',
       cwd: app.isPackaged ? process.resourcesPath : appDir,
@@ -356,8 +408,7 @@ function startProxy() {
         ...process.env,
         PORT: String(PORT),
         HOST: '127.0.0.1',
-        BRIDGE_TOKEN_FILE: tokenFile(),
-        EXTENSION_BRIDGE_TOKEN_FILE: extensionTokenFile(),
+        CHAT_ORCH_PROFILE_DIR: dataDir(),
         CHAT_ORCH_PRIVATE_COORDINATION: privateCoordinationOptIn ? '1' : '0',
       },
     });
@@ -370,6 +421,7 @@ function startProxy() {
       if (child !== processForThisStart) return;
       if (message?.type === 'ready') {
         debug('local MCP proxy ready');
+        diagnostics.info('proxy.ready',{port:PORT,success:true});
         phase = 'running';
         errorMessage = '';
       } else if (message?.type === 'desktop_extension_action_result') {
@@ -379,14 +431,6 @@ function startProxy() {
           desktopExtensionActions.delete(message.request_id);
           if (message.ok) pending.resolve(message.result);
           else pending.reject(new Error(message.error || 'Desktop extension action failed'));
-        }
-      } else if (message?.type === 'manager_attestation') {
-        const pending = managerAttestations.get(message.request_id);
-        if (pending) {
-          clearTimeout(pending.timer);
-          managerAttestations.delete(message.request_id);
-          if (message.ok) pending.resolve(message.result);
-          else pending.reject(new Error(message.error || 'Manager attestation failed'));
         }
       } else if (message?.type === 'agent_settings_synced') {
         agentSettingsSyncRevision = Number(message.revision) || 0;
@@ -398,11 +442,13 @@ function startProxy() {
         }
       } else if (message?.type === 'error') {
         debug('local MCP proxy reported an error');
+        diagnostics.error('proxy.start_failed',{reason:'startup_error'});
         phase = 'error';
         errorMessage = String(message.message || 'Proxy startup failed');
         // A failed listener cannot be reused; release only the process we own.
         processForThisStart.kill();
       } else if (message?.type === 'stopped') {
+        diagnostics.info('proxy.stop_acknowledged',{acknowledged:true});
         // The utility process keeps its parentPort open after closing HTTP.
         processForThisStart.kill();
       }
@@ -410,13 +456,9 @@ function startProxy() {
     });
     processForThisStart.on('exit', (code) => {
       debug(`local MCP proxy exited (code=${code})`);
+      diagnostics.info('proxy.exited',{exitCode:Number.isInteger(code)?code:undefined});
       if (child !== processForThisStart) return;
       child = null;
-      for (const [id, pending] of managerAttestations) {
-        clearTimeout(pending.timer);
-        pending.reject(new Error('Proxy stopped during manager attestation'));
-        managerAttestations.delete(id);
-      }
       for (const [id, pending] of desktopExtensionActions) {
         clearTimeout(pending.timer);
         pending.reject(new Error('Proxy stopped during extension action'));
@@ -449,7 +491,14 @@ function startProxy() {
   }
 }
 
-async function stopProxy() {
+function stopProxy() {
+  if (stopProxyPromise) return stopProxyPromise;
+  diagnostics.info('proxy.stop_requested',{port:PORT});
+  stopProxyPromise = stopProxyOnce().finally(() => { stopProxyPromise = null; });
+  return stopProxyPromise;
+}
+
+async function stopProxyOnce() {
   if (!child) {
     phase = 'stopped';
     publishState();
@@ -459,15 +508,43 @@ async function stopProxy() {
   stopping = true;
   phase = 'stopping';
   publishState();
-  await new Promise((resolve) => {
-    const timer = setTimeout(() => { ownedChild.kill(); resolve(); }, 3500);
-    ownedChild.once('exit', () => { clearTimeout(timer); resolve(); });
-    try { ownedChild.postMessage({ type: 'stop' }); } catch { ownedChild.kill(); }
+  const result = await new Promise((resolve) => {
+    let finished = false;
+    let acknowledged = false;
+    const complete = (forced) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      ownedChild.off('exit', onExit);
+      ownedChild.off('message', onMessage);
+      resolve({ forced, acknowledged });
+    };
+    const onMessage = (message) => {
+      if (message?.type === 'stopped') acknowledged = true;
+    };
+    const onExit = () => complete(false);
+    const timer = setTimeout(() => {
+      debug('Proxy did not finish graceful shutdown within 15 seconds; owner lock may need inspection');
+      ownedChild.kill();
+      complete(true);
+    }, 15000);
+    ownedChild.on('message', onMessage);
+    ownedChild.once('exit', onExit);
+    try { ownedChild.postMessage({ type: 'stop' }); }
+    catch (error) {
+      debug('Proxy stop message delivery failed: ' + error.message);
+      ownedChild.kill();
+      complete(true);
+    }
   });
   if (child === ownedChild) child = null;
   stopping = false;
   extensionConnected = false;
-  phase = 'stopped';
+  phase = !result.forced && result.acknowledged ? 'stopped' : 'error';
+  if (phase === 'error') {
+    errorMessage = 'Proxy did not confirm journal lock release. Verify journal ownership before restart.';
+    debug('Proxy exit lacked verified graceful completion; no stale lock was removed');
+  }
   publishState();
 }
 
@@ -481,12 +558,9 @@ async function pollHealth() {
     coordinationState = health.coordination?.enabled === true ? 'active'
       : health.coordination?.storageReady === true ? 'private_ready'
       : health.coordination?.enabled === false ? 'disabled' : 'unknown';
-    principalState = ['enrolled', 'not_enrolled', 'error'].includes(health.coordination?.principalState)
-      ? health.coordination.principalState : 'unknown';
   } catch {
     extensionConnected = false;
     coordinationState = 'unknown';
-    principalState = 'unknown';
   }
   publishState();
 }
@@ -497,31 +571,16 @@ function requireTrustedWindow(event) {
   }
 }
 
-function attestManagerTab(tabId) {
-  if (!child || phase !== 'running') return Promise.reject(new Error('Start the local proxy and extension before pairing'));
-  if (!Number.isSafeInteger(tabId) || tabId <= 0) return Promise.reject(new Error('Invalid manager tab'));
-  const owned = child;
-  const requestId = crypto.randomUUID();
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      managerAttestations.delete(requestId);
-      reject(new Error('Manager tab attestation timed out; check extension connection'));
-    }, 12000);
-    managerAttestations.set(requestId, { resolve, reject, timer });
-    try { owned.postMessage({ type: 'attest_manager_tab', request_id: requestId, tab_id: tabId }); }
-    catch (error) {
-      clearTimeout(timer); managerAttestations.delete(requestId); reject(error);
-    }
-  });
-}
-
-function desktopExtensionAction(action, tabId) {
+function desktopExtensionAction(action, tabId, nonce) {
   if (!child || phase !== 'running') return Promise.reject(new Error('Start proxy and connect extension first'));
-  if (!['set_orchestrator','diagnose','close_legacy_workers'].includes(action)) {
+  if (!['set_orchestrator','diagnose','close_legacy_workers','inspect_root_repair','confirm_root_repair'].includes(action)) {
     return Promise.reject(new Error('Unsupported desktop action'));
   }
   if (action !== 'close_legacy_workers' && (!Number.isSafeInteger(tabId) || tabId <= 0)) {
     return Promise.reject(new Error('Enter an actual positive tab ID'));
+  }
+  if (action === 'confirm_root_repair' && (typeof nonce !== 'string' || !/^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(nonce))) {
+    return Promise.reject(new Error('Root recovery requires its one-use confirmation nonce'));
   }
   const owned = child;
   const id = crypto.randomUUID();
@@ -529,15 +588,15 @@ function desktopExtensionAction(action, tabId) {
     const timer = setTimeout(() => {desktopExtensionActions.delete(id);
       reject(new Error('Extension action timed out; outcome unknown'));}, 15000);
     desktopExtensionActions.set(id, {resolve,reject,timer});
-    try {owned.postMessage({type:'desktop_extension_action', request_id:id, action, tab_id:tabId});}
+    try {owned.postMessage({type:'desktop_extension_action', request_id:id, action, tab_id:tabId, confirmation_nonce:nonce});}
     catch (error) {clearTimeout(timer); desktopExtensionActions.delete(id); reject(error);}
   });
 }
 
 function registerActions() {
-  ipcMain.handle('bridge:extensionAction', (event, action, tabId) => {
+  ipcMain.handle('bridge:extensionAction', (event, action, tabId, nonce) => {
     requireTrustedWindow(event);
-    return desktopExtensionAction(action, tabId);
+    return desktopExtensionAction(action, tabId, nonce);
   });
   ipcMain.handle('bridge:previewPrompt', (event, input) => {
     requireTrustedWindow(event);
@@ -569,20 +628,10 @@ function registerActions() {
     publishState();
     return state();
   });
-  ipcMain.handle('bridge:showToken', (event) => { requireTrustedWindow(event); return token; });
-  ipcMain.handle('bridge:copyToken', (event) => {
-    requireTrustedWindow(event);
-    clipboard.writeText(token);
-  });
-  ipcMain.handle('bridge:copyExtensionToken', (event) => {
-    requireTrustedWindow(event);
-    if (!extensionToken) throw new Error('Start the proxy to create an extension bridge token');
-    clipboard.writeText(extensionToken);
-  });
   ipcMain.handle('bridge:copyUrl', (event) => {
     requireTrustedWindow(event);
     if (!domain) throw new Error('Save your ngrok domain first');
-    clipboard.writeText(connectorUrl(domain, token));
+    clipboard.writeText(connectorUrl(domain));
   });
   ipcMain.handle('bridge:configureNgrok', async (event, value, authValue) => {
     requireTrustedWindow(event);
@@ -602,7 +651,7 @@ function registerActions() {
     if (E2E_MODE) throw new Error('Isolated test port is fixed by its test profile');
     const next = normalizeProxyPort(value);
     if (next === PORT) return state();
-    if (child || ngrokChild || phase === 'starting' || phase === 'stopping' ||
+    if (child || ngrokChild || ngrokReused || phase === 'starting' || phase === 'stopping' ||
         ngrokPhase === 'starting' || ngrokPhase === 'stopping') {
       throw new Error('Stop the local proxy and Ngrok before changing this profile port');
     }
@@ -622,24 +671,6 @@ function registerActions() {
     await Promise.all([stopProxy(), stopNgrok()]);
     return state();
   });
-  ipcMain.handle('bridge:importToken', async (event) => {
-    requireTrustedWindow(event);
-    if (process.env.BRIDGE_TOKEN) throw new Error('BRIDGE_TOKEN environment override is active');
-    const result = await dialog.showOpenDialog(window, {
-      title: 'Import existing bridge token',
-      properties: ['openFile'],
-      filters: [{ name: 'Token files', extensions: ['token', 'txt'] }, { name: 'All files', extensions: ['*'] }],
-    });
-    if (result.canceled || !result.filePaths[0]) return false;
-    const imported = fs.readFileSync(result.filePaths[0], 'utf8').trim();
-    if (!imported || imported.length > 1024) throw new Error('Invalid token file');
-    await stopProxy();
-    fs.mkdirSync(dataDir(), { recursive: true });
-    fs.writeFileSync(tokenFile(), imported, { encoding: 'utf8', mode: 0o600 });
-    token = imported;
-    startProxy();
-    return true;
-  });
   ipcMain.handle('bridge:configurePrivateCoordination', (event, enabled) => {
     requireTrustedWindow(event);
     if (typeof enabled !== 'boolean') throw new Error('Invalid private coordination setting');
@@ -648,35 +679,6 @@ function registerActions() {
     writeSettings();
     publishState();
     return state();
-  });
-  ipcMain.handle('bridge:enrollPrincipal', async (event, input) => {
-    requireTrustedWindow(event);
-    const attestation = await attestManagerTab(input?.callerTabId);
-    if (attestation.tab_id !== input.callerTabId ||
-        !/^[0-9a-f-]{36}$/i.test(attestation.browser_session_id || '') ||
-        !/^[0-9a-f-]{36}$/i.test(attestation.incarnation_id || '')) {
-      throw new Error('Extension manager tab attestation mismatch; do not enroll');
-    }
-    return createPrincipalCredential(principalRegistryFile(), {
-      ...input, browserSessionId: attestation.browser_session_id,
-      managerIncarnationId: attestation.incarnation_id,
-    });
-  });
-  ipcMain.handle('bridge:listPrincipals', (event) => {
-    requireTrustedWindow(event);
-    return listPrincipalCredentials(principalRegistryFile());
-  });
-  ipcMain.handle('bridge:revokePrincipal', (event, credentialId) => {
-    requireTrustedWindow(event);
-    return revokePrincipalCredential(principalRegistryFile(), credentialId);
-  });
-  ipcMain.handle('bridge:copyScopedUrl', (event, scopedToken) => {
-    requireTrustedWindow(event);
-    if (!domain) throw new Error('Save your ngrok domain first');
-    if (!resolvePrincipalCredential(principalRegistryFile(), scopedToken)) {
-      throw new Error('Scoped credential is invalid or revoked');
-    }
-    clipboard.writeText(connectorUrl(domain, scopedToken));
   });
 }
 

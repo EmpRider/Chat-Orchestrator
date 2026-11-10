@@ -52,7 +52,7 @@ jobs:
           if ($env:GITHUB_REF -like 'refs/tags/*' -and $env:GITHUB_REF_NAME -ne "v$version") {
             throw 'Tag does not match the application version.'
           }
-          $expected = @('background.js', 'content.js', 'manifest.json', 'popup.html', 'popup.js', 'structured-reader.js')
+          $expected = @('background.js', 'content.js', 'manifest.json', 'popup.html', 'popup.js', 'structured-reader.js', 'workspace.html')
           $actual = @(Get-ChildItem 'extention' -File | ForEach-Object { $_.Name } | Sort-Object)
           if (@(Compare-Object ($expected | Sort-Object) $actual).Count -ne 0) {
             throw "Unexpected extension file inventory: $($actual -join ', ')"

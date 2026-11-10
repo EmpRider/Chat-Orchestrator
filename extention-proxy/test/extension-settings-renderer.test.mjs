@@ -60,6 +60,6 @@ test('operation module editor persists edits independently and previews without 
  assert.equal(persisted.maxTasksPerHour,33);
  const html=readFileSync(path.join(root,'..','extention','popup.html'),'utf8');
  assert.match(html,/id="serverUrl"/);
- assert.match(html,/id="token"/);
+ assert.doesNotMatch(html,/id="token"/);
  assert.equal(html.includes('id="workerSystemPrompt"'),false);
 });

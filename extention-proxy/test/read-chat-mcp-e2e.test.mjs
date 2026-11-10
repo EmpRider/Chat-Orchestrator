@@ -3,7 +3,8 @@
 // The site APIs are fixture stubs; no private browser conversations are accessed.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -103,8 +104,11 @@ function createContent(siteInfo, apiFailures, domFallback) {
 }
 
 test('MCP read_chat options survive HTTP, WebSocket, background and content scripts', { timeout: 30000 }, async () => {
+  const profile = mkdtempSync(path.join(tmpdir(),'chat-orch-read-e2e-'));
   const server = spawn(process.execPath, ['server.js'], {
-    cwd: ROOT, env: { ...process.env, PORT: String(PORT), BRIDGE_TOKEN: TOKEN, EXTENSION_BRIDGE_TOKEN: EXTENSION_TOKEN },
+    cwd: ROOT, env: { ...process.env, PORT: String(PORT), BRIDGE_TOKEN: TOKEN,
+      EXTENSION_BRIDGE_TOKEN: EXTENSION_TOKEN,CHAT_ORCH_PROFILE_DIR:profile,
+      CHAT_ORCH_PRIVATE_COORDINATION:'0' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let client;
@@ -119,7 +123,7 @@ test('MCP read_chat options survive HTTP, WebSocket, background and content scri
           enabled: true, token: EXTENSION_TOKEN, serverUrl: `ws://localhost:${PORT}/bridge`,
           orchestratorTabId: cases[0].tabId,
         }) },
-        session: { get: async () => ({ workers: [111, 112], workerOwners: { 111: 'legacy', 112: 'legacy' } }), set: async () => {} },
+        session: { get: async () => ({ workers: [], workerOwners: {} }), set: async () => {} },
         onChanged: { addListener() {} },
       },
       tabs: {
@@ -158,7 +162,8 @@ test('MCP read_chat options survive HTTP, WebSocket, background and content scri
     assert.ok(schema?.last_n, 'MCP schema exposes last_n');
 
     const callRead = async (args) => {
-      const reply = await client.callTool({ name: 'read_chat', arguments: args });
+      const reply = await client.callTool({ name: 'read_chat',
+        arguments: {caller_tab_id:args.tab_id ?? cases[0].tabId,...args} });
       assert.equal(reply.isError, undefined, 'bridge call itself should succeed');
       return JSON.parse(reply.content[0].text);
     };
@@ -207,11 +212,14 @@ test('MCP read_chat options survive HTTP, WebSocket, background and content scri
       { tab_id: cases[0].tabId, include_reasoning: 'yes' },
       { tab_id: cases[0].tabId, include_attachments: 'no' },
     ]) {
-      const response = await client.callTool({ name: 'read_chat', arguments: invalid });
+      const response = await client.callTool({ name: 'read_chat',
+        arguments: {caller_tab_id:invalid.tab_id ?? cases[0].tabId,...invalid} });
       assert.equal(response.isError, true, 'invalid MCP options must be rejected');
     }
   } finally {
     if (client) await client.close().catch(() => {});
     server.kill();
+    try { rmSync(profile,{recursive:true,force:true}); }
+    catch (error) { console.warn('Isolated read-chat profile cleanup deferred:',error.message); }
   }
 });

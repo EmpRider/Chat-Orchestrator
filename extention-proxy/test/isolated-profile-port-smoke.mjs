@@ -57,7 +57,7 @@ try {
     fs.mkdirSync(dir, { recursive: false });
     created.push(dir);
     fs.writeFileSync(path.join(dir, 'settings.json'), JSON.stringify({
-      domain: '', minimizeToTray: false, privateCoordinationOptIn: false,
+      domain: '', minimizeToTray: false, privateQueuePreferenceSchema: 1, privateCoordinationOptIn: false,
       proxyPort: ports[i],
     }));
     const child = spawn(electron, [root, '--profile=' + names[i]], {
@@ -76,13 +76,13 @@ try {
       names[i] + ' exit=' + child.exitCode + ' stderr=' + diagnosticLogs.get(child)).join(' | '));
     throw error;
   }
-  const tokens = created.map((dir) => fs.readFileSync(path.join(dir, 'bridge.token'), 'utf8').trim());
-  assert.notEqual(tokens[0], tokens[1], 'Separate profiles must never reuse a bridge token');
+  assert.ok(created.every((dir) => !fs.existsSync(path.join(dir, 'bridge.token'))),
+    'Independent profiles should not generate bridge tokens');
   assert.deepEqual(created.map((dir) =>
     JSON.parse(fs.readFileSync(path.join(dir, 'settings.json'), 'utf8')).proxyPort), ports);
   if (defaultBefore?.ok) assert.equal((await ping(8787))?.ok, true,
     'Default existing profile/port must remain healthy');
-  console.log('PROFILE_PORT_SMOKE PASS profiles=2 separate_ports=2 separate_tokens=2 default_untouched=true');
+  console.log('PROFILE_PORT_SMOKE PASS profiles=2 separate_ports=2 no_bridge_tokens=true default_untouched=true');
 } finally {
   for (const child of owned) {
     if (!child.pid || child.exitCode !== null) continue;

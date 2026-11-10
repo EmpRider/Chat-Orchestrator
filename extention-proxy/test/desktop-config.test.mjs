@@ -1,9 +1,6 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import path from 'node:path';
 import { test } from 'node:test';
-import { normalizeNgrokDomain, normalizeNgrokAuthtoken, connectorUrl, ensureDesktopToken, ISOLATED_NGROK_CONFIG, normalizeProxyPort, normalizeProfileName } from '../desktop/config.mjs';
+import { normalizeNgrokDomain, normalizeNgrokAuthtoken, connectorUrl, ISOLATED_NGROK_CONFIG, normalizeProxyPort, normalizeProfileName, PRIVATE_QUEUE_PREFERENCE_SCHEMA, resolvePrivateQueuePreference } from '../desktop/config.mjs';
 
 test('named profiles and per-profile proxy ports validate before filesystem or socket use', () => {
   assert.equal(normalizeProfileName('default'), 'default');
@@ -17,6 +14,19 @@ test('named profiles and per-profile proxy ports validate before filesystem or s
   for (const value of ['', '0', '80', '65536', '8888.5', 'NaN', '-8787', undefined]) {
     assert.throws(() => normalizeProxyPort(value), /port from 1024 to 65535/);
   }
+});
+
+test('private FIFO is on by default, migrates legacy off once, and respects new opt-out', () => {
+  assert.equal(resolvePrivateQueuePreference(), true);
+  assert.equal(resolvePrivateQueuePreference({}), true);
+  assert.equal(resolvePrivateQueuePreference({privateCoordinationOptIn: false}), true);
+  assert.equal(resolvePrivateQueuePreference({privateCoordinationOptIn: true}), true);
+  assert.equal(resolvePrivateQueuePreference({
+    privateQueuePreferenceSchema: PRIVATE_QUEUE_PREFERENCE_SCHEMA, privateCoordinationOptIn: true,
+  }), true);
+  assert.equal(resolvePrivateQueuePreference({
+    privateQueuePreferenceSchema: PRIVATE_QUEUE_PREFERENCE_SCHEMA, privateCoordinationOptIn: false,
+  }), false);
 });
 
 test('isolated ngrok configuration contains no credentials', () => {
@@ -36,10 +46,9 @@ test('ngrok domain accepts only a clean HTTPS origin', () => {
   }
 });
 
-test('connector URL uses the dedicated domain root MCP path and encodes bridge token', () => {
-  assert.equal(connectorUrl('https://example.ngrok.app', 'a+b &?'),
-    'https://example.ngrok.app/mcp?token=a%2Bb+%26%3F');
-  assert.equal(connectorUrl('', 'secret'), '');
+test('connector URL has no proxy-managed credential and Ngrok auth remains separate', () => {
+  assert.equal(connectorUrl('https://example.ngrok.app'), 'https://example.ngrok.app/mcp');
+  assert.equal(connectorUrl(''), '');
 });
 
 test('ngrok authtoken input refuses empty, short, and whitespace-containing values', () => {
@@ -47,24 +56,4 @@ test('ngrok authtoken input refuses empty, short, and whitespace-containing valu
   for (const value of ['', 'abc', 'invalid token', 'foo\nbarbazqux']) {
     assert.throws(() => normalizeNgrokAuthtoken(value));
   }
-});
-
-test('desktop token imports existing token once, then stays stable', () => {
-  const dir = mkdtempSync(path.join(tmpdir(), 'chat-orch-test-'));
-  const legacy = path.join(dir, 'legacy.token');
-  const target = path.join(dir, 'data', 'bridge.token');
-  writeFileSync(legacy, 'legacy-secret\n');
-  assert.equal(ensureDesktopToken(target, legacy), 'legacy-secret');
-  assert.equal(readFileSync(target, 'utf8'), 'legacy-secret');
-  writeFileSync(legacy, 'changed');
-  assert.equal(ensureDesktopToken(target, legacy), 'legacy-secret');
-  assert.equal(existsSync(legacy), true);
-});
-
-test('explicit environment token takes precedence without rewriting stored token', () => {
-  const dir = mkdtempSync(path.join(tmpdir(), 'chat-orch-env-'));
-  const target = path.join(dir, 'bridge.token');
-  writeFileSync(target, 'stored');
-  assert.equal(ensureDesktopToken(target, undefined, 'override'), 'override');
-  assert.equal(readFileSync(target, 'utf8'), 'stored');
 });

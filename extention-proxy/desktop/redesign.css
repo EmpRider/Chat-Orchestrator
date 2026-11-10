@@ -144,8 +144,8 @@ button.icon-button { height: 39px; width: 39px; flex-basis: 39px; }
 .hint { font-size: 10px; color: #8d9eb7; }
 .input-row { flex-wrap: wrap; }
 .ngrok-panel .wide { margin-top: 20px; }
-.coordination-panel, .extension-settings-panel, .pairing-panel { margin: 0 0 14px; padding: 19px; }
-.coordination-panel summary, .extension-settings-panel summary, .pairing-panel summary {
+.coordination-panel, .extension-settings-panel { margin: 0 0 14px; padding: 19px; }
+.coordination-panel summary, .extension-settings-panel summary {
   font-size: 13px; color: #dce8fa; font-weight: 660;
 }
 .coordination-panel .coordination-grid { margin-top: 16px; }

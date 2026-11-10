@@ -1,4 +1,4 @@
-// Offline negative tests: one shared transport connection, independent scoped MCP callers.
+// Offline regression: profile-local task ownership, reusable seats and worker recovery.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -15,9 +15,9 @@ const B = '00000000-0000-4000-8000-000000000002';
 const BROWSER_SESSION = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const MANAGER_A = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 const MANAGER_B = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
-const principalA = { mode: 'scoped', role: 'pm', credentialId: A, callerTabId: 101,
+const principalA = { mode: 'profile', role: 'pm', credentialId: A, callerTabId: 101,
   browserSessionId: BROWSER_SESSION, sessionIncarnationId: MANAGER_A };
-const principalB = { mode: 'scoped', role: 'tl', credentialId: B, callerTabId: 102,
+const principalB = { mode: 'profile', role: 'tl', credentialId: B, callerTabId: 102,
   browserSessionId: BROWSER_SESSION, sessionIncarnationId: MANAGER_B };
 const principalBA = { ...principalA, role: 'ba',
   credentialId: '00000000-0000-4000-8000-000000000003' };
@@ -30,7 +30,7 @@ const tabs = [
 const taskA = { id: 'a-result', tabId: 201, site: 'chatgpt', status: 'done', result: 'A private result', owner: 'credential:' + A, startedAt: Date.now() };
 const taskB = { id: 'b-result', tabId: 202, site: 'chatgpt', status: 'done', result: 'B private result', owner: 'credential:' + B, startedAt: Date.now() };
 
-test('all six Worker Tool operations enforce credential and tab ownership', async () => {
+test('all six Worker Tool operations preserve profile-local tab and task state', async () => {
   const tabById = new Map(tabs.map((tab) => [tab.id, tab]));
   const storage = {
     tasks: { [taskA.id]: taskA, [taskB.id]: taskB },
@@ -43,6 +43,10 @@ test('all six Worker Tool operations enforce credential and tab ownership', asyn
   let managerSubmitCount = 0;
   let submittedBatchText = '';
   let nextWorkerTabId = 301;
+  let managedWindowCount = 0;
+  let nextGroupId = 1;
+  const groups = new Map();
+  const windows = new Map();
   let removedCb, updatedCb;
   const chrome = {
     storage: {
@@ -51,12 +55,40 @@ test('all six Worker Tool operations enforce credential and tab ownership', asyn
       onChanged: { addListener() {} },
     },
     tabs: {
-      query: async () => [...tabById.values()],
-      get: async (id) => tabById.get(id) ?? null,
+      query: async (filter = {}) => [...tabById.values()].filter((tab) =>
+        (filter.windowId == null || tab.windowId === filter.windowId) &&
+        (filter.groupId == null || tab.groupId === filter.groupId)),
+      get: async (id) => {const tab=tabById.get(id);return tab?{...tab,status:'complete'}:null;},
+      create: async ({windowId,url,active}) => {
+        assert.ok(windows.has(windowId),'worker must use a managed window');
+        assert.equal(active,false,'worker must not steal focus');
+        const workerTab = {id:nextWorkerTabId++,url,title:'Managed worker',active,windowId};
+        tabById.set(workerTab.id,workerTab);
+        return workerTab;
+      },
+      update:async(id,{url,active})=>{const tab=tabById.get(id);if(!tab)throw Error('missing worker tab');
+        if(url)tab.url=url;
+        if(active===true){for(const other of tabById.values())if(other.windowId===tab.windowId)other.active=false;tab.active=true;}
+        return tab;},
+      group: async ({tabIds,groupId,createProperties}) => {
+        assert.equal(tabIds.length,1);
+        const tab = tabById.get(tabIds[0]);
+        assert.ok(tab,'only existing worker tabs can be grouped');
+        if (groupId == null) {
+          assert.equal(createProperties?.windowId,undefined,
+            'new group inherits the dedicated window of its worker tab');
+          groupId = nextGroupId++;
+          groups.set(groupId,{id:groupId,windowId:tab.windowId,title:''});
+        } else {
+          assert.equal(groups.get(groupId)?.windowId,tab.windowId);
+        }
+        tab.groupId = groupId;
+        return groupId;
+      },
       sendMessage: async (id, msg) => msg.cmd === 'ping'
-        ? { ok: true, ready: true, state: 'idle' }
+        ? { ok: true, ready: true, state: 'idle', documentReady: true }
         : msg.cmd === 'observe_state'
-        ? { ok: true, state: 'idle' }
+        ? { ok: true, ready: true, state: 'idle' }
         : msg.cmd === 'submit_manager_batch'
           ? (managerSubmitCount++, submittedBatchText = msg.text, { ok: true, submitted: true })
           : { ok: true, transcript: 'transcript for ' + id },
@@ -64,13 +96,29 @@ test('all six Worker Tool operations enforce credential and tab ownership', asyn
       onRemoved: { addListener(fn) { removedCb=fn; } },
       onUpdated: { addListener(fn) { updatedCb=fn; } },
     },
-    windows: { create: async ({ url }) => {
-      const tabId = nextWorkerTabId++;
-      const workerTab = { id: tabId, url, title: 'New independent worker', active: false, windowId: 9 };
-      tabById.set(tabId, workerTab);
-      return { tabs: [workerTab] };
-    } },
-    runtime: { onInstalled: { addListener() {} }, onStartup: { addListener() {} }, onMessage: { addListener() {} } },
+    windows: {
+      update:async(id,patch)=>({...windows.get(id),...patch}),
+      get: async (id) => windows.get(id) ?? null,
+      create: async ({url,focused}) => {
+        assert.equal(focused,false,'managed workspace must not steal focus');
+        managedWindowCount++;
+        const id = 9;
+        const window = {id,type:'normal'};
+        windows.set(id,window);
+        const anchor = {id:9000,url,title:'Chat Orchestrator Workspace',windowId:id,active:true};
+        tabById.set(anchor.id,anchor);
+        return {...window,tabs:[anchor]};
+      },
+    },
+    tabGroups: {
+      get: async (id) => groups.get(id) ?? null,
+      update: async (id,update) => {
+        assert.ok(groups.has(id));
+        Object.assign(groups.get(id),update);
+      },
+    },
+    runtime: {getURL: (relative)=>'chrome-extension://test-extension/'+relative,
+      onInstalled: { addListener() {} }, onStartup: { addListener() {} }, onMessage: { addListener() {} } },
     alarms: { onAlarm: { addListener() {} }, create() {} },
   };
   const ctx = createContext({ chrome, crypto: webcrypto, URL, console, setTimeout, clearTimeout, setInterval, clearInterval });
@@ -89,7 +137,9 @@ test('all six Worker Tool operations enforce credential and tab ownership', asyn
   const composed=composeAgentPrompt(settings,{kind:'task',task:'Investigate one scope'});
   assert.match(buildPrompt({},'Investigate one scope','','any-role',composed),/<task>/);
   assert.doesNotMatch(composed,/Council A|BA Watchdog|@AgentBridge|@Worker Tool/);
-  const withOwner = (p, principal) => ({ ...p, __trustedPrincipal: principal });
+  const withOwner = (p, principal) => ({ ...p, __trustedPrincipal: principal,
+    __rootTabId: principal.callerTabId,
+    __rootIncarnationId:principal.sessionIncarnationId });
 
   const ownTabs = await handleCall('list_tabs', withOwner({}, principalA));
   assert.deepEqual(Array.from(ownTabs, (t) => t.tab_id), [101, 201]);
@@ -106,20 +156,19 @@ test('all six Worker Tool operations enforce credential and tab ownership', asyn
     site: 'chatgpt', task: 'attack', share_context_from: '202',
   }, principalA)), /outside this caller scope/);
 
-  await assert.rejects(handleCall('spawn_worker', withOwner({
-    site: 'chatgpt', role: 'watchdog', task: 'Unauthorized watchdog',
-  }, principalA)), /Only an authenticated BA principal/);
-  await assert.rejects(handleCall('spawn_worker', {
-    site: 'chatgpt', role: 'watchdog', task: 'Legacy watchdog',
-  }), /Only an authenticated BA principal/);
+  assert.doesNotMatch(source, /Only an authenticated BA principal/,
+    'Watchdog is a skill-defined role label, not a built-in proxy permission');
   const parentStart = Date.now();
   const independent = await handleCall('spawn_worker', withOwner({
     site: 'chatgpt', role: 'council_a', task: 'Council stage 1 independent proposal',
     keep_open: true, wait_seconds: 0,
   }, principalA));
   assert.equal(independent.status, 'running', 'parent yields without waiting for worker completion');
-  assert.ok(Date.now() - parentStart < 2500, 'spawn returns promptly after accepted prompt');
+  assert.ok(Date.now() - parentStart < 9000, 'spawn completes after 2.5s load settling and composer stabilization');
   assert.ok(tabById.has(301), 'worker remains open while parent continues');
+  assert.equal(managedWindowCount,1,'first spawn creates exactly one managed window');
+  assert.equal(tabById.get(301).windowId,9);
+  assert.equal(groups.get(tabById.get(301).groupId)?.title,'Chat Orchestrator · Root 101');
   assert.equal((await handleCall('get_result', withOwner({ task_id: independent.task_id }, principalA))).status, 'running');
   await assert.rejects(handleCall('get_result', withOwner({ task_id: independent.task_id }, principalB)), /Unknown task_id/);
   runInContext('finishTask', ctx)(independent.task_id, { status: 'done', result: 'Asynchronous child finished' });
@@ -141,6 +190,9 @@ test('all six Worker Tool operations enforce credential and tab ownership', asyn
   }, principalBA));
   assert.equal(watchdog.status, 'running');
   assert.ok(tabById.has(302));
+  assert.equal(managedWindowCount,1,'second root reuses managed browser window');
+  assert.equal(tabById.get(302).groupId,tabById.get(301).groupId,
+    'two agents under the same root share the root group');
   assert.ok(!Array.from(await handleCall('list_tabs', withOwner({}, principalA)),
     (t) => t.tab_id).includes(302), 'PM cannot access BA Watchdog worker');
   runInContext('finishTask', ctx)(watchdog.task_id, {
@@ -155,8 +207,8 @@ test('all six Worker Tool operations enforce credential and tab ownership', asyn
   }, principalA));
   assert.equal(pmSeat.reused_tab, false);
   assert.equal(pmSeat.status, 'running');
-  assert.ok(storage.roleSeats['credential:' + A + '|pm|epic:15'],
-    'existing scoped seat keys must remain reusable after extension update');
+  assert.ok(storage.roleSeats['credential:' + A + '|101|pm|epic:15'],
+    'scoped seats must be isolated to the parent tab');
   await assert.rejects(handleCall('spawn_worker', withOwner({
     site: 'chatgpt', role: 'pm', role_scope: 'epic:15',
     task: 'Overtaking PM while active', keep_open: true,
@@ -179,6 +231,10 @@ test('all six Worker Tool operations enforce credential and tab ownership', asyn
     task: 'TL major-task stage 1', keep_open: true,
   }, principalB));
   assert.equal(tlSeat.reused_tab, false);
+  assert.equal(managedWindowCount,1,'other independent root must not create a new window');
+  assert.notEqual(tabById.get(tlSeat.tab_id).groupId,tabById.get(pmSeat.tab_id).groupId,
+    'separate roots must have distinct tab groups');
+  assert.equal(groups.size,2,'one tab group per root, not per worker');
   runInContext('finishTask', ctx)(tlSeat.task_id, { status: 'done', result: 'Major-task stage 1' });
   const tlStage2 = await handleCall('spawn_worker', withOwner({
     site: 'chatgpt', role: 'tl', role_scope: 'task:68',
@@ -218,16 +274,17 @@ test('all six Worker Tool operations enforce credential and tab ownership', asyn
   await assert.rejects(handleCall('spawn_worker', withOwner({
     site: 'chatgpt', role: 'pm', role_scope: '\ninvalid', task: 'Malformed seat key',
   }, principalA)), /Invalid role_scope/);
-  await assert.rejects(handleCall('spawn_worker', {
-    site: 'chatgpt', role: 'pm', role_scope: 'epic:15', task: 'No trusted owner',
-  }), /scoped principal/);
+  const sharedSeat = await handleCall('spawn_worker', {
+    site: 'chatgpt', role: 'pm', role_scope: 'epic:15', task: 'Profile default seat',
+  });
+  assert.equal(sharedSeat.status, 'running', 'shared profile can use a reusable seat without pairing');
 
   const self = await handleCall('read_chat', withOwner({}, principalA));
   assert.equal(self.transcript, 'transcript for 101');
   const bResult = await handleCall('get_result', withOwner({ task_id: taskB.id }, principalB));
   assert.equal(bResult.result, 'B private result');
-  await assert.rejects(handleCall('close_worker', withOwner({ tab_id: 201 }, principalA)), /HELD until independent Saga verification/);
-  assert.ok(tabById.has(201), 'even owned scoped worker must stay open before Saga proof');
+  await assert.rejects(handleCall('close_worker', withOwner({ tab_id: 201 }, principalA)), /proxy-verified parent review/);
+  assert.ok(tabById.has(201), 'owned worker must remain open before parent review');
   assert.ok(tabById.has(202), 'cross-owner closure did not happen');
   const batchId = '11111111-1111-4111-8111-111111111111';
   const event = {
@@ -285,24 +342,25 @@ test('all six Worker Tool operations enforce credential and tab ownership', asyn
   ]);
   assert.equal(competing.filter((outcome) => outcome.status === 'fulfilled').length, 1);
   assert.equal(managerSubmitCount, 3, 'concurrent wakes submit only one additional batch');
-  await assert.rejects(handleCall('close_verified_worker', withOwner({
+  await assert.rejects(handleCall('close_reviewed_worker', withOwner({
     tab_id: 201, worker_incarnation_id: storage.workerIncarnations[201],
-    saga_event_id: '77777777-7777-4777-8777-777777777777',
-    saga_verified: false,
-  }, principalA)), /Trusted Saga closure proof/);
-  await assert.rejects(handleCall('close_verified_worker', withOwner({
+    parent_reviewed: false,
+  }, principalA)), /Trusted parent review/);
+  await assert.rejects(handleCall('close_reviewed_worker', withOwner({
     tab_id: 201, worker_incarnation_id: storage.workerIncarnations[202],
-    saga_event_id: '77777777-7777-4777-8777-777777777777',
-    saga_verified: true,
+    parent_reviewed: true,
   }, principalA)), /incarnation mismatch/);
-  const closure = await handleCall('close_verified_worker', withOwner({
+  const closure = await handleCall('close_reviewed_worker', withOwner({
     tab_id: 201, worker_incarnation_id: storage.workerIncarnations[201],
-    saga_event_id: '77777777-7777-4777-8777-777777777777',
-    saga_verified: true,
+    parent_reviewed: true,
   }, principalA));
-  assert.equal(closure.saga_verified, true);
-  assert.equal(tabById.has(201), false, 'verified closure removed only owned worker tab');
-  assert.equal((await handleCall('attest_manager_tab', { tab_id: 101 })).incarnation_id, MANAGER_A);
+  assert.equal(closure.parent_reviewed, true);
+  assert.equal(tabById.has(201), false, 'reviewed closure removed only owned worker tab');
+  assert.equal((await handleCall('attest_profile_manager')).incarnation_id, MANAGER_A);
+  await updatedCb(101,{url:'https://chatgpt.com/c/new-queue-conversation'},tabById.get(101));
+  assert.equal(storage.managerIncarnations[101],MANAGER_A,
+    'same-site manager navigation must not invalidate a queue delivery caller');
+  assert.equal((await handleCall('list_tabs',withOwner({},principalA)))[0]?.tab_id,101);
   // Integration smoke: unexpected child loss retains URL and owner-scoped task,
   // and reopens the original conversation without resuming work automatically.
   storage.tasks[taskB.id].workerIncarnationId = storage.workerIncarnations[202];
@@ -315,11 +373,16 @@ test('all six Worker Tool operations enforce credential and tab ownership', asyn
   assert.equal(recovery.old_tab_id,202);
   assert.equal(recovery.execution_resumed,false);
   assert.equal(recovery.saved_url,'https://chatgpt.com/c/worker-b');
+  assert.equal(managedWindowCount,1,'recovering a lost child reuses managed window');
+  assert.equal(tabById.get(recovery.tab_id).groupId,tabById.get(tlSeat.tab_id).groupId,
+    'recovered child belongs to its original root group');
   assert.ok(tabById.has(recovery.tab_id));
   assert.equal((await handleCall('read_chat',withOwner({tab_id:recovery.tab_id},principalB))).transcript,'transcript for '+recovery.tab_id);
   assert.equal((await handleCall('get_result',withOwner({task_id:taskB.id},principalB))).status,'done');
   assert.equal((await handleCall('reopen_child',withOwner({task_id:taskB.id},principalB))).reused,true);
-  storage.managerIncarnations[101] = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+  await updatedCb(101,{url:'https://claude.ai/new'},tabById.get(101));
+  assert.notEqual(storage.managerIncarnations[101],MANAGER_A,
+    'switching chat providers must rotate the browser-tab incarnation');
   await assert.rejects(handleCall('list_tabs', withOwner({}, principalA)), /incarnation changed/);
   assert.deepEqual(Array.from(await handleCall('list_tabs', withOwner({}, principalB)), (t) => t.tab_id), [102, tlSeat.tab_id, recovery.tab_id]);
   runInContext("browserSessionId = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'", ctx);

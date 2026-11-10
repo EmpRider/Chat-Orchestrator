@@ -17,7 +17,7 @@ const profile = path.join(tempRoot, 'app');
 const edgeProfile = path.join(tempRoot, 'edge');
 fs.mkdirSync(profile);
 fs.mkdirSync(edgeProfile);
-fs.writeFileSync(path.join(profile, 'settings.json'), JSON.stringify({privateCoordinationOptIn:false}));
+fs.writeFileSync(path.join(profile, 'settings.json'), JSON.stringify({privateQueuePreferenceSchema:1,privateCoordinationOptIn:false}));
 const edgeExe = 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe';
 const extensionDir = path.resolve(root, '..', 'extention');
 for (const target of [profile, electronExe, edgeExe, extensionDir]) {
@@ -83,6 +83,7 @@ async function invokeTrustedDesktop(target, expression) {
   } finally { ws.close(); }
 }
 let electron;
+let desktopTarget;
 let testEdgeStarted = false;
 try {
   for (const port of [8899, 9339, 9341]) {
@@ -98,7 +99,6 @@ try {
   electron.stderr.on('data', (data) => {
     electronError = (electronError + String(data)).slice(-2000);
   });
-  let desktopTarget;
   await waitFor(async () => {
     if (electron.exitCode !== null) throw new Error('Electron exited: ' + electronError);
     try {
@@ -168,6 +168,17 @@ try {
     }
   }
   if (electron?.pid && electron.exitCode === null) {
+    if (desktopTarget?.webSocketDebuggerUrl) {
+      try {
+        // Gracefully release the test journal owner lock before killing this
+        // disposable Electron process. Never touch the production instance.
+        await invokeTrustedDesktop(desktopTarget,'window.bridge.stop().then(()=>true)');
+      } catch (error) {
+        safeToRemove = false;
+        process.stderr.write('Isolated proxy graceful shutdown needs inspection: '
+          + error.message + '\n');
+      }
+    }
     const stopped = spawnSync('taskkill.exe', ['/PID', String(electron.pid), '/T', '/F'],
       { windowsHide: true, timeout: 7000, stdio: 'ignore' });
     if (stopped.status !== 0) {

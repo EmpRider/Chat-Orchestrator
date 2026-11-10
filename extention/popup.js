@@ -5,22 +5,18 @@ async function refresh(fillFields = false) {
     const state = await chrome.runtime.sendMessage({ type: 'popup_status' });
     const connected = state.wsState === 'connected';
     const synced = connected && Boolean(state.settingsSynced);
-    $('status').textContent = synced ? 'Connected · Settings synchronized'
-      : connected ? 'Connected · Credential needs attention'
-      : 'Disconnected · Check local proxy';
-    $('status').className = 'status ' + (synced ? 'ok' : 'bad');
+    $('status').textContent = synced ? 'Connected - Settings synchronized'
+      : connected ? 'Connected - Synchronizing settings'
+      : 'Disconnected - Check local proxy';
+    $('status').className = 'status ' + (connected ? 'ok' : 'bad');
     $('next-step').textContent = synced
-      ? 'Your browser extension is ready. Continue from the Orchestrator desktop or ChatGPT.'
-      : connected
-        ? 'Open Connections in the desktop app, copy the extension-only credential, paste it below, then Save and reconnect.'
-        : 'Start the Orchestrator desktop proxy, confirm its local port, then Save and reconnect here.';
+      ? 'Ready. Continue from the Orchestrator desktop or ChatGPT.'
+      : connected ? 'Waiting for settings from the desktop proxy.'
+      : 'Start the desktop proxy, confirm its port, then Save and reconnect.';
     $('info').textContent = 'Workers: ' + state.workers.length +
       ' · Running: ' + state.running +
       ' · Queue: ' + (state.coordinationMode || 'unknown');
-    if (fillFields) {
-      $('serverUrl').value = state.cfg.serverUrl;
-      $('token').value = state.cfg.token;
-    }
+    if (fillFields) $('serverUrl').value = state.cfg.serverUrl;
   } catch (error) {
     $('status').textContent = 'Extension background unavailable';
     $('status').className = 'status bad';
@@ -31,30 +27,29 @@ async function refresh(fillFields = false) {
 $('save').addEventListener('click', async () => {
   const button = $('save');
   const url = $('serverUrl').value.trim();
-  const token = $('token').value.trim();
   let validUrl = false;
   try {
     const parsed = new URL(url);
     validUrl = (parsed.protocol === 'ws:' || parsed.protocol === 'wss:') &&
       parsed.pathname === '/bridge' && !parsed.username && !parsed.password;
   } catch {}
-  if (!validUrl || !token || token.length > 256) {
-    $('status').textContent = 'Connection details are incomplete';
+  if (!validUrl) {
+    $('status').textContent = 'Enter a valid WebSocket URL';
     $('status').className = 'status bad';
-    $('next-step').textContent = 'Enter a valid local WebSocket URL and the extension-only credential copied from the desktop app.';
+    $('next-step').textContent = 'Use the WebSocket URL from the desktop Connections page.';
     return;
   }
   button.disabled = true;
   button.textContent = 'Reconnecting…';
   try {
-    await chrome.storage.local.set({ serverUrl: url, token });
+    await chrome.storage.local.set({ serverUrl: url });
     await chrome.runtime.sendMessage({ type: 'reconnect' });
     await new Promise((resolve) => setTimeout(resolve, 700));
     await refresh(false);
   } catch {
     $('status').textContent = 'Could not reconnect';
     $('status').className = 'status bad';
-    $('next-step').textContent = 'Confirm the proxy is running and the extension-only credential belongs to the same desktop profile.';
+    $('next-step').textContent = 'Confirm the desktop proxy is running at this URL.';
   } finally {
     button.disabled = false;
     button.textContent = 'Save and reconnect';

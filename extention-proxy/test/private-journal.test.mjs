@@ -164,3 +164,75 @@ test('desktop readiness is fresh, authenticated and fail-closed across disconnec
   assert.equal(journal.privateReadinessState({ ...base, registered: false }), 'not_registered');
   assert.equal(journal.privateReadinessState({ ...base, revoked: true }), 'revoked');
 });
+
+test('explicit incarnation reconciliation preserves old FIFO events without auto-ACK or replay', () => {
+  const oldResult = queued(1, 'CHILD_RESULT');
+  const newer = { ...recipient, incarnationId: randomUUID() };
+  const currentStatus = { ...queued(3, 'STATUS_REQUEST', newer),
+    source: newer, recipient: newer };
+  assert.throws(() => journal.reducePrivateQueueEvents([oldResult,
+    {...currentStatus, seq:2}]), /requires reconciliation/);
+
+  const oldState = journal.reducePrivateQueueEvents([oldResult]);
+  const snapshot = journal.privateRecipientPredecessors(oldState, newer,
+    journal.privateScopeKey(owner));
+  const reconciliationId = randomUUID();
+  const reconciled = {
+    version: 4, seq: 2, id: reconciliationId, idempotencyKey: randomUUID(),
+    kind: 'recipient.reconcile', ownerScope: owner, source: newer, recipient: newer,
+    ref: reconciliationId, recordedAt: new Date().toISOString(),
+    payload: {
+      phase: 'QUARANTINE_PREDECESSORS', snapshotSha256: snapshot.snapshotSha256,
+      priorKeys: [snapshot.older[0].recipientKey],
+      confirmation: 'QUARANTINE_UNPROCESSED_EVENTS',
+      reason: 'Operator reviewed the historical generation and retained its unprocessed events.',
+    },
+  };
+  const reduced = journal.reducePrivateQueueEvents([oldResult,reconciled,currentStatus]);
+  assert.deepEqual(reduced.fifo.map(k => reduced.byRef.get(k).phase),
+    ['QUEUED','QUEUED']);
+  assert.ok(reduced.quarantinedRecipients.size === 1);
+  assert.equal(journal.privateQueueDiagnosticCounts(reduced).pending,2,
+    'unresolved historical results must still count as pending');
+  const encoded = Buffer.concat([oldResult,reconciled,currentStatus].map(journal.privateJournalFrame));
+  const decoded = journal.replayPrivateJournal(encoded);
+  assert.equal(decoded.tail,null);
+  const recovered = journal.reducePrivateQueueEvents(decoded.events,true);
+  assert.equal(recovered.byRef.size,2);
+  assert.equal(recovered.quarantinedRecipients.size,1);
+  assert.throws(() => journal.reducePrivateQueueEvents([oldResult,{
+    ...reconciled, payload: {...reconciled.payload, snapshotSha256:'0'.repeat(64)},
+  },currentStatus]), /snapshot changed/);
+});
+
+test('incarnation reconciliation snapshot survives restart classification of ambiguous delivery', () => {
+  const initial = queued(1,'CHILD_RESULT');
+  const lease = transition(2,initial,'LEASED');
+  const dispatching = transition(3,initial,'DISPATCHING',1,lease.payload.leaseNonce);
+  const delivered = transition(4,initial,'DELIVERED',1,lease.payload.leaseNonce);
+  const history = [initial,lease,dispatching,delivered];
+  const newer = {...recipient,incarnationId:randomUUID()};
+  const recovered = journal.reducePrivateQueueEvents(history,true);
+  const snapshot=journal.privateRecipientPredecessors(recovered,newer,
+    journal.privateScopeKey(owner));
+  assert.equal(snapshot.older[0].phase,'UNCERTAIN');
+  const id=randomUUID();
+  const marker={
+    version:4,seq:5,id,idempotencyKey:randomUUID(),kind:'recipient.reconcile',
+    ownerScope:owner,source:newer,recipient:newer,ref:id,
+    recordedAt:new Date().toISOString(),
+    payload:{
+      phase:'QUARANTINE_PREDECESSORS',snapshotSha256:snapshot.snapshotSha256,
+      priorKeys:[snapshot.older[0].recipientKey],
+      confirmation:'QUARANTINE_UNPROCESSED_EVENTS',
+      reason:'Operator isolated an unverified delivery without claiming successful processing.',
+    },
+  };
+  const bytes=Buffer.concat([...history,marker].map(journal.privateJournalFrame));
+  const replay=journal.replayPrivateJournal(bytes);
+  assert.equal(replay.tail,null);
+  const after=journal.reducePrivateQueueEvents(replay.events,true);
+  assert.equal(after.byRef.get(after.fifo[0]).phase,'UNCERTAIN');
+  assert.equal(after.quarantinedRecipients.size,1);
+  assert.equal(journal.privateQueueDiagnosticCounts(after).pending,1);
+});

@@ -12,18 +12,66 @@ const TAB_PATTERNS = [
   'https://gemini.google.com/*',
 ];
 
-// Connection details stay in the extension. All behavior and prompts arrive only
-// from a WebSocket authenticated using the desktop's extension-only credential.
-const DEFAULTS = { serverUrl: 'ws://localhost:8787/bridge', token: '', orchestratorTabId: null };
+// The extension needs only the local proxy WebSocket URL.
+const DEFAULTS = { serverUrl: 'ws://localhost:8787/bridge', orchestratorTabId: null };
 let proxySettings = null;
 let proxySettingsRevision = 0;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// A page can keep heartbeats, analytics and streaming requests open forever.
+// Readiness depends on browser document completion, a short settling interval,
+// and the provider composer's independent readiness/ownership checks.
+const pageSettling = (() => {
+  const SETTLE_MS = 2500;
+  const loaded = new Map(); // tab ID -> completion time + URL; in-memory only
+
+  function complete(tabId, tab) {
+    if (tab?.status !== 'complete' || !siteOfUrl(tab.url)) return;
+    const previous = loaded.get(tabId);
+    if (!previous || previous.url !== tab.url) {
+      loaded.set(tabId, {url:tab.url,at:Date.now()});
+    }
+  }
+  function onUpdated(tabId, changeInfo, tab) {
+    if (changeInfo?.status === 'loading') loaded.delete(tabId);
+    if (changeInfo?.status === 'complete') complete(tabId,tab);
+  }
+  async function snapshot(tabId) {
+    const tab=await chrome.tabs.get(tabId).catch(()=>null);
+    const documentComplete=tab?.status==='complete' && !!siteOfUrl(tab?.url);
+    if (!documentComplete) {
+      loaded.delete(tabId);
+      return {ready:false,documentComplete:false,settledMs:0,remainingMs:SETTLE_MS};
+    }
+    // On service-worker restart the original load event may be gone.
+    // Begin a fresh settling interval rather than trusting stale readiness.
+    complete(tabId,tab);
+    const settledMs=Math.max(0,Date.now()-loaded.get(tabId).at);
+    return {ready:settledMs>=SETTLE_MS,documentComplete:true,
+      settledMs,remainingMs:Math.max(0,SETTLE_MS-settledMs)};
+  }
+  async function waitForReady(tabId, timeoutMs=45000) {
+    const deadline=Date.now()+timeoutMs;
+    let last;
+    do {
+      last=await snapshot(tabId);
+      if(last.ready) return last;
+      await sleep(Math.min(200,Math.max(1,deadline-Date.now())));
+    } while(Date.now()<deadline);
+    throw new Error('Browser page did not settle after load for tab '+tabId+
+      ': documentComplete='+last?.documentComplete+
+      ', remainingMs='+last?.remainingMs);
+  }
+  function forget(tabId) {loaded.delete(tabId);}
+  return {snapshot,waitForReady,onUpdated,forget};
+})();
+
 const getConfig = async () => ({
   ...DEFAULTS,
   ...(await chrome.storage.local.get(Object.keys(DEFAULTS))),
   ...(proxySettings || {enabled: false, maxWorkers: 0, maxTasksPerHour: 0, taskTimeoutMin: 0,
     promptSchema: 2, promptModules: {}}),
-  autoCloseWorkers: false, // Forced until independently verified Saga closure.
+  autoCloseWorkers: false, // Parent must explicitly review and close workers.
 });
 function acceptProxySettings(msg) {
   if (msg.schema !== 1 || !Number.isSafeInteger(msg.revision) || msg.revision <= 0 ||
@@ -55,20 +103,51 @@ function siteOfUrl(url = '') {
 let tasks = {}; // taskId -> task
 let workers = []; // tab ids opened by spawn_worker
 let taskLog = []; // timestamps, for rate limiting
-let workerOwners = {}; // worker tab id -> authenticated credential scope; legacy is isolated
+let workerOwners = {}; // worker tab id -> local profile ownership; legacy tasks remain separate
 let workerIncarnations = {}; // tab id -> UUID assigned at creation, never inferred from reused tab IDs
 let workerUrls = {}; // last known supported chat URL
 let lostWorkers = {}; // original task ID -> recoverable, owner-bound closed conversation
 const intentionalClosures = new Set();
-let roleSeats = {}; // scoped caller + role + Saga reference -> one reusable tab
+let roleSeats = {}; // profile + reusable seat label -> one reusable tab
 const roleSeatReservations = new Set(); // serialize simultaneous same-seat startup
 let managerWakes = {}; // batch UUID -> one-shot manager submission ledger (session only)
 let browserSessionId = null; // chrome.storage.session resets after browser restart
 let managerIncarnations = {}; // tab id -> attested UUID in this browser session
+let managerSites = {}; // tab id -> last attested provider; never store URLs
+let workspaceWindow = null; // {windowId, anchorTabId, browserSessionId}; never an owner key
+let workspaceGroups = {}; // root tab+incarnation -> {groupId, windowId, rootTabId, rootIncarnationId}
+let workspaceSerial = Promise.resolve(); // serializes concurrent managed-window/group creation
 const waiters = {}; // taskId -> [resolve]
 
+// Privacy-preserving extension diagnostics: schema is intentionally small.
+// Never serialize a prompt, response, URL, token, error.message or full tab.
+const DIAG_FIELDS = new Set(['tabId','rootTabId','parentTabId','windowId','groupId',
+  'expectedWindowId','actualWindowId','expectedGroupId','actualGroupId',
+  'requestId','batchId','taskId','method','phase','site','reason','attempt',
+  'count','batchSize','success','reused','connected','build']);
+function extensionDiagnostic(level,event,fields={}) {
+  try {
+    if (!['debug','info','warn','error'].includes(level) ||
+        !/^[a-z][a-z0-9_.-]{0,79}$/.test(event)) return;
+    const data={};
+    for(const [key,value] of Object.entries(fields)) {
+      if (!DIAG_FIELDS.has(key)) continue;
+      if (typeof value==='boolean' ||
+          (typeof value==='number' && Number.isSafeInteger(value) && value>=0) ||
+          (typeof value==='string' && (
+            ['requestId','batchId','taskId'].includes(key)
+              ? /^[0-9a-f-]{36}$/i.test(value)
+              : /^[a-zA-Z][a-zA-Z0-9_.:-]{0,95}$/.test(value)
+          ))) data[key]=value;
+    }
+    if (level !== 'debug') console[level]('[chat-orch]',JSON.stringify({event,...data}));
+    if (typeof ws !== 'undefined' && ws?.readyState===WebSocket.OPEN)
+      ws.send(JSON.stringify({type:'diagnostic_event',level,event,data}));
+  } catch { /* Diagnostics are never a worker or queue dependency. */ }
+}
+
 const stateReady = (async () => {
-  const s = await chrome.storage.session.get(['tasks', 'workers', 'taskLog', 'workerOwners', 'workerIncarnations', 'roleSeats', 'managerWakes', 'browserSessionId', 'managerIncarnations', 'workerUrls', 'lostWorkers']);
+  const s = await chrome.storage.session.get(['tasks', 'workers', 'taskLog', 'workerOwners', 'workerIncarnations', 'roleSeats', 'managerWakes', 'browserSessionId', 'managerIncarnations', 'managerSites', 'workerUrls', 'lostWorkers','workspaceWindow','workspaceGroups']);
   tasks = s.tasks || {};
   workers = s.workers || [];
   taskLog = s.taskLog || [];
@@ -81,17 +160,22 @@ const stateReady = (async () => {
   browserSessionId = /^[0-9a-f-]{36}$/i.test(s.browserSessionId || '')
     ? s.browserSessionId : crypto.randomUUID();
   managerIncarnations = s.managerIncarnations || {};
-  await chrome.storage.session.set({ browserSessionId, managerIncarnations });
+  managerSites = s.managerSites || {};
+  workspaceWindow = s.workspaceWindow?.browserSessionId === browserSessionId ? s.workspaceWindow : null;
+  workspaceGroups = workspaceWindow && s.workspaceGroups && typeof s.workspaceGroups === 'object'
+    ? s.workspaceGroups : {};
+  await chrome.storage.session.set({ browserSessionId, managerIncarnations, managerSites });
 })();
 
-const saveState = () => chrome.storage.session.set({ tasks, workers, taskLog, workerOwners, workerIncarnations, workerUrls, lostWorkers, roleSeats, managerWakes, browserSessionId, managerIncarnations });
+const saveState = () => chrome.storage.session.set({ tasks, workers, taskLog, workerOwners, workerIncarnations, workerUrls, lostWorkers, roleSeats, managerWakes, browserSessionId, managerIncarnations,managerSites,workspaceWindow,workspaceGroups });
 
 function callerOwner(p = {}) {
   const principal = p.__trustedPrincipal;
   if (!principal || principal.mode === 'legacy') return 'legacy';
-  if (principal.mode !== 'scoped' || !/^[0-9a-f-]{36}$/i.test(principal.credentialId) ||
+  if (principal.mode !== 'profile' ||
+      !/^[0-9a-f-]{36}$/i.test(principal.credentialId) ||
       !Number.isSafeInteger(principal.callerTabId) || principal.callerTabId <= 0) {
-    throw new Error('Unverified scoped caller');
+    throw new Error('Invalid profile caller context');
   }
   return `credential:${principal.credentialId}`;
 }
@@ -100,8 +184,7 @@ function ownedWorker(tabId, owner) {
   return workers.includes(tabId) && (workerOwners[tabId] || 'legacy') === owner;
 }
 
-// A reusable seat is an opaque label owned by one authenticated caller.
-// Skills define roles and task hierarchy; the proxy must not hardcode PM/TL/Council policy.
+// Reusable seats are profile-local labels. Skills define roles and hierarchy.
 function reusableSeatLabel(value, field) {
   if (typeof value !== 'string' || !value.trim() || value.length > 128 ||
       /[\u0000-\u001f\u007f|]/.test(value)) {
@@ -111,11 +194,11 @@ function reusableSeatLabel(value, field) {
 }
 function roleSeatKey(p, owner) {
   if (p.role_scope == null) return null;
-  if (owner === 'legacy') throw new Error('Reusable seat requires a scoped principal');
   const role = reusableSeatLabel(p.role, 'role');
   const scope = reusableSeatLabel(p.role_scope, 'role_scope');
-  // Preserve existing role|scope seat keys across extension updates.
-  return owner + '|' + role + '|' + scope;
+  // Keep pre-existing legacy seats stable. Profile seats are parent-scoped.
+  if (owner === 'legacy') return owner + '|' + role + '|' + scope;
+  return owner + '|' + p.__trustedPrincipal.callerTabId + '|' + role + '|' + scope;
 }
 
 function clearRoleSeatsForTab(tabId) {
@@ -128,12 +211,45 @@ async function callerManagerTab(p, cfg) {
   const principal = p.__trustedPrincipal;
   if (!principal || principal.mode === 'legacy') return cfg.orchestratorTabId;
   const tab = await chrome.tabs.get(principal.callerTabId).catch(() => null);
-  if (!tab || !siteOfUrl(tab.url)) throw new Error('Paired manager tab unavailable; re-pair this caller');
+  if (!tab || !siteOfUrl(tab.url)) throw new Error('Manager tab unavailable; select a supported chat tab');
   if (principal.browserSessionId !== browserSessionId ||
-      principal.sessionIncarnationId !== managerIncarnations[tab.id]) {
-    throw new Error('Paired manager browser/tab incarnation changed; re-pair required');
+      principal.sessionIncarnationId !== (workerIncarnations[tab.id] || managerIncarnations[tab.id])) {
+    throw new Error('Manager browser/tab incarnation changed; register again');
   }
   return tab.id;
+}
+
+async function inspectChatTab(tabId) {
+  if (!Number.isSafeInteger(tabId) || tabId <= 0) throw new Error('Invalid browser tab ID');
+  let tab = await chrome.tabs.get(tabId).catch(() => null);
+  let site = siteOfUrl(tab?.url);
+  // Newly created background tabs can report about:blank before navigation
+  // commits. A short bounded wait is safe only for workers we just created;
+  // never reclassify an arbitrary caller root using a pending URL.
+  if (tab && !site && workers.includes(tabId)) {
+    for (let attempt = 0; attempt < 25 && !site; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      tab = await chrome.tabs.get(tabId).catch(() => null);
+      site = siteOfUrl(tab?.url);
+      if (!tab) break;
+    }
+  }
+  if (!tab || !site) throw new Error('Browser tab is unavailable or is not a supported chat');
+  let incarnation = workerIncarnations[tabId] || managerIncarnations[tabId];
+  if (!workers.includes(tabId) && managerSites[tabId] && managerSites[tabId] !== site) {
+    incarnation = managerIncarnations[tabId] = crypto.randomUUID();
+    extensionDiagnostic('warn','identity.incarnation_rotated',{tabId,reason:'provider_changed'});
+  }
+  if (!incarnation) incarnation = managerIncarnations[tabId] = crypto.randomUUID();
+  if (!workers.includes(tabId) && managerSites[tabId] !== site) {
+    managerSites[tabId] = site;
+    await saveState();
+  } else if (managerIncarnations[tabId] === incarnation && !managerSites[tabId]) {
+    managerSites[tabId]=site;
+    await saveState();
+  }
+  return {tab_id:tabId, site, browser_session_id:browserSessionId,
+    incarnation_id:incarnation, is_managed_worker:workers.includes(tabId)};
 }
 
 function requireOwnedTab(tabId, managerTabId, owner) {
@@ -153,21 +269,22 @@ function summarize(t) {
   };
   if (t.status === 'done') out.result = t.result;
   if (t.status === 'done' && t.autoClose) {
-    out.note = 'Automatic closure is held pending Saga verification. The worker tab remains open for authorized review and follow-ups.';
+    out.note = 'Automatic closure is disabled. The worker stays open for parent review and fixing tasks.';
   } else if (t.status === 'done') {
     out.note = `Worker window is still open (tab_id ${t.tabId}). You can send a follow-up with send_to_tab; when you no longer need this worker, call close_worker with tab_id ${t.tabId}.`;
   }
   if (t.status === 'failed') {
     out.note = `Worker window left open for inspection (tab_id ${t.tabId}). Call close_worker with this tab_id when done.`;
   }
-  if (t.status === 'failed') out.error = t.error;
+  if (t.status === 'failed' || t.status === 'uncertain') out.error = t.error;
+  if (t.status === 'uncertain') out.note = 'Submission outcome uncertain. Inspect the tab; never blindly replay.';
   if (t.status === 'running') out.note = 'Still running. Call get_result again with wait_seconds.';
   return out;
 }
 
 function finishTask(id, patch) {
   const t = tasks[id];
-  if (!t || t.status !== 'running') return;
+  if (!t || !['running', 'uncertain'].includes(t.status)) return;
   Object.assign(t, patch, { finishedAt: Date.now() });
   saveState();
   (waiters[id] || []).forEach((r) => r());
@@ -187,7 +304,7 @@ function waitTask(id, ms) {
 async function guard({ newWorker = false } = {}) {
   await stateReady;
   const cfg = await getConfig();
-  if (!proxySettings) throw new Error('Proxy settings not synchronized. Connect with the desktop extension-only token.');
+  if (!proxySettings) throw new Error('Proxy settings not synchronized. Connect to the running desktop proxy.');
   if (!cfg.enabled) throw new Error('Automation is disabled in the proxy Settings panel.');
 
   const hourAgo = Date.now() - 3600 * 1000;
@@ -212,15 +329,207 @@ async function guard({ newWorker = false } = {}) {
 }
 
 // ------------------------------------------------------------------ tabs
+function serializeWorkspace(operation) {
+  const next = workspaceSerial.then(operation);
+  workspaceSerial = next.catch(() => {});
+  return next;
+}
+
+async function workspaceRoot(p, fallbackTabId) {
+  const principal = p.__trustedPrincipal;
+  const tabId = principal?.mode === 'profile' ? p.__rootTabId : fallbackTabId;
+  const incarnation = principal?.mode === 'profile'
+    ? p.__rootIncarnationId : managerIncarnations[fallbackTabId];
+  if (!Number.isSafeInteger(tabId) || tabId <= 0 ||
+      (principal?.mode === 'profile' &&
+        !/^[0-9a-f-]{36}$/i.test(incarnation || ''))) {
+    throw new Error('Root orchestrator identity is unavailable; do not create an ungrouped worker');
+  }
+  if (principal?.mode === 'profile') {
+    const live = await inspectChatTab(tabId);
+    if (live.incarnation_id !== incarnation || live.browser_session_id !== principal.browserSessionId)
+      throw new Error('Root orchestrator session/incarnation changed; reconcile before grouping');
+  }
+  return {tabId,incarnation:incarnation || 'legacy'};
+}
+
+async function getManagedWorkspaceWindow() {
+  const anchorUrl = chrome.runtime.getURL('workspace.html');
+  if (workspaceWindow) {
+    const {windowId,anchorTabId,browserSessionId:session} = workspaceWindow;
+    const [window,tab] = await Promise.all([
+      chrome.windows.get(windowId).catch(() => null),
+      chrome.tabs.get(anchorTabId).catch(() => null),
+    ]);
+    if (session === browserSessionId && window?.type === 'normal' &&
+        tab?.windowId === windowId &&
+        (tab.url === anchorUrl || tab.pendingUrl === anchorUrl)) return windowId;
+    extensionDiagnostic('warn','workspace.anchor_changed',{windowId,tabId:anchorTabId});
+    // Never adopt an arbitrary window or a recycled numeric ID.
+    workspaceWindow = null;
+    workspaceGroups = {};
+    await saveState();
+  }
+  const window = await chrome.windows.create({
+    url:anchorUrl, type:'normal', focused:false, width:1200,height:850,
+  });
+  const anchor = window?.tabs?.[0];
+  if (!Number.isSafeInteger(window?.id) || !Number.isSafeInteger(anchor?.id))
+    throw new Error('Managed browser workspace window was not created correctly');
+  workspaceWindow = {windowId:window.id,anchorTabId:anchor.id,browserSessionId};
+  extensionDiagnostic('info','workspace.window_created',{windowId:window.id,tabId:anchor.id});
+  workspaceGroups = {};
+  await saveState();
+  return window.id;
+}
+
+async function createManagedWorkerTab(url, p, fallbackTabId) {
+  return serializeWorkspace(async () => {
+    const root = await workspaceRoot(p,fallbackTabId);
+    const windowId = await getManagedWorkspaceWindow();
+    extensionDiagnostic('info','worker.placement_started',{rootTabId:root.tabId,windowId});
+    const key = root.tabId + ':' + root.incarnation;
+    const title = 'Chat Orchestrator · Root ' + root.tabId;
+    let groupId = null;
+    let groupIsNew = false;
+    const saved = workspaceGroups[key];
+    if (saved && saved.windowId === windowId &&
+        saved.rootTabId === root.tabId && saved.rootIncarnationId === root.incarnation) {
+      const group = await chrome.tabGroups.get(saved.groupId).catch(() => null);
+      const members = group?.windowId === windowId
+        ? await chrome.tabs.query({windowId,groupId:saved.groupId}).catch(() => []) : [];
+      if (group?.windowId === windowId && group.title === title &&
+          members.some((tab)=>workers.includes(tab.id) &&
+            tab.windowId === windowId && tab.groupId === saved.groupId)) {
+        groupId = saved.groupId;
+      } else {
+        delete workspaceGroups[key];
+        await saveState();
+      }
+    }
+    // Create the provider tab directly. Readiness is based on load completion
+    // and a short settling delay; no debugger attachment is needed.
+    const tab = await chrome.tabs.create({windowId,url,active:false});
+    extensionDiagnostic('debug','worker.tab_created',{tabId:tab?.id,windowId:tab?.windowId});
+    if (!Number.isSafeInteger(tab?.id) || tab.windowId !== windowId)
+      throw new Error('Managed worker tab was not created in the expected window');
+    let placementStage = 'group_create';
+    try {
+      if (groupId === null) {
+        // The tab is ALREADY created in the dedicated window. Passing
+        // createProperties.windowId causes Edge to occasionally reparent the
+        // group to another normal window while the operation is settling.
+        groupId = await chrome.tabs.group({tabIds:[tab.id]});
+        groupIsNew = true;
+        // Edge may return the new group ID before tabGroups.get/update can
+        // observe the group. Wait briefly instead of failing in <100ms.
+        let groupVisible = false;
+        for (let attempt = 0; attempt < 12; attempt++) {
+          if (await chrome.tabGroups.get(groupId).catch(() => null)) {
+            groupVisible = true;
+            break;
+          }
+          await sleep(80);
+        }
+        if (!groupVisible)
+          throw new Error('New browser tab group is not visible after confirmation window');
+        placementStage = 'group_update';
+        const colors = ['blue','green','purple','cyan','yellow','orange','pink'];
+        await chrome.tabGroups.update(groupId,{
+          title,color:colors[root.tabId % colors.length],collapsed:false,
+        });
+      } else {
+        placementStage = 'group_join';
+        await chrome.tabs.group({tabIds:[tab.id],groupId});
+      }
+      placementStage = 'group_confirm';
+      // On Edge, group creation can associate the newly created group with
+      // another normal window even when createProperties.windowId was set.
+      // Only move a group that is made entirely of our known worker tabs (or
+      // this one just-created tab), never a user's unrelated tab group.
+      // Edge can report stale group membership immediately after tabs.group.
+      // Recheck BOTH actual tab and group, and only repair our own new group.
+      let grouped;
+      let confirmed = false;
+      for (let attempt = 0; attempt < 30; attempt++) {
+        grouped = await chrome.tabs.get(tab.id).catch(() => null);
+        const observedGroup = await chrome.tabGroups.get(groupId).catch(() => null);
+        if (grouped?.windowId === windowId && grouped.groupId === groupId &&
+            observedGroup?.windowId === windowId) {
+          confirmed = true;
+          break;
+        }
+        if (!grouped) throw new Error('Fresh worker tab disappeared during group assignment');
+        if (observedGroup && observedGroup.windowId !== windowId) {
+          const members = await chrome.tabs.query({groupId}).catch(() => []);
+          const entirelyOwned = members.length > 0 &&
+            members.some((member) => member.id === tab.id) &&
+            members.every((member) => member.id === tab.id || workers.includes(member.id));
+          if (!entirelyOwned) throw new Error('Refusing to move group containing unrelated tabs');
+          extensionDiagnostic('warn','worker.group_window_mismatch',{
+            tabId:tab.id,groupId,expectedWindowId:windowId,
+            actualWindowId:observedGroup.windowId});
+          await chrome.tabGroups.move(groupId,{windowId,index:-1});
+        } else if (grouped.windowId === windowId && grouped.groupId !== groupId &&
+                   attempt >= 5 && attempt % 5 === 0) {
+          // A bounded idempotent re-group is safer than opening more tabs.
+          // Never group a tab belonging to an unrelated existing group.
+          if (grouped.groupId !== -1)
+            throw new Error('Worker was assigned to a different tab group');
+          await chrome.tabs.group({tabIds:[tab.id],groupId});
+        }
+        await new Promise((resolve) => setTimeout(resolve, 120));
+      }
+      if (!confirmed)
+      {
+        extensionDiagnostic('error','worker.group_unconfirmed',{
+          tabId:tab.id,expectedWindowId:windowId,expectedGroupId:groupId,
+          actualWindowId:grouped?.windowId,actualGroupId:grouped?.groupId});
+        throw new Error('Worker grouping remained unconfirmed after bounded retry'
+          + ' (expected window/group ' + windowId + '/' + groupId
+          + ', observed ' + (grouped?.windowId ?? 'missing') + '/'
+          + (grouped?.groupId ?? 'missing') + ')');
+      }
+      if (groupIsNew) {
+        workspaceGroups[key] = {groupId,windowId,rootTabId:root.tabId,
+          rootIncarnationId:root.incarnation};
+        await saveState();
+      }
+      extensionDiagnostic('info','worker.placement_confirmed',{
+        tabId:tab.id,rootTabId:root.tabId,windowId,groupId,success:true});
+      return grouped;
+    } catch (error) {
+      extensionDiagnostic('error','worker.placement_failed',{tabId:tab.id,
+        windowId,groupId,reason:placementStage});
+      // A failed newly-created group must never be cached and reused. Its
+      // numeric ID may already have disappeared or be recycled by Edge.
+      if (groupIsNew) {
+        delete workspaceGroups[key];
+        await saveState().catch(() => {});
+      }
+      // Only this fresh, unstarted tab is safe to roll back.
+      await chrome.tabs.remove(tab.id).catch(() => {});
+      throw new Error('Could not place worker in its root tab group'
+        + ' (stage: ' + placementStage + '): ' + error.message);
+    }
+  });
+}
+
 async function listTabs(p = {}) {
   await stateReady;
   const cfg = await getConfig();
   const owner = callerOwner(p);
-  const managerTabId = await callerManagerTab(p, cfg);
   const tabs = await chrome.tabs.query({ url: TAB_PATTERNS });
+  if (p.__discoveryOnly === true) {
+    return tabs.map((t) => ({tab_id:t.id,site:siteOfUrl(t.url),
+      role:workers.includes(t.id)?'worker':'unregistered',active:t.active}));
+  }
+  const managerTabId = await callerManagerTab(p, cfg);
   return tabs.filter((t) => t.id === managerTabId || ownedWorker(t.id, owner)).map((t) => ({
     tab_id: t.id,
     window_id: t.windowId,
+    group_id: t.groupId ?? null,
+    group_assigned: Number.isSafeInteger(t.groupId) && t.groupId >= 0,
     site: siteOfUrl(t.url),
     title: t.title,
     url: t.url,
@@ -322,17 +631,41 @@ async function tabMessage(tabId, msg) {
   );
 }
 
-async function waitReady(tabId, timeoutMs = 45000) {
-  const end = Date.now() + timeoutMs;
-  while (Date.now() < end) {
+async function waitReady(tabId, expectedText, timeoutMs = 45000) {
+  const deadline = Date.now() + timeoutMs;
+  let stableSince = null;
+  let lastState = 'unobserved';
+  let lastPage = null;
+  let lastError = '';
+  while (Date.now() < deadline) {
     try {
-      const r = await chrome.tabs.sendMessage(tabId, { cmd: 'ping' });
-      if (r?.ready) return;
-    } catch {}
-    await sleep(700);
+      lastPage = await pageSettling.snapshot(tabId);
+      const tab = await chrome.tabs.get(tabId);
+      if (lastPage.ready && tab?.active) {
+        const observed = await tabMessage(tabId,{cmd:'ping',expectedText});
+        lastState = observed?.state || 'unknown';
+        if (observed?.ok === true && observed.ready === true &&
+            observed.documentReady === true) {
+          if (stableSince === null) stableSince = Date.now();
+          if (Date.now() - stableSince >= 1200) return;
+        } else stableSince = null;
+      } else {
+        lastState = !tab?.active ? 'not-focused' :
+          lastPage.documentComplete ? 'post-load-settling' : 'document-loading';
+        stableSince = null;
+      }
+    } catch (error) {
+      lastError = String(error?.message || error);
+      stableSince = null;
+    }
+    await sleep(250);
   }
-  throw new Error('Worker tab never became ready. Are you logged in on that site in this browser profile?');
+  throw new Error('Worker composer did not become stably ready: state='+lastState+
+    ', documentComplete='+lastPage?.documentComplete+
+    ', remainingSettleMs='+lastPage?.remainingMs+
+    ', lastError='+lastError.slice(0,180));
 }
+
 
 // ------------------------------------------------------------------ tasks
 function buildWorkerPrompt(cfg, task, contextTranscript, role='specialist', composed=null) {
@@ -365,36 +698,85 @@ async function closeWorkerTab(tabId) {
 
 // Two observations reduce false-idle sends. The content script rechecks at submit
 // time; neither observation is an ACK or proof that the model processed a result.
-async function confirmTabIdle(tabId) {
-  const first = await tabMessage(tabId, { cmd: 'observe_state' });
-  if (first?.ok !== true || first.state !== 'idle') {
-    throw new Error(`Worker tab is not idle (${first?.state || 'unknown'})`);
+async function confirmTabIdle(tabId, expectedText = null) {
+  await pageSettling.waitForReady(tabId);
+  const first = await tabMessage(tabId, {cmd:'observe_state',expectedText});
+  if (first?.ok !== true || first.ready !== true) {
+    throw new Error('Worker tab is not ready ('+(first?.state || 'unknown')+')');
   }
   await sleep(600);
-  const second = await tabMessage(tabId, { cmd: 'observe_state' });
-  if (second?.ok !== true || second.state !== 'idle') {
-    throw new Error(`Worker tab is not stably idle (${second?.state || 'unknown'})`);
+  const second = await tabMessage(tabId, {cmd:'observe_state',expectedText});
+  if (second?.ok !== true || second.ready !== true) {
+    throw new Error('Worker tab is not stably ready ('+(second?.state || 'unknown')+')');
   }
 }
 
-async function startTask(tabId, site, text, waitSecs, cfg, autoClose = false, owner = 'legacy') {
-  if (Object.values(tasks).some((task) => task.tabId === tabId && task.status === 'running')) {
-    throw new Error('Worker has an outstanding task; await its terminal result before reuse');
-  }
-  await confirmTabIdle(tabId);
-  const id = crypto.randomUUID();
-  const receiptNonce = crypto.randomUUID();
-  const task = { id, tabId, site, status: 'running', startedAt: Date.now(), autoClose, receiptNonce, owner,
-    workerIncarnationId: workerIncarnations[tabId] || null };
-  tasks[id] = task;
-  taskLog.push(Date.now());
-  await saveState();
+// Only one worker may be foregrounded and receive its initial prompt at a
+// time. Chat pages can defer initialization in background Edge tabs. Release
+// this gate once the user turn is confirmed; model responses run concurrently.
+let promptStartupTail = Promise.resolve();
+function serializePromptStartup(operation) {
+  const next = promptStartupTail.then(operation);
+  promptStartupTail = next.catch(() => {});
+  return next;
+}
+async function focusWorkerForStartup(tabId) {
+  const tab = await chrome.tabs.get(tabId);
+  if (!tab || !ownedWorker(tabId, workerOwners[tabId]))
+    throw new Error('Worker tab is unavailable or no longer owned');
+  await chrome.tabs.update(tabId,{active:true});
+  await chrome.windows.update(tab.windowId,{focused:true});
+  const visibleTab = await chrome.tabs.get(tabId);
+  if (!visibleTab?.active || visibleTab.windowId !== tab.windowId)
+    throw new Error('Worker tab could not be activated for page initialization');
+}
 
-  const r = await tabMessage(tabId, { cmd: 'run_prompt', taskId: id, receiptNonce, text, timeoutMs: cfg.taskTimeoutMin * 60000 });
-  if (!r?.ok) {
-    finishTask(id, { status: 'failed', error: r?.error || 'Tab refused the task' });
-  } else if (waitSecs > 0) {
-    await waitTask(id, Math.min(waitSecs, 50) * 1000);
+async function startTask(tabId, site, text, waitSecs, cfg, autoClose = false, owner = 'legacy') {
+  // Serializing submission—not inference—prevents an unfocused second tab
+  // from racing against the first tab's deferred application initialization.
+  const id = await serializePromptStartup(async () => {
+    if (Object.values(tasks).some((task) => task.tabId === tabId &&
+        ['running', 'uncertain'].includes(task.status))) {
+      throw new Error('Worker has an outstanding task (running or uncertain); reconcile before reuse');
+    }
+    await focusWorkerForStartup(tabId);
+    await waitReady(tabId,text);
+    await confirmTabIdle(tabId,text);
+
+    const taskId = crypto.randomUUID();
+    const receiptNonce = crypto.randomUUID();
+    const task = { id:taskId, tabId, site, status:'running', startedAt:Date.now(),
+      autoClose, receiptNonce, owner,
+      workerIncarnationId: workerIncarnations[tabId] || null };
+    tasks[taskId] = task;
+    taskLog.push(Date.now());
+    await saveState();
+
+    let ack;
+    try {
+      // The content script now acknowledges only after it confirms that
+      // the user message was submitted; response collection continues async.
+      ack = await tabMessage(tabId, {cmd:'run_prompt',taskId,receiptNonce,
+        text,timeoutMs:cfg.taskTimeoutMin * 60000});
+    } catch {
+      if (task.status === 'running') {
+        task.status = 'uncertain';
+        task.error = 'Prompt submission receipt lost; inspect this tab before retrying';
+        await saveState();
+        (waiters[taskId] || []).forEach((resolve) => resolve());
+        delete waiters[taskId];
+      }
+      return taskId;
+    }
+    if (!ack?.ok && task.status === 'running') {
+      finishTask(taskId,ack?.uncertain
+        ? {status:'uncertain',error:ack.error || 'Submission outcome uncertain'}
+        : {status:'failed',error:ack?.error || 'Tab refused the task'});
+    }
+    return taskId;
+  });
+  if (waitSecs > 0 && tasks[id]?.status === 'running') {
+    await waitTask(id,Math.min(waitSecs,50)*1000);
   }
   return summarize(tasks[id]);
 }
@@ -403,7 +785,7 @@ async function startTask(tabId, site, text, waitSecs, cfg, autoClose = false, ow
 async function handleCall(method, p = {}) {
   await stateReady;
   const owner = callerOwner(p);
-  if (p.__trustedPrincipal?.mode === 'scoped') {
+  if (p.__trustedPrincipal?.mode === 'profile') {
     await callerManagerTab(p, await getConfig()); // All six public Worker Tool operations.
   }
   switch (method) {
@@ -431,32 +813,56 @@ async function handleCall(method, p = {}) {
       }
       return {closed, held};
     }
-    case 'attest_manager_tab': {
-      // Internal proxy utilityProcess request from trusted desktop IPC only.
-      if (!Number.isSafeInteger(p.tab_id) || p.tab_id <= 0) throw new Error('Invalid manager tab');
-      const tab = await chrome.tabs.get(p.tab_id).catch(() => null);
-      if (!tab || !siteOfUrl(tab.url)) throw new Error('Manager tab unavailable or unsupported');
-      if (!managerIncarnations[tab.id]) {
-        managerIncarnations[tab.id] = crypto.randomUUID();
-        await saveState();
+    case 'attest_profile_manager': {
+      // The proxy supplies the requested tab; verify live browser incarnation.
+      // This attests a tab, not the identity of a remote HTTP caller.
+      const cfg = await getConfig();
+      const tabId = p.tab_id ?? cfg.orchestratorTabId;
+      if (!Number.isSafeInteger(tabId) || tabId <= 0)
+        throw new Error('Caller tab ID required');
+      const tab = await chrome.tabs.get(tabId).catch(() => null);
+      if (!tab || !siteOfUrl(tab.url)) throw new Error('Caller chat tab is unavailable');
+      const observedSite=siteOfUrl(tab.url);
+      if (managerSites[tab.id] && managerSites[tab.id] !== observedSite &&
+          !workers.includes(tab.id)) {
+        managerIncarnations[tab.id]=crypto.randomUUID();
+        extensionDiagnostic('warn','identity.incarnation_rotated',{
+          tabId:tab.id,reason:'provider_changed'});
       }
+      if (!managerIncarnations[tab.id] && !workerIncarnations[tab.id])
+        managerIncarnations[tab.id] = crypto.randomUUID();
+      if (!workers.includes(tab.id)) managerSites[tab.id]=observedSite;
+      await saveState();
       return { tab_id: tab.id, browser_session_id: browserSessionId,
-        incarnation_id: managerIncarnations[tab.id] };
+        incarnation_id: workerIncarnations[tab.id] || managerIncarnations[tab.id],
+        connection_generation: 1 };
+    }
+    case 'inspect_tab':
+      return inspectChatTab(p.tab_id);
+    case 'inspect_all_tabs': {
+      const tabs = await chrome.tabs.query({url:TAB_PATTERNS});
+      return tabs.map((tab) => ({tab_id:tab.id,site:siteOfUrl(tab.url),
+        title:tab.title,active:tab.active,is_managed_worker:workers.includes(tab.id),
+        incarnation_id:workerIncarnations[tab.id] || managerIncarnations[tab.id] || null}));
     }
 
     // Internal server-to-extension operations. These are deliberately NOT public
     // Worker Tool MCP registrations. The server supplies verified identity.
     case 'manager_state': {
-      if (p.__trustedPrincipal?.mode !== 'scoped') throw new Error('Scoped identity required');
+      if (p.__trustedPrincipal?.mode !== 'profile') throw new Error('Configured profile manager required');
       const cfg = await getConfig();
       const manager = await callerManagerTab(p, cfg);
-      const state = await tabMessage(manager, { cmd: 'observe_state' });
-      return { tab_id: manager, state: state?.state || 'unknown', ready: state?.ok === true && state.state === 'idle',
-        browser_session_id: browserSessionId, incarnation_id: managerIncarnations[manager] };
+      const state = await tabMessage(manager, {cmd:'observe_state'});
+      const page = await pageSettling.snapshot(manager);
+      return {tab_id:manager,
+        state:page.ready ? state?.state || 'unknown' : 'loading',
+        ready:page.ready && state?.ok === true && state.state === 'idle',
+        page,
+        browser_session_id: browserSessionId,
+        incarnation_id: workerIncarnations[manager] || managerIncarnations[manager] };
     }
-
     case 'wake_manager': {
-      if (p.__trustedPrincipal?.mode !== 'scoped') throw new Error('Scoped identity required');
+      if (p.__trustedPrincipal?.mode !== 'profile') throw new Error('Configured profile manager required');
       const cfg = await guard();
       const managerTabId = await callerManagerTab(p, cfg);
       if (!/^[0-9a-f-]{36}$/i.test(p.batch_id || '') ||
@@ -485,6 +891,12 @@ async function handleCall(method, p = {}) {
          !batchText.includes('<queue_batch')||batchText.length>60000)
         throw new Error('Invalid proxy-composed queue prompt');
       if (batchText.length > 60000) throw new Error('Manager batch exceeds message limit');
+      const managerTab = await chrome.tabs.get(managerTabId);
+      if (!managerTab || !siteOfUrl(managerTab.url)) throw new Error('Manager tab is unavailable');
+      // Focus before the post-load settling and idle checks.
+      await chrome.tabs.update(managerTabId,{active:true});
+      await chrome.windows.update(managerTab.windowId,{focused:true});
+      await chrome.windows.update(managerTab.windowId,{focused:true});
       await confirmTabIdle(managerTabId);
       // Re-evaluate after the asynchronous idle observations: two concurrent
       // callers must never both reserve and submit to the same manager.
@@ -510,7 +922,7 @@ async function handleCall(method, p = {}) {
     }
 
     case 'manager_processed': {
-      if (p.__trustedPrincipal?.mode !== 'scoped') throw new Error('Scoped identity required');
+      if (p.__trustedPrincipal?.mode !== 'profile') throw new Error('Configured profile manager required');
       const prior = managerWakes[p.batch_id];
       if (!prior || prior.owner !== owner || prior.status !== 'submitted') {
         throw new Error('No submitted batch in this manager scope');
@@ -548,7 +960,7 @@ async function handleCall(method, p = {}) {
         throw new Error('Original child task owner/incarnation mismatch');
       const managerTabId = await callerManagerTab(p,await getConfig());
       if (!Number.isSafeInteger(managerTabId)) throw new Error('Parent tab unavailable');
-      const tab = (await chrome.windows.create({url:lost.url,focused:false,width:1100,height:850}))?.tabs?.[0];
+      const tab = await createManagedWorkerTab(lost.url,p,managerTabId);
       if (!Number.isSafeInteger(tab?.id)) throw new Error('Could not reopen child URL');
       const newIncarnation = crypto.randomUUID();
       workers.push(tab.id);workerOwners[tab.id]=owner;
@@ -562,10 +974,6 @@ async function handleCall(method, p = {}) {
         next_step:'Use read_chat on this tab and get_result with original_task_id; reconcile before continuing.'};
     }
     case 'spawn_worker': {
-      if (p.role === 'watchdog' &&
-          (p.__trustedPrincipal?.mode !== 'scoped' || p.__trustedPrincipal.role !== 'ba')) {
-        throw new Error('Only an authenticated BA principal may own a Watchdog worker');
-      }
       const site = SITES[p.site];
       if (!site) throw new Error(`Unknown site "${p.site}". Use "chatgpt", "claude" or "gemini".`);
       const seatKey = roleSeatKey(p, owner);
@@ -587,6 +995,10 @@ async function handleCall(method, p = {}) {
             }
             const cfg = await guard();
             if (p.auto_close === true) throw new Error('Automatic worker closure is disabled');
+            if (p.__defer_start === true) {
+              return {tab_id:prior.tabId,incarnation_id:prior.incarnationId,
+                reused_tab:true,prepared:true,seat_role:p.role,seat_scope:p.role_scope};
+            }
             // Initial role/context is already in this chat; new stages are follow-ups.
             const result = await startTask(prior.tabId, p.site, p.task, p.wait_seconds || 0, cfg, false, owner);
             return { ...result, reused_tab: true, seat_role: p.role, seat_scope: p.role_scope };
@@ -596,7 +1008,7 @@ async function handleCall(method, p = {}) {
         }
         const cfg = await guard({ newWorker: true });
         if (p.auto_close === true || (p.keep_open !== true && cfg.autoCloseWorkers)) {
-          throw new Error('Automatic worker closure requires verified Saga completion and is currently disabled');
+          throw new Error('Automatic worker closure is disabled; parent review and explicit close_worker are required');
         }
         const managerTabId = await callerManagerTab(p, cfg);
         let contextTranscript = '';
@@ -607,8 +1019,8 @@ async function handleCall(method, p = {}) {
           contextTranscript = chat.transcript;
         }
         const prompt = buildWorkerPrompt(cfg, p.task, contextTranscript, p.role, p.prompt_text);
-        const win = await chrome.windows.create({ url: site.newChatUrl, focused: false, width: 1100, height: 850 });
-        const tabId = win.tabs[0].id;
+        const createdTab = await createManagedWorkerTab(site.newChatUrl,p,managerTabId);
+        const tabId = createdTab.id;
         workers.push(tabId);
         workerOwners[tabId] = owner;
         workerIncarnations[tabId] = crypto.randomUUID();
@@ -618,13 +1030,40 @@ async function handleCall(method, p = {}) {
           scope: p.role_scope, site: p.site,
         };
         await saveState();
-        await waitReady(tabId);
+        if (p.__defer_start === true) {
+          return {tab_id:tabId,incarnation_id:workerIncarnations[tabId],
+            reused_tab:false,prepared:true,seat_role:p.role || null,seat_scope:p.role_scope || null};
+        }
         // Completion stays in its tab until separately verified and approved.
         const result = await startTask(tabId, p.site, prompt, p.wait_seconds || 0, cfg, false, owner);
         return seatKey ? { ...result, reused_tab: false, seat_role: p.role, seat_scope: p.role_scope } : result;
       } finally {
         if (seatKey) roleSeatReservations.delete(seatKey);
       }
+    }
+
+    case 'start_prepared_worker': {
+      const tabId = p.tab_id;
+      if (!ownedWorker(tabId,owner) || workerIncarnations[tabId] !== p.expected_incarnation_id) {
+        throw new Error('Prepared worker ownership/incarnation mismatch');
+      }
+      const cfg = await guard();
+      const tab = await chrome.tabs.get(tabId).catch(() => null);
+      if (siteOfUrl(tab?.url) !== p.site) throw new Error('Prepared worker changed site');
+      if (p.auto_close === true) throw new Error('Automatic worker closure is disabled');
+      let contextTranscript = '';
+      if (p.share_context_from) {
+        const caller = await callerManagerTab(p,cfg);
+        const srcId = p.share_context_from === 'orchestrator'
+          ? caller : await resolveTab(p.share_context_from);
+        requireOwnedTab(srcId,caller,owner);
+        contextTranscript = (await tabMessage(srcId,{cmd:'read_chat'})).transcript;
+      }
+      const prompt = p.reused_tab === true ? p.task :
+        buildWorkerPrompt(cfg,p.task,contextTranscript,p.role,p.prompt_text);
+      const result = await startTask(tabId,p.site,prompt,p.wait_seconds || 0,cfg,false,owner);
+      return {...result,reused_tab:p.reused_tab === true,
+        seat_role:p.role || null,seat_scope:p.role_scope || null};
     }
 
 
@@ -645,6 +1084,25 @@ async function handleCall(method, p = {}) {
       if (p.wait_seconds > 0) await waitTask(t.id, Math.min(p.wait_seconds, 50) * 1000);
       return summarize(tasks[t.id]);
     }
+    case 'inspect_worker_tasks': {
+      // Internal proxy operation: task IDs and statuses are the tool's own
+      // execution identifiers; no Saga board is involved in worker closure.
+      if (p.__trustedPrincipal?.mode !== 'profile' ||
+          !ownedWorker(p.tab_id, owner) ||
+          workerIncarnations[p.tab_id] !== p.worker_incarnation_id) {
+        throw new Error('Worker ownership or incarnation changed');
+      }
+      const tab = await chrome.tabs.get(p.tab_id).catch(() => null);
+      if (!tab || !siteOfUrl(tab.url)) throw new Error('Worker tab is unavailable');
+      return {
+        tab_id: p.tab_id,
+        worker_incarnation_id: workerIncarnations[p.tab_id],
+        tasks: Object.values(tasks)
+          .filter((task) => task.tabId === p.tab_id && task.owner === owner &&
+            task.workerIncarnationId === p.worker_incarnation_id)
+          .map((task) => ({task_id:task.id,status:task.status}))
+      };
+    }
     case 'read_chat': {
       const cfg = await guard();
       const managerTabId = await callerManagerTab(p, cfg);
@@ -658,23 +1116,22 @@ async function handleCall(method, p = {}) {
       });
     }
 
-    case 'close_verified_worker': {
-      if (p.__trustedPrincipal?.mode !== 'scoped' || p.saga_verified !== true ||
-          !/^[0-9a-f-]{36}$/i.test(p.saga_event_id || '')) {
-        throw new Error('Trusted Saga closure proof required');
+    case 'close_reviewed_worker': {
+      if (p.__trustedPrincipal?.mode !== 'profile' || p.parent_reviewed !== true) {
+        throw new Error('Trusted parent review is required');
       }
       if (!ownedWorker(p.tab_id, owner) ||
           workerIncarnations[p.tab_id] !== p.worker_incarnation_id) {
         const absent = await chrome.tabs.get(p.tab_id).catch(() => null);
         if (!absent) return { closed: p.tab_id, already_closed: true };
-        throw new Error('Scoped worker incarnation mismatch');
+        throw new Error('Profile worker incarnation mismatch');
       }
       if (Object.values(tasks).some((task) =>
-          task.tabId === p.tab_id && task.status === 'running')) {
-        throw new Error('Cannot close a still-running scoped worker');
+          task.tabId === p.tab_id && ['running', 'uncertain'].includes(task.status))) {
+        throw new Error('Cannot close a running or uncertain profile worker');
       }
       await closeWorkerTab(p.tab_id);
-      return { closed: p.tab_id, saga_verified: true };
+      return { closed: p.tab_id, parent_reviewed: true };
     }
 
     case 'close_worker': {
@@ -684,14 +1141,14 @@ async function handleCall(method, p = {}) {
         throw new Error('Worker is outside this caller scope');
       }
       if (owner !== 'legacy') {
-        // A scoped manager may not self-attest Saga completion or silently
-        // close a child. Release only after independent board readback is wired.
-        throw new Error('Scoped worker closure is HELD until independent Saga verification');
+        // Scoped workers close only after the proxy reviews parent ownership and task receipts.
+        throw new Error('Profile worker closure requires proxy-verified parent review');
       }
       const tab = await chrome.tabs.get(p.tab_id).catch(() => null);
       if (!tab) return { closed: p.tab_id, already_closed: true };
-      if (Object.values(tasks).some((t) => t.tabId === p.tab_id && t.status === 'running')) {
-        throw new Error('Cannot close a worker while its task is running');
+      if (Object.values(tasks).some((t) => t.tabId === p.tab_id &&
+          ['running', 'uncertain'].includes(t.status))) {
+        throw new Error('Cannot close a worker while its task is running or uncertain');
       }
       if (!workers.includes(p.tab_id)) throw new Error('That tab was not opened by spawn_worker; refusing to close it.');
       await closeWorkerTab(p.tab_id);
@@ -715,16 +1172,11 @@ let attempts = 0;
 async function connect() {
   const cfg = await getConfig();
   clearTimeout(reconnectTimer);
-  if (!cfg.token) {
-    wsState = 'no token';
-    return;
-  }
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
 
   wsState = 'connecting';
-  const sep = cfg.serverUrl.includes('?') ? '&' : '?';
   try {
-    ws = new WebSocket(`${cfg.serverUrl}${sep}token=${encodeURIComponent(cfg.token)}`);
+    ws = new WebSocket(cfg.serverUrl);
   } catch (err) {
     wsState = `error: ${err.message}`;
     return scheduleReconnect();
@@ -734,6 +1186,8 @@ async function connect() {
   ws.onopen = () => {
     if (thisSocket !== ws) return;
     wsState = 'connected';
+    extensionDiagnostic('info','bridge.connected',{connected:true});
+    extensionDiagnostic('info','extension.build_loaded',{build:'grouping-20261108-v3'});
     proxySettings = null;
     proxySettingsRevision = 0;
     privateQueueMode = 'unknown';
@@ -776,10 +1230,16 @@ async function connect() {
     }
     if (msg.type !== 'call') return;
     const socket = thisSocket;
+    extensionDiagnostic('debug','bridge.call_received',{requestId:msg.id,method:msg.method,
+      tabId:msg.params?.tab_id});
     try {
       const result = await handleCall(msg.method, msg.params || {});
+      extensionDiagnostic('debug','bridge.call_completed',{requestId:msg.id,
+        method:msg.method,success:true});
       socket.send(JSON.stringify({ type: 'result', id: msg.id, ok: true, result }));
     } catch (err) {
+      extensionDiagnostic('warn','bridge.call_failed',{requestId:msg.id,
+        method:msg.method,success:false});
       socket.send(JSON.stringify({ type: 'result', id: msg.id, ok: false, error: String(err?.message || err) }));
     }
   };
@@ -787,6 +1247,7 @@ async function connect() {
   ws.onclose = () => {
     if (thisSocket !== ws) return;
     wsState = 'disconnected';
+    extensionDiagnostic('warn','bridge.disconnected',{connected:false});
     proxySettings = null;
     proxySettingsRevision = 0;
     privateQueueMode = 'unknown';
@@ -867,7 +1328,7 @@ chrome.alarms.onAlarm.addListener((a) => {
 });
 
 chrome.storage.onChanged.addListener((changes, area) => {
-  if (area === 'local' && (changes.serverUrl || changes.token)) reconnectNow();
+  if (area === 'local' && changes.serverUrl) reconnectNow();
 });
 
 async function reportLostWorker(info) {
@@ -898,13 +1359,33 @@ async function reportLostWorker(info) {
   } catch {console.warn('[coordination] Lost worker event UNCERTAIN; do not retry blindly');}
 }
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+  pageSettling.onUpdated(tabId,changeInfo,tab);
   await stateReady;
-  if (!workers.includes(tabId)) return;
+  if (changeInfo?.url && managerIncarnations[tabId]) {
+    const newSite = siteOfUrl(changeInfo.url);
+    const previousSite = managerSites[tabId] || siteOfUrl(workerUrls[tabId] || tab?.url);
+    // A manager is identified by its browser TAB incarnation, not the
+    // ChatGPT conversation URL. A queue wake creates a /c/... navigation in
+    // the same tab; rotating here invalidates the entire live FIFO queue.
+    // Leaving the supported site or switching chat providers still revokes
+    // the incarnation, so an unrelated navigation cannot retain authority.
+    if (!newSite || (previousSite && newSite !== previousSite)) {
+      managerIncarnations[tabId] = crypto.randomUUID();
+      managerSites[tabId] = newSite || null;
+      extensionDiagnostic('warn','identity.incarnation_rotated',{tabId,
+        reason:!newSite?'unsupported_navigation':'provider_changed'});
+      await saveState();
+    } else {
+      managerSites[tabId] = newSite;
+      extensionDiagnostic('debug','identity.same_site_navigation',{tabId,site:newSite});
+    }
+  }
   const url=changeInfo?.url || tab?.url;
   if (typeof url==='string' && siteOfUrl(url)) {workerUrls[tabId]=url;void saveState();}
+  await stateReady;
 });
 chrome.tabs.onRemoved.addListener(async (tabId) => {
-  await stateReady;
+  pageSettling.forget(tabId);
   const managed=workers.includes(tabId);
   const intentional=intentionalClosures.delete(tabId);
   const owner=workerOwners[tabId],incarnation=workerIncarnations[tabId],url=workerUrls[tabId];
@@ -912,7 +1393,7 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
     .sort((a,b)=>b.startedAt-a.startedAt)[0];
   workers=workers.filter(id=>id!==tabId);
   delete workerOwners[tabId];delete workerIncarnations[tabId];delete workerUrls[tabId];
-  clearRoleSeatsForTab(tabId);delete managerIncarnations[tabId];
+  clearRoleSeatsForTab(tabId);delete managerIncarnations[tabId];delete managerSites[tabId];
   for (const t of Object.values(tasks)) if(t.tabId===tabId)
     finishTask(t.id,{status:'failed',error:'Tab closed or unavailable before task completion'});
   if(managed&&!intentional&&task&&url&&incarnation&&owner?.startsWith('credential:')){
@@ -931,6 +1412,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
     await stateReady;
     switch (msg?.type) {
+      case 'browser_page_settled': {
+        if (sender.id !== chrome.runtime.id || sender.frameId !== 0 ||
+            !Number.isSafeInteger(sender.tab?.id) ||
+            !siteOfUrl(sender.tab?.url)) {
+          sendResponse({ok:false,error:'Page-readiness request did not originate from a supported top-level chat tab'});
+          break;
+        }
+        const timeout = Number.isSafeInteger(msg.timeoutMs)
+          ? Math.min(45000,Math.max(1000,msg.timeoutMs)) : 12000;
+        const ready = await pageSettling.waitForReady(sender.tab.id,timeout);
+        sendResponse({ok:true,...ready});
+        break;
+      }
       case 'task_done': {
         const task = tasks[msg.taskId];
         if (!task || sender.id !== chrome.runtime.id || sender.frameId !== 0 ||
@@ -940,7 +1434,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           sendResponse({ ok: false, error: 'Unverified worker completion source' });
           break;
         }
-        if (task.status !== 'running') {
+        // An authenticated, nonce-matched completion is sufficient to resolve
+        // an uncertain submission without submitting the prompt again.
+        if (!['running', 'uncertain'].includes(task.status)) {
           const duplicate = (task.status === 'done' && msg.ok === true) ||
             (task.status === 'failed' && msg.ok === false);
           if (!duplicate) { sendResponse({ ok: false, error: 'Conflicting terminal receipt' }); break; }
@@ -950,6 +1446,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           } catch {
             sendResponse({ ok: false, error: 'Private journal receipt UNCERTAIN' });
           }
+          break;
+        }
+        if (msg.uncertain === true && msg.ok === false) {
+          finishTask(msg.taskId, {status:'uncertain',error:msg.error});
+          sendResponse({ok:true,uncertain:true});
           break;
         }
         finishTask(
@@ -971,7 +1472,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           coordinationMode: privateQueueMode,
           settingsSynced: Boolean(proxySettings),
           settingsRevision: proxySettingsRevision,
-          cfg: { serverUrl: cfg.serverUrl, token: cfg.token, orchestratorTabId: cfg.orchestratorTabId },
+          cfg: { serverUrl: cfg.serverUrl, orchestratorTabId: cfg.orchestratorTabId },
           workers,
           running: Object.values(tasks).filter((t) => t.status === 'running').length,
         });
@@ -1000,7 +1501,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       default:
         sendResponse({ ok: false });
     }
-  })();
+  })().catch((error) => {
+    sendResponse({ok:false,error:String(error?.message || error)});
+  });
   return true;
 });
 

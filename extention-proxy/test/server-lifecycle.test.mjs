@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtempSync, existsSync, readFileSync } from 'node:fs';
+import { mkdtempSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -8,37 +8,27 @@ import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
-async function waitForHealth(port) {
-  for (let i = 0; i < 40; i++) {
-    try {
-      const response = await fetch(`http://127.0.0.1:${port}/health`);
-      if (response.ok) return;
-    } catch {}
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
-  throw new Error('Server did not become ready');
-}
-
-test('server uses desktop token path without printing the token', async () => {
-  const dir = mkdtempSync(path.join(tmpdir(), 'chat-orch-server-'));
-  const tokenFile = path.join(dir, 'config', 'bridge.token');
-  const port = 8891;
-  const child = spawn(process.execPath, ['server.js'], {
+test('server starts without generating or requiring a bridge token', { timeout: 15000 }, async (t) => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'chat-orch-no-token-'));
+  const tokenFile = path.join(dir, 'bridge.token');
+  const server = spawn(process.execPath, ['server.js'], {
     cwd: root,
-    env: { ...process.env, PORT: String(port), HOST: '127.0.0.1', BRIDGE_TOKEN: '', BRIDGE_TOKEN_FILE: tokenFile },
+    env: { ...process.env, PORT: '0', HOST: '127.0.0.1',
+      BRIDGE_TOKEN_FILE: tokenFile, BRIDGE_TOKEN: '', EXTENSION_BRIDGE_TOKEN: '' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  let output = '';
-  child.stdout.on('data', (chunk) => { output += chunk.toString(); });
-  child.stderr.on('data', (chunk) => { output += chunk.toString(); });
-  try {
-    await waitForHealth(port);
-    assert.equal(existsSync(tokenFile), true);
-    const token = readFileSync(tokenFile, 'utf8').trim();
-    assert.match(token, /^[a-f0-9]{48}$/);
-    assert.equal(output.includes(token), false);
-  } finally {
-    child.kill();
-    await new Promise((resolve) => child.once('exit', resolve));
-  }
+  t.after(() => { server.kill(); rmSync(dir, { recursive: true, force: true }); });
+  const port = await new Promise((resolve, reject) => {
+    let output = '';
+    const timer = setTimeout(() => reject(new Error('Server did not start: ' + output)), 8000);
+    server.stdout.on('data', (chunk) => {
+      output += chunk.toString();
+      const found = /listening on http:\/\/[^:]+:(\d+)/.exec(output);
+      if (found) { clearTimeout(timer); resolve(Number(found[1])); }
+    });
+    server.once('exit', (code) => { clearTimeout(timer); reject(new Error('Proxy exited: ' + code)); });
+  });
+  const health = await fetch('http://127.0.0.1:' + port + '/health');
+  assert.equal(health.ok, true);
+  assert.equal(existsSync(tokenFile), false, 'proxy must not provision obsolete token file');
 });

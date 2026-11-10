@@ -1,5 +1,5 @@
-// Manual Windows packaged smoke: isolated temporary profile, port, one trusted settings handshake.
-// Never touches the live default profile, its tokens, or port 8787.
+// Manual Windows packaged smoke: isolated temporary profile, tokenless local settings handshake.
+// Never touches the live default profile, its Ngrok auth, or port 8787.
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {once} from 'node:events';
@@ -13,7 +13,7 @@ import WebSocket from 'ws';
 if (process.platform !== 'win32') throw new Error('Windows portable smoke only');
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const currentVersion = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8')).version;
-const executable = path.join(root, 'dist', 'Chat Orchestrator ' + currentVersion + '.exe');
+const executable = process.env.CHAT_ORCH_PACKAGED_EXE || path.join(root, 'dist', 'Chat Orchestrator ' + currentVersion + '.exe');
 if (!existsSync(executable)) throw new Error('Build portable EXE before running packaged smoke');
 const dataDir = mkdtempSync(path.join(tmpdir(), 'chat-orchestrator-smoke-settings-'));
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -39,10 +39,9 @@ try {
     await delay(350);
   }
   assert.ok(active, 'Packaged isolated proxy must listen on test port');
-  const tokenFile = path.join(dataDir,'extension-bridge.token');
-  assert.ok(existsSync(tokenFile), 'Packaged profile should create its own extension-only credential');
-  const token = readFileSync(tokenFile,'utf8').trim();
-  ws = new WebSocket(`ws://127.0.0.1:${port}/bridge?token=${encodeURIComponent(token)}`);
+  assert.ok(!existsSync(path.join(dataDir,'extension-bridge.token')),
+    'Packaged proxy must not create an obsolete extension credential');
+  ws = new WebSocket(`ws://127.0.0.1:${port}/bridge`);
   const snapshot = new Promise((resolve,reject)=>{
     const timer=setTimeout(()=>reject(new Error('Settings snapshot timed out')),8000);
     ws.on('message',(raw)=>{
@@ -70,7 +69,10 @@ try {
 } finally {
   try {ws?.terminate();} catch {}
   // EXE launcher might exit before Electron; the bounded smoke timer owns shutdown.
-  if(child.exitCode===null) child.kill();
-  await delay(500);
-  rmSync(dataDir,{recursive:true,force:true});
+  if (child.exitCode === null) {
+    child.kill();
+    await Promise.race([once(child, 'exit').catch(() => {}), delay(3000)]);
+  }
+  // Windows antivirus and Electron child shutdown may briefly hold the isolated temp profile.
+  rmSync(dataDir, {recursive:true, force:true, maxRetries:20, retryDelay:250});
 }

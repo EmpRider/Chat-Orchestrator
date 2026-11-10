@@ -36,8 +36,11 @@ test('dark UI has visible icon assets, setting checkbox and accessible controls'
   assert.match(html, /id="minimize-to-tray" type="checkbox" checked/);
   assert.match(html, /Minimize to system tray when closing/);
   for (const name of ['proxy-port-label', 'proxy-port', 'save-proxy-port', 'profile-description',
-    'extension-local-url', 'token-value', 'copy-token', 'import-token', 'domain', 'ngrok-token', 'configure-ngrok', 'connector-url', 'copy-url', 'start', 'stop']) {
+    'extension-local-url', 'domain', 'ngrok-token', 'configure-ngrok', 'connector-url', 'copy-url', 'start', 'stop']) {
     assert.ok(html.includes(`id="${name}"`), `existing control ${name} must remain`);
+  }
+  for (const obsolete of ['token-value', 'copy-token', 'import-token', 'copy-extension-token']) {
+    assert.ok(!html.includes(`id="${obsolete}"`), `obsolete proxy auth control ${obsolete} must be absent`);
   }
   assert.match(html, /Icons by Icons8/);
 });

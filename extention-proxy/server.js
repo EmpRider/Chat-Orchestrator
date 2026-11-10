@@ -15,42 +15,19 @@ import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { disabledAgentSettings, normalizeAgentSettings, replaceObsoletePromptSettings, composeAgentPrompt } from './agent-settings.mjs';
-import { listPrincipalCredentials, resolvePrincipalCredential } from './principal-auth.mjs';
+import { createSessionTabRegistry } from './tab-registry.mjs';
+import { normalizeOpenChatTabs, annotateTabPresence } from './tab-presence.mjs';
+import { createDiagnostics, classifyDiagnosticError } from './diagnostics.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || '127.0.0.1';
+const diagnostics = createDiagnostics({component:'proxy'});
 
-// ---------------------------------------------------------------- auth token
-function loadToken() {
-  if (process.env.BRIDGE_TOKEN) return process.env.BRIDGE_TOKEN;
-  const file = process.env.BRIDGE_TOKEN_FILE || path.join(__dirname, '.token');
-  if (fs.existsSync(file)) return fs.readFileSync(file, 'utf8').trim();
-  const token = crypto.randomBytes(24).toString('hex');
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, token, { mode: 0o600 });
-  return token;
-}
-let TOKEN;
-let EXTENSION_TOKEN = null; // Distinct from MCP transport and scoped credentials.
-function loadExtensionToken() {
-  const file = process.env.EXTENSION_BRIDGE_TOKEN_FILE;
-  if (file && !path.isAbsolute(file)) throw new Error('Extension bridge token path must be absolute');
-  const value = process.env.EXTENSION_BRIDGE_TOKEN ||
-    (file ? fs.readFileSync(file, 'utf8').trim() : null);
-  if (!value) return null;
-  if (value.length < 32 || value.length > 128 || /\s/.test(value) ||
-      safeEqual(value, TOKEN)) {
-    throw new Error('Private extension bridge token must be distinct, bounded and secret');
-  }
-  return value;
-}
-const PRINCIPAL_REGISTRY_FILE = path.join(
-  path.dirname(process.env.BRIDGE_TOKEN_FILE || path.join(__dirname, '.token')),
-  'coordination-principals.json'
+// Profile settings are independent of any proxy or browser-extension secret.
+const AGENT_SETTINGS_FILE = path.join(
+  process.env.CHAT_ORCH_PROFILE_DIR || __dirname, 'settings.json'
 );
-// Settings live beside this profile's bridge token, never in the extension.
-const AGENT_SETTINGS_FILE = path.join(path.dirname(PRINCIPAL_REGISTRY_FILE), 'settings.json');
 let agentSettings = disabledAgentSettings();
 let agentSettingsRevision = 0;
 const trustedExtensionSockets = new WeakSet();
@@ -75,42 +52,17 @@ function sendAgentSettings(ws) {
     revision: agentSettingsRevision, settings: agentSettings}));
 }
 
-function safeEqual(a, b) {
-  const A = Buffer.from(String(a));
-  const B = Buffer.from(String(b));
-  return A.length === B.length && crypto.timingSafeEqual(A, B);
-}
-
-function requestToken(req) {
-  const auth = req.headers.authorization || '';
-  if (auth.toLowerCase().startsWith('bearer ')) return auth.slice(7).trim();
-  if (req.headers['x-bridge-token']) return String(req.headers['x-bridge-token']);
-  return String(req.query?.token || '');
-}
-
-function requireToken(req, res, next) {
-  const token = requestToken(req);
-  if (safeEqual(token, TOKEN)) {
-    // Legacy callers retain their own isolated scope, never a privileged principal.
-    req.bridgePrincipal = Object.freeze({ mode: 'legacy' });
-    return next();
-  }
-  try {
-    const record = resolvePrincipalCredential(PRINCIPAL_REGISTRY_FILE, token);
-    if (!record) return res.status(401).json({ error: 'unauthorized' });
-    req.bridgePrincipal = Object.freeze({ mode: 'scoped', ...record });
-    if (privateCoordinationEnabled) verifiedPrincipalContexts.add(req.bridgePrincipal);
-    return next();
-  } catch (error) {
-    console.error('[auth] principal registry unavailable:', error?.message);
-    return res.status(503).json({ error: 'principal registry unavailable' });
-  }
+async function attachProfile(req, _res, next) {
+  // HTTP MCP has no trustworthy originating browser tab. Never select a
+  // single global manager during discovery or before dispatching a tool.
+  // Operations resolve their explicit caller_tab_id and inspect live tabs.
+  req.bridgePrincipal = Object.freeze({ mode: 'legacy' });
+  return next();
 }
 
 // ------------------------------------------- private P0 coordination (inert)
 /**
- * Independently authenticated caller identity. The shared bridge token is
- * transport access only; request parameters cannot establish this context.
+ * Local profile manager context. No MCP token, agent identity or per-role authorization.
  * @typedef {Readonly<{
  *   principalId: string, credentialId: string, workspaceId: string,
  *   projectId: string, orchestratorId: string, parentTaskId: string,
@@ -130,36 +82,283 @@ function requireToken(req, res, next) {
  * }>} PrivateCoordinationScope
  */
 
-// No enrollment or grants exist. Future trusted enrollment must register frozen
-// contexts and scopes using independently verified per-caller credentials.
-// A worker-completion producer needs an authenticated origin/receipt, and
-// manager-originated status needs its own independently trusted credential.
-// Neither may inherit authority from the shared bridge transport token.
+// Every MCP caller uses the selected local profile. These contexts correlate
+// worker results and ordered queue ACKs, never enforce per-agent credentials.
 let privateCoordinationEnabled = false;
 const privateCoordinationRequested = process.env.CHAT_ORCH_PRIVATE_COORDINATION === '1';
 let privateJournal = null; // Only if the preprovisioned journal passes strict replay.
+let stopServerPromise = null; // One serialized graceful stop, including lock release.
 const verifiedPrincipalContexts = new WeakSet();
 const verifiedCoordinationScopes = new WeakSet();
+// Profile queue identity is derived locally. It never represents an individual agent
+// or grants a BA/PM/TL role. The browser extension attests the selected manager tab.
+const profileManagerIdentities = new Map(); // caller tab -> current connection incarnation
+let tabRegistry = null;
+let profileSocketGeneration = 0;
+function profileCredentialId(tabId) {
+  // Stable non-secret identity for the app's local profile data directory.
+  const hex = crypto.createHash('sha256').update(path.dirname(AGENT_SETTINGS_FILE) + ':' + tabId).digest('hex');
+  return `${hex.slice(0,8)}-${hex.slice(8,12)}-4${hex.slice(13,16)}-8${hex.slice(17,20)}-${hex.slice(20,32)}`;
+}
+function sameProfileManager(a, b) {
+  return a?.credentialId === b?.credentialId &&
+    a?.callerTabId === b?.callerTabId &&
+    a?.browserSessionId === b?.browserSessionId &&
+    a?.sessionIncarnationId === b?.sessionIncarnationId &&
+    a?.connectionGeneration === b?.connectionGeneration &&
+    a?.socketGeneration === b?.socketGeneration;
+}
+function profilePrincipalFromExtension(a) {
+  if (!a || !Number.isSafeInteger(a.tab_id) || a.tab_id <= 0 ||
+      !PRIVATE_EVENT_ID.test(a.browser_session_id || '') ||
+      !PRIVATE_EVENT_ID.test(a.incarnation_id || '') ||
+      !Number.isSafeInteger(a.connection_generation) || a.connection_generation < 1)
+    throw new Error('Extension could not attest the configured manager tab');
+  const credentialId = profileCredentialId(a.tab_id);
+  return Object.freeze({
+    mode: 'profile', principalId: credentialId, credentialId,
+    workspaceId: 'local-profile', projectId: 'local-profile',
+    orchestratorId: 'local-profile', parentTaskId: 'local-profile',
+    callerTabId: a.tab_id, browserSessionId: a.browser_session_id,
+    sessionIncarnationId: a.incarnation_id,
+    connectionGeneration: a.connection_generation,
+    socketGeneration: profileSocketGeneration,
+  });
+}
+
 
 /** @param {PrincipalContext} principal @param {PrivateCoordinationScope} scope */
-// A token validated at MCP connection time is not sufficient for a long-running
-// asynchronous delivery. Consult the revocable registry before every journal
-// mutation and immediately before issuing an external browser side effect.
+// Recheck the browser session/incarnation before acting on an asynchronous
+// worker event so stale tab IDs are not accidentally reused.
 function currentPrivatePrincipal(principal) {
-  if (!principal || principal.mode !== 'scoped') return false;
+  return Boolean(principal?.mode === 'profile' && bridgeConnected() &&
+    sameProfileManager(profileManagerIdentities.get(principal.callerTabId), principal) &&
+    principal.credentialId === profileCredentialId(principal.callerTabId));
+}
+
+async function resolveCaller(args = {}, { createRoot = false } = {}) {
+  if (!tabRegistry) throw new Error('Proxy tab registry unavailable');
+  const tabId = args.caller_tab_id;
+  if (!Number.isSafeInteger(tabId) || tabId <= 0) {
+    throw new Error('caller_tab_id required: call list_tabs first to identify the calling chat tab');
+  }
+  const inspection = await callExtension('inspect_tab', { tab_id: tabId }, 10000);
+  let record = tabRegistry.get(tabId);
+  diagnostics.debug('identity.inspected',{tabId,site:inspection.site,
+    registryPresent:Boolean(record)});
+  if (!record) {
+    if (!createRoot) throw new Error('Unregistered caller: use spawn_worker to establish the root relationship');
+    record = await tabRegistry.registerRoot(inspection);
+  }
+  if (record.incarnationId !== inspection.incarnation_id ||
+      record.browserSessionId !== inspection.browser_session_id ||
+      record.site !== inspection.site ||
+      (record.parentTabId !== null && inspection.is_managed_worker !== true)) {
+    const mismatches = [
+      record.incarnationId !== inspection.incarnation_id ? 'incarnationId' : null,
+      record.browserSessionId !== inspection.browser_session_id ? 'browserSessionId' : null,
+      record.site !== inspection.site ? 'site' : null,
+      record.parentTabId !== null && inspection.is_managed_worker !== true
+        ? 'isManagedWorker' : null,
+    ].filter(Boolean);
+    for (const mismatchField of mismatches) {
+      diagnostics.error('identity.registry_mismatch',{tabId,mismatchField});
+    }
+    throw new Error('Caller tab session/incarnation changed; manual registry reconciliation required');
+  }
+  const observed = await callExtension('attest_profile_manager', {tab_id: tabId}, 10000);
+  if (observed.tab_id !== inspection.tab_id ||
+      observed.incarnation_id !== inspection.incarnation_id ||
+      observed.browser_session_id !== inspection.browser_session_id) {
+    diagnostics.warn('identity.attestation_mismatch',{tabId});
+    throw new Error('Caller tab changed during attestation; retry only after reconciliation');
+  }
+  diagnostics.debug('identity.attestation_verified',{tabId,site:inspection.site});
+  const principal = profilePrincipalFromExtension(observed);
+  const old = profileManagerIdentities.get(tabId);
+  if (old && !sameProfileManager(old, principal)) {
+    activePrivateManagers.delete(old.credentialId);
+    privateManagerObservations.delete(old.credentialId);
+    armedPrivateDelivery.delete(old.credentialId);
+  }
+  profileManagerIdentities.set(tabId, principal);
+  verifiedPrincipalContexts.add(principal);
+  if (privateCoordinationEnabled && privateJournal) {
+    // Re-enroll the verified tab after proxy/extension reconnect so its
+    // existing durable queue can be inspected. Wake remains explicitly armed.
+    activePrivateManagers.set(principal.credentialId,principal);
+  }
+  return principal;
+}
+
+// Local Desktop confirmation only. Do not rewrite or replay FIFO events.
+const rootRepairOffers = new Map();
+const rootRepairBusy = new Set();
+async function inspectRootRepair(tabId, offer = false) {
+  if (!Number.isSafeInteger(tabId) || tabId <= 0 || !tabRegistry || !bridgeConnected())
+    throw new Error('Connected Proxy and valid tab required');
+  const saved = tabRegistry.get(tabId);
+  const live = await callExtension('inspect_tab', {tab_id:tabId}, 10000);
+  const unresolved = privateJournal?.unresolvedForTab(tabId) ?? [];
+  const reasons = [];
+  if (!saved || saved.parentTabId !== null || saved.phase !== 'root')
+    reasons.push('NOT_REGISTERED_ROOT');
+  if (live.is_managed_worker) reasons.push('MANAGED_WORKER');
+  if (saved && saved.browserSessionId !== live.browser_session_id)
+    reasons.push('BROWSER_SESSION_CHANGED');
+  if (saved && saved.site !== live.site) reasons.push('SITE_CHANGED');
+  if (tabRegistry.hasChildren(tabId)) reasons.push('ROOT_HAS_DESCENDANTS');
+  if (privateCoordinationEnabled && !privateJournal) reasons.push('JOURNAL_UNAVAILABLE');
+  if (unresolved.length) reasons.push('UNRESOLVED_FIFO');
+  const changed = Boolean(saved && saved.incarnationId !== live.incarnation_id);
+  const eligible = reasons.length === 0 && changed;
+  const response = {tab_id:tabId,site:live.site,can_reconcile:eligible,
+    incarnation_changed:changed,reasons,has_descendants:tabRegistry.hasChildren(tabId),
+    unresolved_by_phase:unresolved.reduce((counts,item)=>{
+      counts[item.phase]=(counts[item.phase]||0)+1;return counts;
+    },{})};
+  rootRepairOffers.delete(tabId);
+  if (!offer || !eligible) return response;
+  const nonce = crypto.randomUUID();
+  rootRepairOffers.set(tabId,{nonce,expires:Date.now()+60000,
+    oldIncarnation:saved.incarnationId,newIncarnation:live.incarnation_id,
+    browserSessionId:live.browser_session_id,site:live.site});
+  return {...response,confirmation_nonce:nonce};
+}
+async function reconcileRootFromDesktop(tabId, nonce) {
+  if (!PRIVATE_EVENT_ID.test(nonce || '') || rootRepairBusy.has(tabId))
+    throw new Error('Invalid or concurrent root recovery');
+  const offer=rootRepairOffers.get(tabId);
+  rootRepairOffers.delete(tabId);
+  if (!offer || offer.nonce !== nonce || Date.now()>offer.expires)
+    throw new Error('Expired or invalid recovery confirmation');
+  rootRepairBusy.add(tabId);
   try {
-    const record = listPrincipalCredentials(PRINCIPAL_REGISTRY_FILE).find((item) =>
-      item.credentialId === principal.credentialId && !item.revokedAt);
-    return Boolean(record && record.principalId === principal.principalId &&
-      record.browserSessionId === principal.browserSessionId &&
-      record.sessionIncarnationId === principal.sessionIncarnationId &&
-      record.connectionGeneration === principal.connectionGeneration &&
-      record.callerTabId === principal.callerTabId &&
-      record.workspaceId === principal.workspaceId &&
-      record.projectId === principal.projectId &&
-      record.orchestratorId === principal.orchestratorId &&
-      record.parentTaskId === principal.parentTaskId);
-  } catch { return false; } // Corrupt/missing registry never grants authority.
+    const saved=tabRegistry.get(tabId);
+    const live=await callExtension('inspect_tab',{tab_id:tabId},10000);
+    const attested=await callExtension('attest_profile_manager',{tab_id:tabId},10000);
+    if (!saved || saved.incarnationId !== offer.oldIncarnation ||
+        saved.browserSessionId !== offer.browserSessionId || saved.site !== offer.site ||
+        live.incarnation_id !== offer.newIncarnation ||
+        attested.incarnation_id !== offer.newIncarnation ||
+        live.browser_session_id !== offer.browserSessionId ||
+        attested.browser_session_id !== offer.browserSessionId ||
+        live.site !== offer.site || live.is_managed_worker ||
+        live.tab_id !== tabId || attested.tab_id !== tabId ||
+        tabRegistry.hasChildren(tabId) ||
+        (privateCoordinationEnabled && !privateJournal) ||
+        (privateJournal?.unresolvedForTab(tabId).length ?? 0)>0)
+      throw new Error('Root changed or has unresolved events; recovery refused');
+    await tabRegistry.reconcileRoot(live,offer.oldIncarnation);
+    profileManagerIdentities.delete(tabId);
+    const key=profileCredentialId(tabId);
+    activePrivateManagers.delete(key);
+    armedPrivateDelivery.delete(key);
+    privateManagerObservations.delete(key);
+    diagnostics.info('identity.root_reconciled',{tabId,site:live.site});
+    return {tab_id:tabId,reconciled:true,no_replay:true,no_ack:true};
+  } finally { rootRepairBusy.delete(tabId); }
+}
+
+function requireDirectChild(callerId, childId) {
+  if (!tabRegistry?.directChild(callerId, childId)) {
+    throw new Error('Target tab is not a direct child of the supplied caller tab');
+  }
+}
+
+async function verifyDirectChild(callerId, childId) {
+  requireDirectChild(callerId,childId);
+  const record = tabRegistry.get(childId);
+  const live = await callExtension('inspect_tab',{tab_id:childId},10000);
+  if (live.incarnation_id !== record.incarnationId ||
+      live.browser_session_id !== record.browserSessionId ||
+      live.site !== record.site || live.is_managed_worker !== true) {
+    throw new Error('Child tab was replaced, closed or changed incarnation');
+  }
+}
+
+async function verifyLiveAncestry(tabId) {
+  let node = tabRegistry.get(tabId);
+  while (node && node.parentTabId !== null) {
+    const parent = tabRegistry.get(node.parentTabId);
+    if (!parent || parent.incarnationId !== node.parentIncarnationId)
+      throw new Error('Orphaned parent tab; new delegation is held for reconciliation');
+    const observed = await callExtension('inspect_tab',{tab_id:parent.tabId},10000);
+    if (observed.incarnation_id !== parent.incarnationId ||
+        observed.browser_session_id !== parent.browserSessionId ||
+        observed.site !== parent.site)
+      throw new Error('Ancestor tab changed or closed; new delegation is held');
+    node = parent;
+  }
+}
+
+const preparingWorkerTabs = new Set();
+// Browser tabs may defer SPA initialization until foregrounded. Serialize
+// each prepare -> focus -> confirmed-submit handoff, not the worker's reply.
+// Worker models continue generating independently after submission.
+const spawnStartupSerial = {tail: Promise.resolve()};
+function serializeWorkerSpawn(operation) {
+  const next = spawnStartupSerial.tail.then(operation);
+  spawnStartupSerial.tail = next.catch(() => {});
+  return next;
+}
+async function spawnAndBindWorker(args, principal) {
+  return serializeWorkerSpawn(() => prepareAndStartWorker(args,principal));
+}
+async function prepareAndStartWorker(args, principal) {
+  await verifyLiveAncestry(principal.callerTabId);
+  const root = tabRegistry.get(tabRegistry.get(principal.callerTabId)?.rootTabId);
+  if (!root || root.parentTabId !== null || root.browserSessionId !== principal.browserSessionId)
+    throw new Error('Root browser identity is unavailable for worker grouping');
+  const taskText = args.saga_task_id == null ? args.task :
+    args.task + '\n\nExternal tracking reference (optional, not an execution identity): Saga task #' + args.saga_task_id;
+  const params = {...args, task:taskText,__trustedPrincipal:principal,
+    __rootTabId:root.tabId,__rootIncarnationId:root.incarnationId,__defer_start:true,
+    prompt_text:composeAgentPrompt(agentSettings,{
+      kind:'task',operation:args.operation || 'task',task:taskText})};
+  const prepared = await callExtension('spawn_worker',params);
+  if (prepared?.prepared !== true || !Number.isSafeInteger(prepared.tab_id) ||
+      !PRIVATE_EVENT_ID.test(prepared.incarnation_id || '')) {
+    throw new Error('Worker preparation returned no attested tab; reconcile before retrying');
+  }
+  if (preparingWorkerTabs.has(prepared.tab_id))
+    throw new Error('Worker tab already has a pending prepared task; reconcile before retrying');
+  preparingWorkerTabs.add(prepared.tab_id);
+  try {
+    const inspection = await callExtension('inspect_tab',{tab_id:prepared.tab_id});
+    if (inspection.incarnation_id !== prepared.incarnation_id)
+      throw new Error('Prepared worker incarnation changed');
+    const existing = tabRegistry.get(prepared.tab_id);
+    if (existing) {
+      await verifyDirectChild(principal.callerTabId,prepared.tab_id);
+      if (prepared.reused_tab !== true ||
+          !['started','reattached'].includes(existing.phase))
+        throw new Error('Existing worker phase does not permit automatic reuse');
+      await tabRegistry.setPhase(prepared.tab_id,'prepared');
+    } else {
+      if (prepared.reused_tab === true)
+        throw new Error('Unregistered reusable worker requires manual reconciliation');
+      await tabRegistry.registerChild(principal.callerTabId,inspection);
+    }
+    const result = await callExtension('start_prepared_worker',{
+      ...params,__defer_start:false,tab_id:prepared.tab_id,
+      expected_incarnation_id:prepared.incarnation_id,reused_tab:prepared.reused_tab,
+    });
+    await tabRegistry.setPhase(prepared.tab_id,'started');
+    return {...result,parent_tab_id:principal.callerTabId,
+      root_tab_id:tabRegistry.get(prepared.tab_id).rootTabId};
+  } catch (error) {
+    if (tabRegistry.directChild(principal.callerTabId,prepared.tab_id) &&
+        tabRegistry.get(prepared.tab_id)?.phase === 'prepared') {
+      await tabRegistry.setPhase(prepared.tab_id,'uncertain').catch(()=>{});
+    }
+    // A prompt may already have been submitted even if the response vanished.
+    // Keep the prepared tab open; no blind second spawn or task replay.
+    throw new Error('Prepared worker tab ' + prepared.tab_id +
+      ' outcome UNCERTAIN; inspect the tab and registry before retrying: ' + error.message);
+  } finally {
+    preparingWorkerTabs.delete(prepared.tab_id);
+  }
 }
 
 function authorizePrivateCoordination(principal, scope) {
@@ -197,13 +396,14 @@ function authorizePrivateCoordination(principal, scope) {
     principal.connectionGeneration === scope.connectionGeneration;
 }
 
-// Only the authenticated MCP token path can admit a verified principal.
+// Profile context is derived from the connected extension and its selected manager tab.
 async function verifiedPrivateWorkerScope(principal, workerTabId) {
   if (!privateCoordinationEnabled || !verifiedPrincipalContexts.has(principal)) {
-    throw new Error('Private queue requires authenticated scoped caller');
+    throw new Error('Private queue requires a connected profile manager');
   }
   const tabs = await callExtension('list_tabs', { __trustedPrincipal: principal });
   const worker = tabs.find((tab) => tab.tab_id === workerTabId && tab.role === 'worker');
+  await verifyDirectChild(principal.callerTabId,workerTabId);
   if (!worker || typeof worker.incarnation_id !== 'string' ||
       !PRIVATE_EVENT_ID.test(worker.incarnation_id)) {
     throw new Error('Worker tab has no verified creation incarnation');
@@ -255,7 +455,7 @@ function privateScopeKey(owner) {
   }).join('|');
 }
 
-function privateScopedRetryKey(owner, idempotencyKey) {
+function privateProfileRetryKey(owner, idempotencyKey) {
   if (typeof idempotencyKey !== 'string' || !PRIVATE_EVENT_ID.test(idempotencyKey)) {
     throw new Error('Private journal requires a stable UUID retry key');
   }
@@ -290,11 +490,63 @@ function privateSourceKey(source) {
     source.incarnationId.toLowerCase() + '#' + source.connectionGeneration;
 }
 
+// Deterministic view of unresolved predecessor generations. The audit
+// boundary never moves, replays, acknowledges or mutates these events.
+function privateRecipientPredecessors(reduced, recipient, ownerKey) {
+  const currentKey = privateRecipientKey(recipient);
+  const older = reduced.fifo.map((key) => reduced.byRef.get(key))
+    .filter((item) => item.ownerKey === ownerKey &&
+      item.recipientTabId === recipient.tabId &&
+      item.recipientKey !== currentKey &&
+      !['PROCESSED', 'SAGA_CONFIRMED'].includes(item.phase));
+  const snapshot = older.map((item) => [
+    item.recipientKey,item.ref,item.previousPhase ?? item.phase,item.lastSeq,
+  ]);
+  const snapshotSha256 = crypto.createHash('sha256')
+    .update(JSON.stringify(snapshot)).digest('hex');
+  return {currentKey, older, snapshotSha256};
+}
+
+function applyPrivateQueueStep(reduced, step) {
+  if (step.quarantine) {
+    reduced.quarantinedRecipients.set(step.quarantine.currentKey,
+      new Set(step.quarantine.priorKeys));
+    return;
+  }
+  reduced.byRef.set(step.key,step.next);
+  if (step.queued) reduced.fifo.push(step.key);
+}
+
 function privateQueueStep(reduced, event) {
   const ownerKey = privateScopeKey(event.ownerScope);
   const recipientKey = privateRecipientKey(event.recipient);
   const sourceKey = privateSourceKey(event.source);
   const payload = event.payload;
+  if (event.kind === 'recipient.reconcile') {
+    // This is an explicit and durable incarnation boundary, not a
+    // processing ACK or permission to replay any historical message.
+    if (!payload || event.ref !== event.id || sourceKey !== recipientKey ||
+        payload.phase !== 'QUARANTINE_PREDECESSORS' ||
+        Object.keys(payload).sort().join(',') !==
+          'confirmation,phase,priorKeys,reason,snapshotSha256' ||
+        payload.confirmation !== 'QUARANTINE_UNPROCESSED_EVENTS' ||
+        typeof payload.reason !== 'string' || payload.reason.trim().length < 10 ||
+        payload.reason.length > 512 ||
+        typeof payload.snapshotSha256 !== 'string' ||
+        !/^[a-f0-9]{64}$/.test(payload.snapshotSha256) ||
+        !Array.isArray(payload.priorKeys)) {
+      throw new Error('Invalid explicit predecessor reconciliation record');
+    }
+    const predecessors = privateRecipientPredecessors(reduced, event.recipient, ownerKey);
+    const priorKeys = [...new Set(predecessors.older.map((item) => item.recipientKey))].sort();
+    if (!priorKeys.length ||
+        reduced.quarantinedRecipients.has(ownerKey + '#' + recipientKey) ||
+        payload.snapshotSha256 !== predecessors.snapshotSha256 ||
+        JSON.stringify(payload.priorKeys) !== JSON.stringify(priorKeys)) {
+      throw new Error('Historical recipient snapshot changed; inspect events before reconciling');
+    }
+    return {quarantine:{currentKey:ownerKey + '#' + recipientKey,priorKeys}};
+  }
   if (event.kind !== 'queue.transition' || !PRIVATE_EVENT_ID.test(event.ref) ||
       typeof event.recordedAt !== 'string' ||
       !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(event.recordedAt) ||
@@ -365,8 +617,10 @@ function privateQueueStep(reduced, event) {
     // unresolved previous incarnation of that numeric recipient tab.
     const staleIncarnation = reduced.fifo.some((itemKey) => {
       const item = reduced.byRef.get(itemKey);
-      return item.recipientTabId === event.recipient.tabId &&
+      return item.ownerKey === ownerKey &&
+        item.recipientTabId === event.recipient.tabId &&
         item.recipientKey !== recipientKey &&
+        !reduced.quarantinedRecipients.get(ownerKey + '#' + recipientKey)?.has(item.recipientKey) &&
         item.phase !== 'PROCESSED' && item.phase !== 'SAGA_CONFIRMED';
     });
     if (staleIncarnation) throw new Error('Private recipient incarnation requires reconciliation');
@@ -426,13 +680,12 @@ function reducePrivateQueueEvents(events, recovering = false) {
   if (!Array.isArray(events) || events.length > PRIVATE_EVENT_LIMIT) {
     throw new Error('Private queue exceeds the record-count limit');
   }
-  const reduced = { byRef: new Map(), fifo: [] };
+  const reduced = {byRef:new Map(),fifo:[],quarantinedRecipients:new Map()};
   let expectedSeq = 0;
   for (const event of events) {
     if (event.seq !== ++expectedSeq) throw new Error('Private queue sequence gap');
     const step = privateQueueStep(reduced, event);
-    reduced.byRef.set(step.key, step.next);
-    if (step.queued) reduced.fifo.push(step.key);
+    applyPrivateQueueStep(reduced, step);
     if (reduced.byRef.size > PRIVATE_EVENT_LIMIT ||
         reduced.fifo.length > PRIVATE_EVENT_LIMIT) {
       throw new Error('Private queue in-memory state exceeds the limit');
@@ -521,7 +774,7 @@ function replayPrivateJournal(bytes) {
         !Object.hasOwn(event, 'payload')) return unreconciled('INVALID_EVENT');
     let retryKey;
     try {
-      retryKey = privateScopedRetryKey(event.ownerScope, event.idempotencyKey);
+      retryKey = privateProfileRetryKey(event.ownerScope, event.idempotencyKey);
       privateRecipientKey(event.recipient);
     } catch { return unreconciled('INVALID_OWNER_OR_RECIPIENT'); }
     if (ids.has(event.id)) return unreconciled('DUPLICATE_EVENT_ID');
@@ -536,14 +789,11 @@ function replayPrivateJournal(bytes) {
 
 async function openPrivateEventJournal() {
   if (!privateCoordinationEnabled) throw new Error('Private coordination is disabled');
-  // Desktop supplies this absolute path under Electron app.getPath('userData').
-  // CLI without an explicit user-data token path cannot open a private journal.
-  const tokenFile = process.env.BRIDGE_TOKEN_FILE;
-  if (!tokenFile || !path.isAbsolute(tokenFile) ||
-      path.basename(tokenFile).toLowerCase() !== 'bridge.token') {
-    throw new Error('Private journal requires the desktop user-data token path');
-  }
-  const journalPath = path.join(path.dirname(tokenFile), 'coordination.events.journal');
+  // The journal belongs to this app profile and never depends on a token file.
+  const profileDir = process.env.CHAT_ORCH_PROFILE_DIR;
+  if (!profileDir || !path.isAbsolute(profileDir))
+    throw new Error('Private journal requires the desktop profile directory');
+  const journalPath = path.join(profileDir, 'coordination.events.journal');
   const lockPath = journalPath + '.lock';
   let lock;
   let file;
@@ -594,7 +844,7 @@ async function openPrivateEventJournal() {
       throw blocked;
     }
     const byKey = new Map(events.map((event) => [
-      privateScopedRetryKey(event.ownerScope, event.idempotencyKey), event,
+      privateProfileRetryKey(event.ownerScope, event.idempotencyKey), event,
     ]));
     let size = bytes.length;
     let sequence = events.length;
@@ -606,7 +856,7 @@ async function openPrivateEventJournal() {
     // The key correlates one logical event; it grants no caller authority.
     const append = (principal, scope, kind, payload, idempotencyKey) => {
       if (!authorizePrivateCoordination(principal, scope)) {
-        return Promise.reject(new Error('Private journal requires independently authenticated owner'));
+        return Promise.reject(new Error('Private journal needs the matching local-profile manager'));
       }
       if (closePromise) return Promise.reject(new Error('Private journal is closing'));
       const operation = serial.then(async () => {
@@ -623,7 +873,7 @@ async function openPrivateEventJournal() {
         const ownerScope = Object.freeze(Object.fromEntries(
           PRIVATE_SCOPE_FIELDS.map((field) => [field, principal[field]])
         ));
-        const retryKey = privateScopedRetryKey(ownerScope, idempotencyKey);
+        const retryKey = privateProfileRetryKey(ownerScope, idempotencyKey);
         const existing = byKey.get(retryKey);
         const recipient = Object.freeze({
           type: 'manager_tab', tabId: scope.recipientTabId,
@@ -666,14 +916,15 @@ async function openPrivateEventJournal() {
           throw full;
         }
         const id = crypto.randomUUID();
-        const ref = payload?.phase === 'QUEUED' ? id : payload?.ref;
+        const ref = kind === 'recipient.reconcile' || payload?.phase === 'QUEUED'
+          ? id : payload?.ref;
         const prior = queueState.byRef.get(
           privateScopeKey(ownerScope) + '#' + String(ref).toLowerCase()
         );
         const entryType = payload?.phase === 'QUEUED' ? payload?.entryType : prior?.entryType;
         // Status is modeled as a manager-originated ordered barrier, but no
         // status ingress or manager delivery path is registered.
-        const source = entryType === 'STATUS_REQUEST'
+        const source = kind === 'recipient.reconcile' || entryType === 'STATUS_REQUEST'
           ? Object.freeze({
             type: 'manager_tab', tabId: scope.recipientTabId,
             incarnationId: scope.recipientIncarnationId,
@@ -713,8 +964,7 @@ async function openPrivateEventJournal() {
         ));
         events.push(stored);
         byKey.set(retryKey, stored);
-        queueState.byRef.set(step.key, step.next);
-        if (step.queued) queueState.fifo.push(step.key);
+        applyPrivateQueueStep(queueState, step);
         return structuredClone(stored);
       });
       serial = operation.catch(() => {});
@@ -724,7 +974,7 @@ async function openPrivateEventJournal() {
     return Object.freeze({
       replay: (principal, scope) => {
         if (!authorizePrivateCoordination(principal, scope)) {
-          throw new Error('Private journal replay requires authenticated owner');
+          throw new Error('Private journal replay requires the same local profile');
         }
         const ownerKey = privateScopeKey(principal);
         const recipientKey = privateRecipientKey({
@@ -738,7 +988,7 @@ async function openPrivateEventJournal() {
       },
       queueState: (principal, scope) => {
         if (!authorizePrivateCoordination(principal, scope)) {
-          throw new Error('Private queue state requires authenticated owner');
+          throw new Error('Private queue state requires the same local profile');
         }
         const ownerKey = privateScopeKey(principal);
         const recipientKey = privateRecipientKey({
@@ -753,7 +1003,7 @@ async function openPrivateEventJournal() {
       },
       recoveryDiagnostics: (principal, scope) => {
         if (!authorizePrivateCoordination(principal, scope)) {
-          throw new Error('Private recovery diagnostics require authenticated owner');
+          throw new Error('Private recovery diagnostics require the same local profile');
         }
         const ownerKey = privateScopeKey(principal);
         const recipientKey = privateRecipientKey({
@@ -778,8 +1028,103 @@ async function openPrivateEventJournal() {
           items,
         });
       },
+      incarnationConflicts: (principal, scope) => {
+        if (!authorizePrivateCoordination(principal, scope)) {
+          throw new Error('Private incarnation diagnostics require the same local profile');
+        }
+        const ownerKey = privateScopeKey(principal);
+        const recipient = {
+          type:'manager_tab',tabId:scope.recipientTabId,
+          incarnationId:scope.recipientIncarnationId,
+          connectionGeneration:scope.recipientGeneration,
+        };
+        const {currentKey,older,snapshotSha256} =
+          privateRecipientPredecessors(queueState,recipient,ownerKey);
+        const quarantinedKeys = queueState.quarantinedRecipients.get(ownerKey + '#' + currentKey);
+        return structuredClone({
+          classification: older.length
+            ? quarantinedKeys ? 'HISTORICAL_EVENTS_QUARANTINED' : 'RECONCILIATION_REQUIRED'
+            : 'CLEAR',
+          recipient_tab_id:scope.recipientTabId,
+          unresolved_event_count:older.length,
+          conflicting_generations:new Set(older.map((item)=>item.recipientKey)).size,
+          snapshot_sha256:snapshotSha256,
+          historical_events_quarantined:Boolean(quarantinedKeys),
+          automatic_replay_allowed:false,
+          events:older.map((item)=>({
+            event_id:item.ref,phase:item.phase,entry_type:item.entryType,
+            recipient_incarnation_id:item.recipientIncarnationId,
+            recipient_generation:item.recipientGeneration,
+            lease_generation:item.leaseGeneration,
+            quarantined:Boolean(quarantinedKeys?.has(item.recipientKey)),
+          })),
+        });
+      },
+      predecessorEvent: (principal,scope,eventId) => {
+        if (!authorizePrivateCoordination(principal,scope) ||
+            !PRIVATE_EVENT_ID.test(eventId)) {
+          throw new Error('Historical event inspection requires an authorized manager and event ID');
+        }
+        const ownerKey = privateScopeKey(principal);
+        const currentKey = privateRecipientKey({
+          type:'manager_tab',tabId:scope.recipientTabId,
+          incarnationId:scope.recipientIncarnationId,
+          connectionGeneration:scope.recipientGeneration,
+        });
+        const event = events.find((record)=>
+          record.id===eventId && record.kind==='queue.transition' &&
+          record.payload.phase==='QUEUED' &&
+          privateScopeKey(record.ownerScope)===ownerKey &&
+          record.recipient.tabId===scope.recipientTabId &&
+          privateRecipientKey(record.recipient)!==currentKey);
+        if (!event) throw new Error('No historical event in this recipient scope');
+        const data=event.payload.data;
+        if (event.payload.entryType==='CHILD_RESULT') {
+          const hash=crypto.createHash('sha256')
+            .update(JSON.stringify({result:data.result??null,error:data.error??null})).digest('hex');
+          if (hash!==data.resultSha256) throw new Error('Historical report checksum mismatch');
+        }
+        return structuredClone({event_id:event.id,entry_type:event.payload.entryType,
+          recorded_at:event.recordedAt,original_recipient_incarnation_id:event.recipient.incarnationId,
+          historical_unprocessed:true,data});
+      },
+      reconcilePredecessors: async (principal,scope,expectedSnapshotSha256,
+          confirmation,reason,idempotencyKey) => {
+        if (!authorizePrivateCoordination(principal,scope)) {
+          throw new Error('Predecessor reconciliation requires the same local-profile manager');
+        }
+        if (confirmation!=='QUARANTINE_UNPROCESSED_EVENTS' ||
+            typeof reason!=='string' || reason.trim().length<10 || reason.length>512 ||
+            !/^[a-f0-9]{64}$/.test(expectedSnapshotSha256)) {
+          throw new Error('Explicit quarantine confirmation, reason and snapshot digest required');
+        }
+        const ownerKey=privateScopeKey(principal);
+        const recipient={
+          type:'manager_tab',tabId:scope.recipientTabId,
+          incarnationId:scope.recipientIncarnationId,
+          connectionGeneration:scope.recipientGeneration,
+        };
+        const predecessor=privateRecipientPredecessors(queueState,recipient,ownerKey);
+        if (!predecessor.older.length ||
+            predecessor.snapshotSha256!==expectedSnapshotSha256) {
+          throw new Error('Historical snapshot mismatch; inspect unresolved events again');
+        }
+        const priorKeys=[...new Set(predecessor.older.map((item)=>item.recipientKey))].sort();
+        const record=await append(principal,scope,'recipient.reconcile',{
+          phase:'QUARANTINE_PREDECESSORS',snapshotSha256:expectedSnapshotSha256,
+          priorKeys,confirmation,reason,
+        },idempotencyKey);
+        return {reconciliation_event_id:record.id,sequence:record.seq,
+          historical_events_preserved:true,historical_events_processed:false,
+          automatic_replay:false,quarantined_recipient_generations:priorKeys.length};
+      },
       append,
       diagnosticCounts: () => privateQueueDiagnosticCounts(queueState),
+      unresolvedForTab: (tabId) => queueState.fifo
+        .map((key) => queueState.byRef.get(key))
+        .filter((item) => item.recipientTabId === tabId &&
+          !['PROCESSED','SAGA_CONFIRMED'].includes(item.phase))
+        .map((item) => ({phase:item.phase,entryType:item.entryType})),
       close: () => {
         if (!closePromise) {
           closePromise = (async () => {
@@ -818,11 +1163,26 @@ function callExtension(method, params = {}, timeoutMs = 120000) {
       );
     }
     const id = crypto.randomUUID();
+    const startedAt = Date.now();
+    diagnostics.debug('bridge.request',{method,requestId:id,tabId:params.tab_id});
     const timer = setTimeout(() => {
       pending.delete(id);
+      diagnostics.warn('bridge.timeout',{method,requestId:id,durationMs:Date.now()-startedAt});
       reject(new Error(`Extension call "${method}" timed out after ${timeoutMs / 1000}s`));
     }, timeoutMs);
-    pending.set(id, { resolve, reject, timer });
+    pending.set(id, {
+      resolve:(result)=>{
+        diagnostics.debug('bridge.response',{method,requestId:id,
+          durationMs:Date.now()-startedAt,success:true});
+        resolve(result);
+      },
+      reject:(error)=>{
+        diagnostics.warn('bridge.response',{method,requestId:id,
+          durationMs:Date.now()-startedAt,success:false,
+          errorClass:classifyDiagnosticError(error)});
+        reject(error);
+      },timer,
+    });
     bridge.send(JSON.stringify({ type: 'call', id, method, params }));
   });
 }
@@ -846,6 +1206,12 @@ wss.on('connection', (ws) => {
     } catch {}
   }
   bridge = ws;
+  profileSocketGeneration++;
+  diagnostics.info('bridge.connected',{socketGeneration:profileSocketGeneration});
+  profileManagerIdentities.clear();
+  activePrivateManagers.clear();
+  privateManagerObservations.clear();
+  armedPrivateDelivery.clear();
   console.log('[bridge] extension connected');
   ws.send(JSON.stringify({ type: 'coordination_capabilities',
     queue_enabled: privateCoordinationEnabled && Boolean(privateJournal) }));
@@ -867,6 +1233,13 @@ wss.on('connection', (ws) => {
     }
     if (msg.type === 'ping') {
       ws.send(JSON.stringify({ type: 'pong' }));
+      return;
+    }
+    if (msg.type === 'diagnostic_event') {
+      if (typeof msg.event === 'string' && /^[a-z][a-z0-9_.-]{0,79}$/.test(msg.event) &&
+          ['debug','info','warn','error'].includes(msg.level)) {
+        diagnostics.event(msg.level,'extension.'+msg.event,msg.data);
+      }
       return;
     }
     if (msg.type === 'worker_lost') {
@@ -911,22 +1284,25 @@ wss.on('connection', (ws) => {
   ws.on('close', () => {
     if (bridge === ws) {
       bridge = null;
+      diagnostics.warn('bridge.disconnected',{socketGeneration:profileSocketGeneration});
       console.log('[bridge] extension disconnected');
+      profileManagerIdentities.clear();
+      activePrivateManagers.clear();
+      armedPrivateDelivery.clear();
       failAllPending('Extension disconnected while a call was in flight');
     }
   });
 });
 
 // ------------------------------------------------- private producer/manager API
-// The temporary registration is LOST on proxy restart. This intentionally
-// prevents automatic delivery to a reused numeric tab until re-authenticated.
-const activePrivateManagers = new Map(); // credentialId -> frozen token-verified principal
-const privateManagerObservations = new Map(); // transient authenticated readiness, never persisted
+// Manager registration is volatile and reset on extension restart or proxy restart.
+const activePrivateManagers = new Map(); // profileId -> frozen browser-session manager context
+const privateManagerObservations = new Map(); // transient readiness observation
 
 function privateManagerScope(principal) {
   if (!privateCoordinationEnabled || !privateJournal ||
-      !verifiedPrincipalContexts.has(principal) || principal.mode !== 'scoped') {
-    throw new Error('Private coordination requires an authenticated scoped manager');
+      !verifiedPrincipalContexts.has(principal) || principal.mode !== 'profile') {
+    throw new Error('Private coordination requires a configured profile manager');
   }
   const scope = Object.freeze({
     ownerPrincipalId: principal.principalId,
@@ -946,30 +1322,30 @@ function privateManagerScope(principal) {
 
 function registeredPrivateManager(principal) {
   const active = activePrivateManagers.get(principal?.credentialId);
-  if (!active || active.principalId !== principal.principalId ||
-      active.sessionIncarnationId !== principal.sessionIncarnationId ||
-      active.connectionGeneration !== principal.connectionGeneration) {
-    throw new Error('Manager is not registered in this proxy session');
-  }
-  const record = listPrincipalCredentials(PRINCIPAL_REGISTRY_FILE)
-    .find((item) => item.credentialId === principal.credentialId && !item.revokedAt);
-  if (!record || record.principalId !== principal.principalId) {
-    activePrivateManagers.delete(principal.credentialId);
-    throw new Error('Manager credential revoked or absent');
+  if (!active || !sameProfileManager(active, principal) ||
+      !currentPrivatePrincipal(principal)) {
+    throw new Error('Selected manager tab is not registered in this proxy session');
   }
   return active;
 }
 
 function rememberPrivateManagerReadiness(principal, observation) {
-  if (!observation || observation.tab_id !== principal.callerTabId ||
-      !['idle', 'busy', 'draft', 'uncertain', 'unknown'].includes(observation.state) ||
-      observation.browser_session_id !== principal.browserSessionId ||
-      observation.incarnation_id !== principal.sessionIncarnationId) {
-    throw new Error('Paired manager tab could not be attested');
+function rememberPrivateManagerReadiness(principal, observation) {
+  if (!observation) throw new Error('Paired manager tab could not be attested: no browser observation');
+  const mismatches = [];
+  if (observation.tab_id !== principal.callerTabId) mismatches.push('tab_id');
+  if (observation.browser_session_id !== principal.browserSessionId) mismatches.push('browser_session_id');
+  if (observation.incarnation_id !== principal.sessionIncarnationId) mismatches.push('incarnation_id');
+  const validStates = ['idle', 'busy', 'draft', 'loading', 'uncertain', 'unknown'];
+  if (!validStates.includes(observation.state)) mismatches.push('readiness_state');
+  if (mismatches.length) {
+    throw new Error('Paired manager tab could not be attested: mismatch in ' + mismatches.join(', '));
   }
+  // Loading is a valid authenticated observation, but it cannot dispatch.
   privateManagerObservations.set(principal.credentialId, {
     state: observation.state, observedAt: Date.now(),
   });
+}
 }
 
 function privateReadinessState({ revoked, registered, connected, observation, now = Date.now() }) {
@@ -978,114 +1354,69 @@ function privateReadinessState({ revoked, registered, connected, observation, no
   if (!connected) return 'disconnected';
   if (!observation || !Number.isSafeInteger(observation.observedAt) ||
       observation.observedAt > now || now - observation.observedAt > 10000) return 'unknown';
-  return ['idle', 'busy', 'draft', 'uncertain', 'unknown'].includes(observation.state)
+  return ['idle', 'busy', 'draft', 'loading', 'uncertain', 'unknown'].includes(observation.state)
     ? observation.state : 'unknown';
 }
 
 async function registerPrivateManager(principal) {
   privateManagerScope(principal);
   const observation = await callExtension('manager_state', { __trustedPrincipal: principal });
-  if (!currentPrivatePrincipal(principal)) throw new Error('Manager credential revoked during registration');
+  if (!currentPrivatePrincipal(principal)) throw new Error('Configured manager tab changed during registration');
   rememberPrivateManagerReadiness(principal, observation);
   activePrivateManagers.set(principal.credentialId, principal);
   return { registered: true, manager_tab_id: principal.callerTabId,
     observation: observation.state, storage_ready: true };
 }
 
-// Independent readback from the already-running LOCAL Saga UI. A client-supplied
-// note/status is never accepted as proof; missing board fails closed.
-const SAGA_READBACK_BASE = process.env.SAGA_READBACK_BASE_URL || 'http://127.0.0.1:4319';
-async function sagaReadTask(taskId) {
-  const base = new URL(SAGA_READBACK_BASE);
-  if (base.protocol !== 'http:' || base.hostname !== '127.0.0.1' ||
-      base.username || base.password || base.search || base.hash ||
-      base.pathname !== '/') {
-    throw new Error('Saga readback must use a dedicated 127.0.0.1 HTTP origin');
+// Closure is an internal worker lifecycle decision, not a Saga board operation.
+// Optional Saga references remain external reporting metadata only.
+// Closure is controlled by the parent and internal worker task UUIDs. Saga
+// references are optional external metadata, never a gate or ownership key.
+async function closeReviewedWorker(principal, args) {
+  const worker = tabRegistry.get(args.tab_id);
+  if (!worker || worker.parentTabId !== principal.callerTabId ||
+      !['started','reattached'].includes(worker.phase)) {
+    throw new Error('Worker is not in a closable state; reconcile it first');
   }
-  const response = await fetch(new URL('/api/tasks/' + taskId, base), {
-    signal: AbortSignal.timeout(3000), headers: { accept: 'application/json' },
-    redirect: 'error',
+  if (tabRegistry.hasChildren(args.tab_id))
+    throw new Error('Worker has descendants; close or reconcile them first');
+  const inspected = await callExtension('inspect_worker_tasks', {
+    __trustedPrincipal:principal,tab_id:args.tab_id,
+    worker_incarnation_id:worker.incarnationId,
   });
-  if (!response.ok) throw new Error('Saga task readback unavailable');
-  const task = await response.json();
-  if (task.id !== taskId || task.is_deleted) throw new Error('Saga task identity unavailable');
-  return task;
-}
-
-async function verifiedSagaClose(principal, args) {
-  const active = registeredPrivateManager(principal);
-  const managerScope = privateManagerScope(active);
-  if (!PRIVATE_EVENT_ID.test(args.saga_event_id || '') ||
-      !Number.isSafeInteger(args.saga_note_id) || args.saga_note_id <= 0 ||
-      !Number.isSafeInteger(args.saga_task_id) || args.saga_task_id <= 0) {
-    throw new Error('Scoped close HELD: event, task and note verification IDs are required');
+  if (inspected?.tab_id !== args.tab_id ||
+      inspected.worker_incarnation_id !== worker.incarnationId ||
+      !Array.isArray(inspected.tasks) || inspected.tasks.length === 0 ||
+      inspected.tasks.some((task)=>!PRIVATE_EVENT_ID.test(task.task_id || '') ||
+        !['done','failed'].includes(task.status))) {
+    throw new Error('Worker tasks are missing, running or unresolved');
   }
-  const item = privateJournal.queueState(active, managerScope)
-    .find((entry) => entry.ref === args.saga_event_id);
-  if (!item || !['PROCESSED', 'SAGA_CONFIRMED'].includes(item.phase)) {
-    throw new Error('Scoped close HELD: child result has no processed journal ACK');
+  if (privateCoordinationEnabled && privateJournal) {
+    const active = registeredPrivateManager(principal);
+    const scope = privateManagerScope(active);
+    const reports = privateJournal.replay(active,scope).filter((event)=>
+      event.payload.phase === 'QUEUED' &&
+      event.payload.entryType === 'CHILD_RESULT' &&
+      event.source.tabId === args.tab_id &&
+      event.source.incarnationId === worker.incarnationId);
+    const acknowledgements = new Set(privateJournal.queueState(active,scope)
+      .filter((item)=>['PROCESSED','SAGA_CONFIRMED'].includes(item.phase))
+      .map((item)=>item.ref));
+    for (const task of inspected.tasks) {
+      if (!reports.some((event)=>event.payload.data.taskId === task.task_id &&
+          event.payload.data.status === task.status && acknowledgements.has(event.id))) {
+        throw new Error('Parent has not ACKed worker result ' + task.task_id +
+          '; review it or send a fixing task to the same worker');
+      }
+    }
   }
-  const original = privateJournal.replay(active, managerScope).find((event) =>
-    event.id === args.saga_event_id && event.payload.phase === 'QUEUED' &&
-    event.payload.entryType === 'CHILD_RESULT');
-  if (!original || original.source.tabId !== args.tab_id ||
-      original.payload.data.workerTabId !== args.tab_id) {
-    throw new Error('Scoped close HELD: event does not belong to this worker');
-  }
-  const parentTaskId = Number(active.parentTaskId);
-  if (!Number.isSafeInteger(parentTaskId) || parentTaskId <= 0) {
-    throw new Error('Scoped close HELD: parent Saga task binding invalid');
-  }
-  const parent = await sagaReadTask(parentTaskId);
-  const board = args.saga_task_id === parentTaskId
-    ? parent : await sagaReadTask(args.saga_task_id);
-  if (String(board.project_id) !== String(active.projectId) ||
-      String(parent.project_id) !== String(active.projectId) ||
-      board.epic_id !== parent.epic_id) {
-    throw new Error('Scoped close HELD: Saga project/epic binding mismatch');
-  }
-  const subtaskId = args.saga_subtask_id ?? null;
-  if (subtaskId === null ? board.status !== 'done' :
-      !board.subtasks?.some((entry) =>
-        entry.id === subtaskId && entry.status === 'done')) {
-    throw new Error('Scoped close HELD: Saga task/subtask not complete');
-  }
-  const marker = 'CHATORCH_SAGA_VERIFIED ' + [
-    args.saga_event_id, original.payload.data.taskId,
-    String(args.tab_id), active.credentialId,
-  ].join(' ');
-  const note = board.notes?.find((entry) => entry.id === args.saga_note_id &&
-    entry.related_entity_type === 'task' && entry.related_entity_id === board.id &&
-    typeof entry.content === 'string' && entry.content.includes(marker));
-  if (!note) throw new Error('Scoped close HELD: linked Saga evidence note missing');
-  const noteDigest = crypto.createHash('sha256').update(note.content).digest('hex');
-  // Read once more before release: board could have changed during journal sync.
-  const fresh = await sagaReadTask(board.id);
-  const freshNote = fresh.notes?.find((entry) =>
-    entry.id === note.id && entry.content === note.content);
-  const stillDone = subtaskId === null ? fresh.status === 'done'
-    : fresh.subtasks?.some((entry) => entry.id === subtaskId && entry.status === 'done');
-  if (!freshNote || !stillDone) {
-    throw new Error('Scoped close HELD: Saga readback changed before release');
-  }
-  if (item.phase === 'PROCESSED') {
-    await privateJournal.append(active, privateRecordedScope(active, original),
-      'queue.transition', {
-        phase: 'SAGA_CONFIRMED', ref: item.ref,
-        leaseGeneration: item.leaseGeneration, leaseNonce: item.leaseNonce,
-        saga: {
-          eventRef: item.ref, principalId: active.principalId,
-          workerTabId: args.tab_id, sagaTaskId: board.id,
-          sagaSubtaskId: subtaskId, sagaNoteId: note.id,
-          noteSha256: noteDigest, readbackAt: new Date().toISOString(),
-        },
-      }, crypto.randomUUID());
-  }
-   registeredPrivateManager(active); // Recheck authority after asynchronous Saga readback.
-  return callExtension('close_verified_worker', {
-    __trustedPrincipal: active, tab_id: args.tab_id,
-    worker_incarnation_id: original.source.incarnationId,
-    saga_verified: true, saga_event_id: item.ref,
+  await verifyDirectChild(principal.callerTabId,args.tab_id);
+  if (privateCoordinationEnabled && privateJournal) registeredPrivateManager(principal);
+  else if (!currentPrivatePrincipal(principal))
+    throw new Error('Parent tab changed during close review');
+  return callExtension('close_reviewed_worker',{
+    __trustedPrincipal:principal,tab_id:args.tab_id,
+    worker_incarnation_id:worker.incarnationId,parent_reviewed:true,
   });
 }
 
@@ -1160,8 +1491,7 @@ async function acceptPrivateWorkerCompletion(packet) {
     result_sha256: data.resultSha256, seq: record.seq, durably_recorded: true };
 }
 
-// Closed workers can no longer be verified through live list_tabs. Accept only
-// an authenticated extension receipt that matches an existing scoped task.
+// A worker-loss report must match the existing local-profile task and incarnation.
 async function acceptPrivateWorkerLoss(packet) {
   if (!privateCoordinationEnabled || !privateJournal) throw new Error('Private child-loss queue unavailable');
   if (!packet || !PRIVATE_EVENT_ID.test(packet.task_id || '') ||
@@ -1263,12 +1593,17 @@ async function pumpOnePrivateManager(principal) {
       !armedPrivateDelivery.has(principal.credentialId) ||
       privateDispatching.has(principal.credentialId)) return;
   privateDispatching.add(principal.credentialId);
+  diagnostics.debug('fifo.pump_started',{callerTabId:principal.callerTabId});
   try {
     registeredPrivateManager(principal); // Rechecks revocation on every wake.
     const managerScope = privateManagerScope(principal);
     let pendingQueue = privateJournal.queueState(principal, managerScope)
       .filter((item) => item.phase !== 'PROCESSED' && item.phase !== 'SAGA_CONFIRMED');
-    if (!pendingQueue.length || pendingQueue[0].phase !== 'QUEUED') return;
+    if (!pendingQueue.length || pendingQueue[0].phase !== 'QUEUED') {
+      diagnostics.debug('fifo.pump_held',{callerTabId:principal.callerTabId,
+        queueDepth:pendingQueue.length,phase:pendingQueue[0]?.phase || 'empty'});
+      return;
+    }
     // Stop at the first unresolved earlier batch; never skip a status barrier.
     const batchItems = [];
     for (const item of pendingQueue) {
@@ -1300,10 +1635,19 @@ async function pumpOnePrivateManager(principal) {
       size += summary.length;
       events.push(candidate);
     }
-    if (!events.length) return; // Oversized immutable event requires manual handling.
+    if (!events.length) {
+      diagnostics.warn('fifo.empty_batch',{callerTabId:principal.callerTabId});
+      return; // Oversized immutable event requires manual handling.
+    }
+    diagnostics.info('fifo.batch_prepared',{callerTabId:principal.callerTabId,batchId,
+      batchSize:events.length,queueDepth:pendingQueue.length});
     const ready = await callExtension('manager_state', { __trustedPrincipal: principal });
     rememberPrivateManagerReadiness(principal, ready);
-    if (ready.ready !== true || ready.state !== 'idle') return;
+    if (ready.ready !== true || ready.state !== 'idle') {
+      diagnostics.debug('fifo.parent_not_ready',{callerTabId:principal.callerTabId,batchId,
+        status:ready.state});
+      return;
+    }
     // An await above may have admitted another producer: revalidate this
     // exact oldest prefix before writing even the first lease.
     pendingQueue = privateJournal.queueState(principal, managerScope)
@@ -1334,6 +1678,8 @@ async function pumpOnePrivateManager(principal) {
         leaseNonce: batchId,
       }, crypto.randomUUID());
     }
+    diagnostics.info('fifo.dispatching',{callerTabId:principal.callerTabId,batchId,
+      batchSize:events.length});
     let submitted = false;
     try {
       registeredPrivateManager(principal); // No stale credential may submit a browser prompt.
@@ -1349,7 +1695,12 @@ async function pumpOnePrivateManager(principal) {
         ref: events[i].event_id, leaseGeneration: 1, leaseNonce: batchId,
       }, crypto.randomUUID());
     }
+    diagnostics.event(submitted?'info':'warn','fifo.dispatch_result',{
+      callerTabId:principal.callerTabId,batchId,batchSize:events.length,
+      phase:submitted?'DELIVERED':'UNCERTAIN',success:submitted});
   } catch (error) {
+    diagnostics.error('fifo.pump_failed',{callerTabId:principal.callerTabId,
+      errorClass:classifyDiagnosticError(error)});
     console.error('[coordination] dispatch held:', error?.message);
   } finally {
     privateDispatching.delete(principal.credentialId);
@@ -1373,8 +1724,13 @@ async function acknowledgePrivateBatch(principal, batchId, eventIds) {
       eventIds.length < 1 || eventIds.length > 16 ||
       items.length !== eventIds.length ||
       items.some((item, i) => item.ref !== eventIds[i])) {
+    diagnostics.warn('fifo.ack_rejected',{callerTabId:principal.callerTabId,
+      batchId, batchSize:Array.isArray(eventIds)?eventIds.length:0,
+      deliveredCount:items.length});
     throw new Error('Batch processing ACK does not match delivered FIFO records');
   }
+  diagnostics.info('fifo.ack_started',{callerTabId:principal.callerTabId,
+    batchId,batchSize:items.length});
   const recorded = privateJournal.replay(active, managerScope);
   const originals = new Map(recorded.filter((event) => event.payload.phase === 'QUEUED')
     .map((event) => [event.id, event]));
@@ -1393,6 +1749,8 @@ async function acknowledgePrivateBatch(principal, batchId, eventIds) {
   await callExtension('manager_processed', {
     __trustedPrincipal: active, batch_id: batchId,
   }).catch(() => {}); // Journal ACK remains primary; extension state may need manual reconciliation.
+  diagnostics.info('fifo.ack_processed',{callerTabId:principal.callerTabId,
+    batchId,processedCount:items.length});
   return { processed: items.map((item) => item.ref), saga_confirmed: false };
 }
 
@@ -1411,15 +1769,61 @@ const errorResult = (err) => ({
 function forward(method, principal) {
   return async (args) => {
     const startedAt = Date.now();
+    const traceId=crypto.randomUUID();
+    diagnostics.debug('mcp.call_started',{traceId,method,callerTabId:args?.caller_tab_id,
+      tabId:args?.tab_id});
     try {
-      // Trust boundary: ignore any caller-supplied identity; the server owns it.
-      const params = { ...(args || {}), __trustedPrincipal: principal };
-      if (method === 'spawn_worker') params.prompt_text = composeAgentPrompt(agentSettings,{kind:'task',operation:args.operation||'task',task:args.task});
-      const result = await callExtension(method, params);
-      recordToolActivity(principal, method, true, startedAt);
+      if (method === 'list_tabs' && args?.caller_tab_id == null) {
+        const candidates = await callExtension('list_tabs',{__discoveryOnly:true});
+        return textResult(candidates);
+      }
+      const selfRead = method === 'read_chat' &&
+        (args?.tab_id == null || args.tab_id === args.caller_tab_id);
+      const caller = await resolveCaller(args,{
+        createRoot:method === 'spawn_worker' || selfRead,
+      });
+      let result;
+      if (method === 'spawn_worker') {
+        result = await spawnAndBindWorker(args,caller);
+      } else if (method === 'reopen_child') {
+        const root = tabRegistry.get(tabRegistry.get(caller.callerTabId)?.rootTabId);
+        if (!root || root.parentTabId !== null ||
+            root.browserSessionId !== caller.browserSessionId)
+          throw new Error('Root browser identity unavailable for child recovery');
+        result = await callExtension(method,{...args,__trustedPrincipal:caller,
+          __rootTabId:root.tabId,__rootIncarnationId:root.incarnationId});
+        if (Number.isSafeInteger(result?.tab_id)) {
+          const inspected = await callExtension('inspect_tab',{tab_id:result.tab_id});
+          await tabRegistry.registerChild(caller.callerTabId,inspected);
+          await tabRegistry.setPhase(result.tab_id,'reattached');
+          result = {...result,parent_tab_id:caller.callerTabId,
+            root_tab_id:tabRegistry.get(result.tab_id).rootTabId};
+        }
+      } else {
+        const target = args?.tab_id;
+        if (method === 'send_to_tab' || (method === 'read_chat' && target != null)) {
+          if (target !== caller.callerTabId) await verifyDirectChild(caller.callerTabId,target);
+        }
+        if (method === 'send_to_tab' &&
+            !['started','reattached'].includes(tabRegistry.get(target)?.phase))
+          throw new Error('Worker is prepared or UNCERTAIN; reconcile before another message');
+        if (method === 'list_tabs') {
+          const tabs = await callExtension('list_tabs',{__trustedPrincipal:caller});
+          result = tabs.filter(t=>t.tab_id === caller.callerTabId ||
+            tabRegistry.directChild(caller.callerTabId,t.tab_id))
+            .map(t=>({...t,parent_tab_id:tabRegistry.get(t.tab_id)?.parentTabId ?? null,
+              root_tab_id:tabRegistry.get(t.tab_id)?.rootTabId ?? null}));
+        } else result = await callExtension(method,{...args,__trustedPrincipal:caller});
+      }
+      recordToolActivity(caller, method, true, startedAt);
+      diagnostics.info('mcp.call_completed',{traceId,method,callerTabId:args?.caller_tab_id,
+        tabId:args?.tab_id,durationMs:Date.now()-startedAt,success:true});
       return textResult(result);
     } catch (err) {
       recordToolActivity(principal, method, false, startedAt);
+      diagnostics.warn('mcp.call_failed',{traceId,method,callerTabId:args?.caller_tab_id,
+        tabId:args?.tab_id,durationMs:Date.now()-startedAt,success:false,
+        errorClass:classifyDiagnosticError(err)});
       return errorResult(err);
     }
   };
@@ -1436,6 +1840,8 @@ const waitSeconds = z
   );
 
 function buildServer(principal) {
+  const callerTabInput = z.number().int().positive()
+    .describe('Browser tab_id of the calling chat conversation. Use list_tabs to discover IDs.');
   const server = new McpServer({ name: 'chat-orchestrator', version: '0.1.0' });
 
   server.registerTool(
@@ -1444,7 +1850,7 @@ function buildServer(principal) {
       title: 'List chat tabs',
       description:
         'List open Claude / ChatGPT tabs in the user\'s browser with their tab_id, site, title and role (orchestrator, worker, or other).',
-      inputSchema: {},
+      inputSchema: {caller_tab_id:callerTabInput.optional()},
     },
     forward('list_tabs', principal)
   );
@@ -1454,14 +1860,17 @@ function buildServer(principal) {
     {
       title: 'Start a worker chat',
       description:
-        'Open a new worker chat on the selected site and send a self-contained task, or continue an authorized reusable seat when a matching role_scope is supplied. Returns task_id and, when wait_seconds permits, a result; use get_result for later results. Worker tabs are held for reconciliation and follow-ups. Before calling close_worker, independently verify authorized ownership, every child incarnation and the required Saga effects; UNCERTAIN or failed Saga reconciliation must keep the tab open.',
+        'Open or reuse a worker chat under caller_tab_id. Returns an internal task_id; use get_result for updates. The parent may inspect the result and send fixing tasks with send_to_tab until satisfied. Saga references are optional external task metadata, never worker identities or closure gates. Close only when parent-owned work is terminal and all required result receipts are processed.',
       inputSchema: {
+        caller_tab_id:callerTabInput,
+        saga_task_id:z.number().int().positive().optional()
+          .describe('Optional external Saga tracking reference; not a worker identifier or closure prerequisite.'),
         site: z.enum(['chatgpt', 'claude', 'gemini']).describe('Which chat site the worker runs on.'),
         operation: z.enum(['task','workspace','delegation']).optional().describe('Operation-specific instructions to include.'),
         role: z.string().trim().min(1).max(128).optional()
           .describe('Optional reusable seat label; any project role is allowed. This is metadata, never authorization or an injected role prompt.'),
         role_scope: z.string().trim().min(1).max(128).optional()
-          .describe('Opaque, owner-scoped stable seat key chosen by your skill/task context. Same label and scope reuse the SAME idle chat; no role-specific Saga hierarchy is imposed.'),
+          .describe('Reusable profile-local seat label from your skill/task context. Same label and scope reuse the same idle chat; the proxy imposes no role hierarchy.'),
         task: z
           .string()
           .min(1)
@@ -1476,7 +1885,7 @@ function buildServer(principal) {
           .boolean()
           .optional()
           .describe(
-             'Automatic worker closure is currently disabled: true is rejected. Keep the worker tab open and close it explicitly only after independent ownership, child-result and Saga verification.'
+             'Automatic worker closure is disabled. The parent reviews results, acknowledges FIFO receipts when enabled, and explicitly calls close_worker.'
           ),
         wait_seconds: waitSeconds,
       },
@@ -1488,8 +1897,8 @@ function buildServer(principal) {
     'reopen_child',
     {
       title:'Recover a lost child conversation',
-      description:'Reopen a saved child conversation by its original task_id; owner-scoped. Returns a newly attached child tab. Execution is NOT automatically resumed. Inspect read_chat and get_result first.',
-      inputSchema:{task_id:z.string().uuid().describe('Original task_id from CHILD_TAB_LOST notification.')},
+      description:'Reopen a saved child conversation by its original task_id in this profile. Returns a newly attached child tab. Execution is not automatically resumed. Inspect read_chat and get_result first.',
+      inputSchema:{caller_tab_id:callerTabInput,task_id:z.string().uuid().describe('Original task_id from CHILD_TAB_LOST notification.')},
     },
     forward('reopen_child',principal)
   );
@@ -1500,6 +1909,7 @@ function buildServer(principal) {
       description:
         'Send another message to a worker tab that is already open (continues that chat). Returns a task_id; use get_result to collect the reply.',
       inputSchema: {
+        caller_tab_id:callerTabInput,
         tab_id: z.number().int().describe('tab_id of the worker tab (from list_tabs or spawn_worker).'),
         text: z.string().min(1).describe('Message to send.'),
         wait_seconds: waitSeconds,
@@ -1515,13 +1925,13 @@ function buildServer(principal) {
       description:
         'Get the status/result of a task started by spawn_worker or send_to_tab. If it is still running, waits up to wait_seconds (max 50). Call it again if status is still "running".',
       inputSchema: {
+        caller_tab_id:callerTabInput,
         task_id: z.string().describe('The task_id returned earlier.'),
         wait_seconds: waitSeconds,
       },
     },
     forward('get_result', principal)
   );
-
   server.registerTool(
     'read_chat',
     {
@@ -1529,6 +1939,7 @@ function buildServer(principal) {
       description:
         'Read the conversation using the site conversation API where available, with DOM fallback. Supports ChatGPT, Claude and Gemini. Defaults to orchestrator/active tab. Reasoning is excluded by default; image and attachment names can be included.',
       inputSchema: {
+        caller_tab_id:callerTabInput,
         tab_id: z
           .number()
           .int()
@@ -1547,56 +1958,73 @@ function buildServer(principal) {
     {
       title: 'Close a worker tab',
       description:
-        'Close a worker tab/window that was opened by spawn_worker. Call this yourself when you have collected a worker\'s result and no longer need it. Safe to call on an already-closed tab.',
+        'Close your direct child after reviewing results and any fixing tasks. Requires terminal internal task history and processed FIFO receipts when coordination is enabled. No Saga task, note or event IDs required.',
       inputSchema: {
+        caller_tab_id:callerTabInput,
         tab_id: z.number().int().describe('tab_id of the worker to close.'),
-        saga_task_id: z.number().int().positive().optional(),
-        saga_subtask_id: z.number().int().positive().optional(),
-        saga_note_id: z.number().int().positive().optional(),
-        saga_event_id: z.string().uuid().optional(),
+        // Saga IDs are external task metadata, never a closure prerequisite.
       },
     },
     async (args) => {
       try {
-        if (principal.mode === 'scoped') {
-          return textResult(await verifiedSagaClose(principal, args));
-        }
-        return textResult(await callExtension('close_worker', {
-          ...args, __trustedPrincipal: principal,
-        }));
+        const caller = await resolveCaller(args);
+        await verifyDirectChild(caller.callerTabId,args.tab_id);
+        if (tabRegistry.hasChildren(args.tab_id))
+          throw new Error('Child has descendants; close or reconcile them before closing this tab');
+        const result = await closeReviewedWorker(caller,args);
+        if (result?.closed === args.tab_id) await tabRegistry.remove(args.tab_id);
+        return textResult(result);
       } catch (error) { return errorResult(error); }
     }
   );
 
   // Conditional private API: never present in the standard six-tool endpoint.
   if (privateCoordinationEnabled && privateJournal) {
+    server.registerTool('coordination_inspect_worker_tasks', {
+      title: 'Recover task identifiers from an owned worker',
+      description: 'Read-only task IDs and statuses for a verified direct child. Never retries work.',
+      inputSchema: {caller_tab_id:callerTabInput,tab_id:z.number().int().positive()},
+    }, async (args) => {
+      try {
+        const caller = await resolveCaller(args);
+        await verifyDirectChild(caller.callerTabId,args.tab_id);
+        const worker = tabRegistry.get(args.tab_id);
+        return textResult(await callExtension('inspect_worker_tasks', {
+          __trustedPrincipal:caller,tab_id:args.tab_id,
+          worker_incarnation_id:worker.incarnationId,
+        }));
+      } catch (error) { return errorResult(error); }
+    });
     server.registerTool('coordination_register_manager', {
-      title: 'Register scoped manager for private queue',
-      description: 'Attest the paired manager tab for this proxy process. No automatic replay on restart.',
-      inputSchema: {},
-    }, async () => {
-      try { return textResult(await registerPrivateManager(principal)); }
+      title: 'Register profile manager for private queue',
+      description: 'Register the caller tab as a queue recipient without selecting a global manager. No replay on restart.',
+      inputSchema: {caller_tab_id:callerTabInput},
+    }, async (args) => {
+      try { return textResult(await registerPrivateManager(
+        await resolveCaller(args,{createRoot:true}))); }
       catch (error) { return errorResult(error); }
     });
     server.registerTool('coordination_status_request', {
       title: 'Queue an ordered manager status barrier',
       description: 'Durably enqueue STATUS_REQUEST after earlier child reports; does not send a chat prompt.',
       inputSchema: {
+        caller_tab_id:callerTabInput,
         idempotency_key: z.string().uuid(),
         summary: z.string().max(4000),
       },
     }, async (args) => {
-      try { return textResult(await enqueuePrivateStatus(principal, args.idempotency_key, args.summary)); }
+      try { return textResult(await enqueuePrivateStatus(await resolveCaller(args), args.idempotency_key, args.summary)); }
       catch (error) { return errorResult(error); }
     });
     server.registerTool('coordination_start_delivery', {
       title: 'Arm private automatic batched manager wake',
       description: 'After explicit registration, automatically wake the paired manager once on stable idle. No recovered UNCERTAIN replay.',
-      inputSchema: {},
-    }, async () => {
+      inputSchema: {caller_tab_id:callerTabInput},
+    }, async (args) => {
       try {
-        registeredPrivateManager(principal);
-        armedPrivateDelivery.add(principal.credentialId);
+        const caller = await resolveCaller(args);
+        registeredPrivateManager(caller);
+        armedPrivateDelivery.add(caller.credentialId);
         setImmediate(pumpPrivateQueue);
         return textResult({ armed: true, no_replay: true });
       } catch (error) { return errorResult(error); }
@@ -1604,43 +2032,85 @@ function buildServer(principal) {
     server.registerTool('coordination_pause_delivery', {
       title: 'Pause private manager wake',
       description: 'Stop new batch dispatch for this credential; already submitted batch remains unresolved.',
-      inputSchema: {},
-    }, async () => {
-      armedPrivateDelivery.delete(principal.credentialId);
-      return textResult({ armed: false });
+      inputSchema: {caller_tab_id:callerTabInput},
+    }, async (args) => {
+      try {
+        const caller = await resolveCaller(args);
+        armedPrivateDelivery.delete(caller.credentialId);
+        return textResult({ armed: false });
+      } catch (error) { return errorResult(error); }
     });
     server.registerTool('coordination_ack_batch', {
       title: 'Explicitly acknowledge processed private batch',
       description: 'Call only after handling every ordered event. This records consumer ACK, NOT independently verified Saga completion.',
       inputSchema: {
+        caller_tab_id:callerTabInput,
         batch_id: z.string().uuid(),
         event_ids: z.array(z.string().uuid()).min(1).max(16),
       },
     }, async (args) => {
       try {
-        const result = await acknowledgePrivateBatch(principal, args.batch_id, args.event_ids);
+        const result = await acknowledgePrivateBatch(await resolveCaller(args), args.batch_id, args.event_ids);
         setImmediate(pumpPrivateQueue);
         return textResult(result);
       } catch (error) { return errorResult(error); }
     });
     server.registerTool('coordination_get_report', {
-      title: 'Read immutable owner-scoped child report',
+      title: 'Read immutable profile-local child report',
       description: 'Read full report bytes from a validated journal event; no mutable worker tab dependence.',
-      inputSchema: { event_id: z.string().uuid() },
+      inputSchema: { caller_tab_id:callerTabInput,event_id: z.string().uuid() },
     }, async (args) => {
-      try { return textResult(getPrivateFullReport(principal, args.event_id)); }
+      try { return textResult(getPrivateFullReport(await resolveCaller(args), args.event_id)); }
       catch (error) { return errorResult(error); }
     });
     server.registerTool('coordination_pending', {
       title: 'Read own private queue state',
-      description: 'Scoped read-only queue phases; does not release UNCERTAIN items or perform Saga updates.',
-      inputSchema: {},
-    }, async () => {
+      description: 'Read-only queue phases for the current profile; does not release UNCERTAIN items or perform Saga updates.',
+      inputSchema: {caller_tab_id:callerTabInput},
+    }, async (args) => {
       try {
-        const active = registeredPrivateManager(principal);
+        const active = registeredPrivateManager(await resolveCaller(args));
         const scope = privateManagerScope(active);
         return textResult({ events: privateJournal.queueState(active, scope) });
       } catch (error) { return errorResult(error); }
+    });
+    server.registerTool('coordination_incarnation_conflicts', {
+      title: 'Inspect unresolved historical recipient incarnations',
+      description: 'Read-only inspection of unresolved prior manager generations. Never replays or acknowledges events.',
+      inputSchema: {caller_tab_id:callerTabInput},
+    }, async (args) => {
+      try {
+        const active = await resolveCaller(args,{createRoot:true});
+        return textResult(privateJournal.incarnationConflicts(active, privateManagerScope(active)));
+      } catch (error) { return errorResult(error); }
+    });
+    server.registerTool('coordination_get_predecessor_event', {
+      title:'Inspect a historical recipient event',
+      description:'Read-only verified data for an unresolved prior incarnation. Does not deliver, process or ACK it.',
+      inputSchema:{caller_tab_id:callerTabInput,event_id:z.string().uuid()},
+    },async(args)=>{
+      try {
+        const active=await resolveCaller(args,{createRoot:true});
+        return textResult(privateJournal.predecessorEvent(active,privateManagerScope(active),args.event_id));
+      } catch(error) {return errorResult(error);}
+    });
+    server.registerTool('coordination_reconcile_predecessors', {
+      title:'Explicitly quarantine historical recipient generations',
+      description:'Durably records an auditable boundary after operator review. Preserves every historical event as unprocessed; never replays or ACKs them. Requires a fresh snapshot digest, explicit confirmation and stable idempotency key.',
+      inputSchema:{
+        caller_tab_id:callerTabInput,
+        snapshot_sha256:z.string().regex(/^[a-f0-9]{64}$/),
+        confirmation:z.literal('QUARANTINE_UNPROCESSED_EVENTS'),
+        reason:z.string().trim().min(10).max(512),
+        idempotency_key:z.string().uuid(),
+      },
+    },async(args)=>{
+      try {
+        const active=registeredPrivateManager(await resolveCaller(args));
+        return textResult(await privateJournal.reconcilePredecessors(
+          active,privateManagerScope(active),args.snapshot_sha256,
+          args.confirmation,args.reason,args.idempotency_key));
+      } catch(error) {return errorResult(error);}
     });
   }
 
@@ -1650,34 +2120,28 @@ function buildServer(principal) {
 // Desktop-only snapshot through Electron utilityProcess IPC, never public HTTP.
 const privateToolHistory = [];
 let dashboardTimer = null;
+let dashboardRefreshInFlight = false;
+let currentBrowserTabs = {status:'unavailable',tabs:[],observedAt:null};
 function recordToolActivity(principal, method, ok, startedAt) {
   privateToolHistory.push({
     at: new Date().toISOString(), method, ok,
     durationMs: Date.now() - startedAt,
-    caller: principal?.mode === 'scoped' ? principal.role : 'legacy',
+    caller: principal?.mode === 'profile' ? 'profile' : 'legacy',
   });
   if (privateToolHistory.length > 80) privateToolHistory.shift();
 }
 function privateDashboardSnapshot() {
-  let seats = [];
-  let registryError = false;
-  try {
-    seats = listPrincipalCredentials(PRINCIPAL_REGISTRY_FILE).map((principal) => ({
-      credentialId: principal.credentialId,
-      seatName: principal.seatName || principal.role.toUpperCase(),
-      role: principal.role, workspaceId: principal.workspaceId,
-      projectId: principal.projectId, parentTaskId: principal.parentTaskId,
-      callerTabId: principal.callerTabId, revoked: Boolean(principal.revokedAt),
-      registered: activePrivateManagers.has(principal.credentialId),
-      deliveryArmed: armedPrivateDelivery.has(principal.credentialId),
-      readiness: privateReadinessState({
-        revoked: Boolean(principal.revokedAt),
-        registered: activePrivateManagers.has(principal.credentialId),
-        connected: Boolean(bridgeConnected()),
-        observation: privateManagerObservations.get(principal.credentialId),
-      }),
-    }));
-  } catch { registryError = true; }
+  const registryError = false;
+  const seats = [...activePrivateManagers.values()].map((profile) => ({
+    seatName: 'Profile manager', role: 'manager',
+    workspaceId: profile.workspaceId, callerTabId: profile.callerTabId,
+    registered: true, deliveryArmed: armedPrivateDelivery.has(profile.credentialId),
+    readiness: privateReadinessState({
+      revoked: false, registered: true,
+      connected: Boolean(bridgeConnected()),
+      observation: privateManagerObservations.get(profile.credentialId),
+    }),
+  }));
   const aggregate = privateJournal?.diagnosticCounts();
   const phases = aggregate?.phases || Object.fromEntries(
     [...PRIVATE_QUEUE_PHASES].map((phase) => [phase, 0]));
@@ -1700,20 +2164,44 @@ function privateDashboardSnapshot() {
   const visiblePending = queue.filter((item) =>
     !['PROCESSED', 'SAGA_CONFIRMED'].includes(item.phase)).length;
   const hiddenPending = Math.max(0, (aggregate?.pending || 0) - visiblePending);
+  const savedHierarchy=tabRegistry?.list().map(({tabId,parentTabId,rootTabId,site,phase})=>({
+    tabId,parentTabId,rootTabId,site,phase,
+  })) || [];
   return {
     storageReady: privateCoordinationEnabled && Boolean(privateJournal),
     deliveryEnabledByDefault: false, registryError, hiddenPending,
     extensionConnected: Boolean(bridgeConnected()),
+    browserTabs:currentBrowserTabs,
+    tabHierarchy:annotateTabPresence(savedHierarchy,currentBrowserTabs),
     seats, phases, queue: queue.slice(-30),
     toolCalls: privateToolHistory.slice(-25),
     generatedAt: new Date().toISOString(),
   };
 }
-function publishPrivateDashboard() {
-  if (!process.parentPort) return;
+async function publishPrivateDashboard() {
+  if (!process.parentPort || dashboardRefreshInFlight) return;
+  dashboardRefreshInFlight=true;
+  try {
+    if (!bridgeConnected()) {
+      currentBrowserTabs={status:'unavailable',tabs:[],observedAt:null};
+    } else {
+      // Read-only tab discovery. This must never attest/register identities,
+      // change durable relationships, or acknowledge/replay queued work.
+      const discovered=await callExtension('list_tabs',{__discoveryOnly:true},2500);
+      currentBrowserTabs={
+        status:'observed',
+        tabs:normalizeOpenChatTabs(discovered),
+        observedAt:new Date().toISOString(),
+      };
+    }
+  } catch {
+    // A failed browser observation is UNKNOWN, not proof that tabs closed.
+    currentBrowserTabs={status:'unavailable',tabs:[],observedAt:null};
+  } finally {dashboardRefreshInFlight=false;}
+  if (!process.parentPort || !httpServer.listening) return;
   try {
     process.parentPort.postMessage({
-      type: 'coordination_snapshot', snapshot: privateDashboardSnapshot(),
+      type:'coordination_snapshot',snapshot:privateDashboardSnapshot(),
     });
   } catch { /* No export of internal errors or credentials. */ }
 }
@@ -1723,23 +2211,15 @@ const app = express();
 app.use(express.json({ limit: '4mb' }));
 
 app.get('/health', (_req, res) => {
-  let principalState = 'not_enrolled';
-  try {
-    const active = listPrincipalCredentials(PRINCIPAL_REGISTRY_FILE).filter((p) => !p.revokedAt);
-    principalState = active.some((p) => p.browserSessionId) ? 'enrolled'
-      : active.length ? 're_pair_required' : 'not_enrolled';
-  } catch { principalState = 'error'; }
   res.json({
-    ok: true,
-    extensionConnected: Boolean(bridgeConnected()),
+    ok: true, extensionConnected: Boolean(bridgeConnected()),
     coordination: {
-      enabled: false, // Public automated delivery is not yet wired/authorized.
+      enabled: false,
       storageReady: privateCoordinationEnabled && Boolean(privateJournal),
-      principalState,
     },
   });
 });
-app.post('/mcp', requireToken, async (req, res) => {
+app.post('/mcp', attachProfile, async (req, res) => {
   const server = buildServer(req.bridgePrincipal);
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   res.on('close', () => {
@@ -1774,36 +2254,24 @@ const httpServer = http.createServer(app);
 
 httpServer.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url, 'http://localhost');
-  const supplied = url.searchParams.get('token') || '';
-  const directLocal = ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(req.socket.remoteAddress) &&
-    !req.headers['x-forwarded-for'] && !req.headers['x-forwarded-host'] &&
-    !req.headers.forwarded;
-  // Legacy bridge remains compatible while private coordination is off.
-  // Private worker completion/attestation NEVER uses the shared MCP token.
-  const extensionAuthenticated = Boolean(directLocal && EXTENSION_TOKEN && safeEqual(supplied, EXTENSION_TOKEN));
-  const ok = url.pathname === '/bridge' &&
-    (privateCoordinationRequested
-      ? extensionAuthenticated
-      : safeEqual(supplied, TOKEN) || extensionAuthenticated);
-  if (!ok) {
-    socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+  if (url.pathname !== '/bridge') {
+    socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
     socket.destroy();
     return;
   }
   wss.handleUpgrade(req, socket, head, (ws) => {
-    if (extensionAuthenticated) trustedExtensionSockets.add(ws);
+    trustedExtensionSockets.add(ws);
     wss.emit('connection', ws, req);
   });
 });
 
 export async function startServer() {
+  if (stopServerPromise) throw new Error('Cannot start while previous journal shutdown is in progress');
   if (httpServer.listening) return httpServer.address();
-  TOKEN = loadToken();
-  EXTENSION_TOKEN = loadExtensionToken();
   reloadAgentSettings();
-  if (privateCoordinationRequested && !EXTENSION_TOKEN) {
-    throw new Error('Private coordination requires separate extension bridge credential');
-  }
+  // Ownership is scoped to the current Proxy session. Ignore older
+  // tab-relations.json entries; never modify the separate durable FIFO journal.
+  if (!tabRegistry) tabRegistry = createSessionTabRegistry();
   if (privateCoordinationRequested && !['127.0.0.1', '::1', 'localhost'].includes(HOST)) {
     throw new Error('Private extension bridge requires loopback bind');
   }
@@ -1819,8 +2287,25 @@ export async function startServer() {
     }
   }
   return new Promise((resolve, reject) => {
-    const onError = (error) => {
+    const onError = async (error) => {
       httpServer.off('listening', onListening);
+      // The journal lock was acquired before listen(). A failed bind must
+      // release it, otherwise the *next* startup reports a misleading stale
+      // owner even though no proxy is running.
+      clearInterval(privateDispatchTimer);
+      privateDispatchTimer = null;
+      if (privateJournal) {
+        const journal = privateJournal;
+        try {
+          await journal.close();
+          privateJournal = null;
+          privateCoordinationEnabled = false;
+        } catch (closeError) {
+          reject(new AggregateError([error,closeError],
+            'Listener failed and journal lock release needs manual inspection'));
+          return;
+        }
+      }
       reject(error);
     };
     const onListening = () => {
@@ -1828,7 +2313,7 @@ export async function startServer() {
       const address = httpServer.address();
       console.log(`Chat Orchestrator MCP server listening on http://${HOST}:${address.port}`);
       console.log('  Extension bridge: ws://localhost:' + address.port + '/bridge');
-      console.log('  MCP endpoint: /mcp (token required; credential not logged)');
+      console.log('  MCP endpoint: /mcp');
       process.parentPort?.postMessage({ type: 'ready', port: address.port });
       dashboardTimer = setInterval(publishPrivateDashboard, 3000);
       dashboardTimer.unref?.();
@@ -1841,24 +2326,68 @@ export async function startServer() {
   });
 }
 
-export async function stopServer() {
+export function stopServer() {
+  if (stopServerPromise) return stopServerPromise;
+  stopServerPromise = stopServerOnce().finally(() => { stopServerPromise = null; });
+  return stopServerPromise;
+}
+
+async function stopServerOnce() {
   failAllPending('The local MCP server is stopping');
   clearInterval(privateDispatchTimer);
   privateDispatchTimer = null;
   clearInterval(dashboardTimer);
   dashboardTimer = null;
+  currentBrowserTabs = {status:'unavailable',tabs:[],observedAt:null};
   armedPrivateDelivery.clear();
   activePrivateManagers.clear();
+  privateManagerObservations.clear();
+  profileManagerIdentities.clear();
+  rootRepairOffers.clear();
   for (const client of wss.clients) client.terminate();
-  if (httpServer.listening) {
-    await new Promise((resolve, reject) => httpServer.close((error) => error ? reject(error) : resolve()));
+  let listenerError;
+  let journalCloseError;
+  try {
+    if (httpServer.listening) {
+      // A still-open HTTP keep-alive or long-running MCP request must not
+      // prevent journal.close() from ever releasing the single-writer lock.
+      const closed = new Promise((resolve, reject) =>
+        httpServer.close((error) => error ? reject(error) : resolve()));
+      httpServer.closeIdleConnections?.();
+      const forceConnections = setTimeout(() => {
+        console.warn('[bridge] graceful shutdown: closing lingering HTTP connections');
+        httpServer.closeAllConnections?.();
+      }, 4000);
+      forceConnections.unref?.();
+      try { await closed; } finally { clearTimeout(forceConnections); }
+    }
+  } catch (error) {
+    listenerError = error;
+  } finally {
+    if (privateJournal) {
+      const journal = privateJournal;
+      // Journal.close() drains all registered append operations before
+      // closing handles and unlinking this process's own lock. It refuses
+      // new appends once closing starts.
+      try {
+        await journal.close();
+        privateJournal = null;
+        privateCoordinationEnabled = false;
+      } catch (error) {
+        console.error('[bridge] private journal close failed; lock requires owner inspection:', error.message);
+        journalCloseError = error;
+      }
+    }
   }
-  if (privateJournal) {
-    const journal = privateJournal;
-    privateJournal = null;
-    privateCoordinationEnabled = false;
-    await journal.close();
+  // All root/worker relationships are session-only. Close the registry even
+  // if the HTTP listener failed to close, without touching the FIFO journal.
+  if (tabRegistry) {
+    const oldRegistry = tabRegistry;
+    await oldRegistry.closeSession();
+    if (tabRegistry === oldRegistry) tabRegistry = null;
   }
+  if (journalCloseError) throw journalCloseError;
+  if (listenerError) throw listenerError;
 }
 
 if (process.parentPort) {
@@ -1869,9 +2398,13 @@ if (process.parentPort) {
       const action = event.data.action;
       const method = {set_orchestrator: 'desktop_set_orchestrator_tab',
         diagnose: 'desktop_diagnose_tab', close_legacy_workers: 'desktop_close_legacy_workers'}[action];
-      if (!method) return;
+      if (!method && !['inspect_root_repair','confirm_root_repair'].includes(action)) return;
       try {
-        const result = await callExtension(method, {tab_id: event.data.tab_id}, 12000);
+        const result = action === 'inspect_root_repair'
+          ? await inspectRootRepair(event.data.tab_id,true)
+          : action === 'confirm_root_repair'
+            ? await reconcileRootFromDesktop(event.data.tab_id,event.data.confirmation_nonce)
+            : await callExtension(method, {tab_id: event.data.tab_id}, 12000);
         process.parentPort.postMessage({type:'desktop_extension_action_result',request_id:id,ok:true,result});
       } catch (error) {
         process.parentPort.postMessage({type:'desktop_extension_action_result',request_id:id,ok:false,
@@ -1883,22 +2416,6 @@ if (process.parentPort) {
       reloadAgentSettings();
       sendAgentSettings(bridge);
       process.parentPort.postMessage({ type: 'agent_settings_reloaded', revision: agentSettingsRevision });
-      return;
-    }
-    if (event?.data?.type === 'attest_manager_tab') {
-      const requestId = event.data.request_id;
-      if (!PRIVATE_EVENT_ID.test(requestId || '')) return;
-      try {
-        if (!Number.isSafeInteger(event.data.tab_id) || event.data.tab_id <= 0) {
-          throw new Error('Invalid manager tab for desktop attestation');
-        }
-        const result = await callExtension('attest_manager_tab', { tab_id: event.data.tab_id }, 10000);
-        process.parentPort.postMessage({ type: 'manager_attestation', request_id: requestId,
-          ok: true, result });
-      } catch (error) {
-        process.parentPort.postMessage({ type: 'manager_attestation', request_id: requestId,
-          ok: false, error: String(error?.message || 'Tab attestation failed') });
-      }
       return;
     }
     if (event?.data?.type !== 'stop') return;
@@ -1925,4 +2442,5 @@ if (isMain || process.parentPort) {
 export const privateJournalTestHooks = Object.freeze({
   privateJournalFrame, replayPrivateJournal, reducePrivateQueueEvents,
   privateQueueDiagnosticCounts, privateReadinessState,
+  privateRecipientPredecessors, privateScopeKey,
 });

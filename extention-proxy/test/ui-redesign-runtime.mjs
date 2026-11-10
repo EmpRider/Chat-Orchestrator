@@ -91,9 +91,20 @@ try {
     return { name, ...result };
   };
   for (let i = 0; i < 60; i++) {
-    if (await evaluate('document.readyState === "complete" && Boolean(document.getElementById("quick-extension-token"))')) break;
+    if (await evaluate('document.readyState === "complete" && Boolean(document.getElementById("quick-copy-url"))')) break;
     await pause(150);
   }
+  assert.equal(await evaluate('window.bridge.status().then(s => s.privateCoordinationOptIn)'),
+    true, 'new isolated desktop profile must enable FIFO by default');
+  let queueReady = false;
+  for (let i = 0; i < 60; i++) {
+    try {
+      const health = await (await fetch('http://127.0.0.1:' + proxyPort + '/health')).json();
+      if (health.coordination?.storageReady === true) { queueReady = true; break; }
+    } catch {}
+    await pause(200);
+  }
+  assert.equal(queueReady, true, 'default-enabled FIFO journal was not provisioned at startup');
   const results = [];
   await fs.promises.mkdir(output, { recursive: true });
   async function screenshot(name) {
@@ -101,10 +112,10 @@ try {
     await fs.promises.writeFile(path.join(output, 'redesign-' + name + '.png'),
       Buffer.from(capture.data, 'base64'));
   }
-  results.push(await check('overview', 'quick-extension-token'));
+  results.push(await check('overview', 'quick-copy-url'));
   await screenshot('overview');
   for (const [name, control] of [
-    ['connections', 'copy-extension-token'],
+    ['connections', 'copy-url'],
     ['agents', 'agent-seats'],
     ['settings', 'minimize-to-tray'],
   ]) {
@@ -115,13 +126,9 @@ try {
   }
   assert.equal(await evaluate(
     'document.querySelector("[data-view=settings]").getAttribute("aria-current")'), 'page');
-  assert.equal(await evaluate('document.getElementById("principal-panel").hidden'), true,
-    'manual identity enrollment must stay hidden in the normal desktop UI');
-  await evaluate('document.querySelector(".extension-admin-actions").open = true');
-  await evaluate('document.getElementById("show-identity-recovery").click()');
-  assert.equal(await evaluate('document.getElementById("principal-panel").hidden'), false);
-  assert.equal(await evaluate('document.getElementById("principal-panel").open'), true);
-  assert.equal(await evaluate('document.querySelector("[data-view=agents]").getAttribute("aria-current")'), 'page');
+  assert.equal(await evaluate('document.getElementById("principal-panel")'), null,
+    'manual agent pairing must be removed from the desktop UI');
+  assert.equal(await evaluate('document.getElementById("show-identity-recovery")'), null);
   await evaluate('document.querySelector("[data-view=settings]").click()');
   await evaluate('document.querySelector("[data-open-view=connections]").click()');
   assert.equal(await evaluate('document.getElementById("view-connections").hidden'), false);

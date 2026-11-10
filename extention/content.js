@@ -32,7 +32,7 @@
         'article[data-turn="assistant"]',
         '[data-testid^="conversation-turn-"] .markdown',
       ],
-      user: ['[data-message-author-role="user"]', 'article[data-turn="user"]'],
+      user: ['[data-message-author-role="user"]', 'article[data-turn="user"]', 'li[data-message-role="user"]'],
       streamingAttr: null,
     },
     claude: {
@@ -94,20 +94,82 @@
     }
     return null;
   }
+  // Do not wait for fetch/XHR idle: the provider can keep heartbeats open.
+  const pageReadyForSubmission = () => document.readyState === 'complete';
+  async function awaitBrowserPageSettled(timeoutMs = 12000) {
+    const response = await chrome.runtime.sendMessage({
+      type:'browser_page_settled',timeoutMs,
+    });
+    if (response?.ok !== true || response.ready !== true) {
+      throw new Error(response?.error || 'Browser page has not settled after load');
+    }
+  }
 
+  const verifiedAssistantNodes = () => site === 'chatgpt'
+    ? all(['[data-message-author-role="assistant"]', 'article[data-turn="assistant"]',
+        'li[data-message-role="assistant"]']) : assistantNodes();
   const assistantNodes = () => all(A.assistant);
   const userNodes = () => all(A.user);
   const isGenerating = () =>
     !!q(A.stop) || (A.streamingAttr ? !!document.querySelector(A.streamingAttr) : false);
 
-  const composerText = (el) => ((el && (el.value !== undefined ? el.value : el.textContent)) || '').trim();
-  const buttonEnabled = (b) => !!b && !b.disabled && b.getAttribute('aria-disabled') !== 'true';
-  const findSendButton = () => q([...A.send, ...SEND_FALLBACKS]);
+  const normalizePrompt = (text) => String(text ?? '').replace(/\r\n?/g,'\n').replace(/\u00a0/g,' ').trim();
+  const composerText = (el) => !el ? '' : normalizePrompt(
+    el.value !== undefined ? el.value : el.innerText ?? el.textContent);
+  const matchingUserTurn = (text) => {
+    const expected = normalizePrompt(text);
+    return !!expected && userNodes().some((node) =>
+      normalizePrompt(node.innerText ?? node.textContent) === expected);
+  };
+  const buttonEnabled = (b) => !!b && !b.disabled &&
+    b.getAttribute('aria-disabled') !== 'true' &&
+    b.getAttribute('data-disabled') !== 'true' &&
+    !b.closest('[inert]');
+
+  // The primary composer action has precedence over generic Send-labelled
+  // buttons elsewhere (e.g. share dialogs, popovers, or hidden composers).
+  // Never select a generic page button if the composer's own action is disabled.
+  function findSendButton(composer = q(A.input)) {
+    const selectors = [
+      ...A.send,
+      'button[data-testid="composer-submit-button"]',
+      'button[aria-label="Send message"]',
+      ...SEND_FALLBACKS,
+    ];
+    const scope = composer?.closest('form') ||
+      composer?.closest('[data-testid="composer"]') ||
+      composer?.closest('[class*="composer"]');
+    function select(root) {
+      if (!root) return {found:false,button:null};
+      let matched = false;
+      for (const selector of selectors) {
+        const buttons = [...root.querySelectorAll(selector)].filter(visible);
+        if (!buttons.length) continue;
+        matched = true;
+        const enabled = buttons.filter(buttonEnabled);
+        if (enabled.length === 1) return {found:true,button:enabled[0]};
+        if (enabled.length > 1) return {found:true,button:null};
+        // Continue to the next selector *within the same composer*.
+        // A stale disabled primary button must not prevent selecting the
+        // enabled alternate submit control in the active form.
+      }
+      return {found:matched,button:null};
+    }
+    const scoped = select(scope);
+    if (scoped.found) return scoped.button;
+    return select(document).button;
+  }
 
   function lastAssistantText() {
     const nodes = assistantNodes();
     const last = nodes[nodes.length - 1];
     return last ? last.innerText.trim() : '';
+  }
+
+  function chatgptAccountChanged() {
+    return site === 'chatgpt' &&
+      /Your account changed\.\s*Send your message again/i.test(
+        String(document.body?.innerText || ''));
   }
 
   // Selector-free fallback: take everything on the page that appears AFTER the
@@ -132,9 +194,16 @@
   function setInputText(el, text) {
     el.focus();
     if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {
-      const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement : HTMLInputElement;
-      Object.getOwnPropertyDescriptor(proto.prototype, 'value').set.call(el, text);
-      el.dispatchEvent(new Event('input', { bubbles: true }));
+      // Setting .value and dispatching an untrusted synthetic input event can
+      // leave the SPA's controlled composer unchanged. Native editing produces
+      // a browser-dispatched input event and updates its internal state.
+      el.select();
+      const normalized = text.replace(/\r/g, '');
+      const deleted = document.execCommand('delete');
+      const inserted = document.execCommand('insertText', false, normalized);
+      if (!deleted || !inserted || composerText(el) !== normalized.trim()) {
+        throw new Error('Native textarea editing did not synchronize the composer; no prompt was submitted');
+      }
       return;
     }
     // contenteditable (ProseMirror): select all, clear, then insert.
@@ -166,89 +235,149 @@
     if (!composerText(el)) throw new Error('Could not type into the chat input');
   }
 
-  function pressEnter(el) {
-    const opts = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true };
-    el.dispatchEvent(new KeyboardEvent('keydown', opts));
-    el.dispatchEvent(new KeyboardEvent('keyup', opts));
-  }
-
-  // Types the prompt and makes sure it was actually submitted.
+  // Use the provider's enabled DOM Send button, as in the original extension.
+  // Perform only one click; if delivery cannot be confirmed, do not retry.
   async function sendPrompt(text) {
-    const input = await waitFor(() => q(A.input), 20000);
-    if (!input) throw new Error('Chat input not found (not logged in, or selectors changed)');
-
-    const userBefore = userNodes().length;
-    setInputText(input, text);
-    await sleep(600);
-
-    const submitted = () => isGenerating() || userNodes().length > userBefore || composerText(q(A.input)) === '';
-    const notes = [];
-
-    const attempts = [
-      async () => {
-        const btn = await waitFor(() => {
-          const b = findSendButton();
-          return buttonEnabled(b) ? b : null;
-        }, 6000);
-        if (!btn) return 'no enabled send button found';
-        btn.click();
-      },
-      async () => {
-        const form = (q(A.input) || input).closest('form');
-        if (!form) return 'no <form> around the input';
-        form.requestSubmit();
-      },
-      async () => pressEnter(q(A.input) || input),
-    ];
-
-    for (const attempt of attempts) {
-      const note = await attempt();
-      if (note) notes.push(note);
-      if (await waitFor(submitted, 4000, 250)) return;
+    let submitAttempted = false;
+    let insertedByUs = false;
+    try {
+      const ready = await waitFor(() => pageReadyForSubmission() && q(A.input), 45000, 250);
+      if (!ready) throw new Error('Chat page document or composer is not ready');
+      await awaitBrowserPageSettled(45000);
+    if (chatgptAccountChanged()) {
+      throw new Error('ChatGPT session changed before submission; refresh and verify login');
     }
-    throw new Error(
-      `Typed the message but could not submit it (${notes.join('; ') || 'UI did not react'}). ` +
-        'Run "Diagnose this tab" on the worker tab and check the send selectors in content.js.'
-    );
+    const input = ready;
+    const expected = normalizePrompt(text);
+    const previousDraft = composerText(input);
+    if (matchingUserTurn(expected)) {
+      const error = new Error('Matching user turn already exists; inspect task before any repeat submission');
+      error.code = 'SUBMISSION_UNCERTAIN';
+      throw error;
+    }
+    if (previousDraft && previousDraft !== expected) {
+      const error = new Error('Composer contains a different draft; refusing to overwrite or submit it');
+      error.code = 'SUBMISSION_NOT_ATTEMPTED';
+      throw error;
+    }
+    const userBefore = userNodes().length;
+    if (!previousDraft) {
+      insertedByUs = true;
+      setInputText(input, text);
+    }
+    await sleep(250);
+    const button = await waitFor(() => {
+      if (!pageReadyForSubmission() || chatgptAccountChanged()) return null;
+      return findSendButton(input);
+    }, 6500, 200);
+    if (!button) {
+      const inspected = [...document.querySelectorAll([...A.send, ...SEND_FALLBACKS,
+        'button[data-testid="composer-submit-button"]'].join(','))]
+        .filter(visible).map((b) => ({
+          testId:b.getAttribute('data-testid'), enabled:buttonEnabled(b),
+          label:b.getAttribute('aria-label') })).slice(0, 8);
+      throw new Error('No unambiguous enabled submit control for the active composer; ' +
+        'document=' + document.readyState + ', composer=' + input.tagName +
+        ', chars=' + composerText(input).length + ', buttons=' + JSON.stringify(inspected));
+    }
+    if (!pageReadyForSubmission() || chatgptAccountChanged()) {
+      throw new Error('Chat page changed readiness before submission; no message sent');
+    }
+    // No second network-idle gate after inserting the prompt: the page may
+    // legitimately start background requests while the enabled Send control
+    // is ready. Requiring every such request to finish strands an unsent draft.
+    if (!button.isConnected && typeof button.isConnected === 'boolean') {
+      throw new Error('Composer submit control disappeared before click; no prompt sent');
+    }
+    if (!buttonEnabled(button) || composerText(input) !== expected) {
+      throw new Error('Composer changed or Send became disabled before click; no prompt sent');
+    }
+    submitAttempted = true;
+    button.click();
+    const confirmed = await waitFor(() =>
+      userNodes().length > userBefore || isGenerating() || chatgptAccountChanged(), 12000, 200);
+    if (chatgptAccountChanged() || !confirmed) {
+      const error = new Error(chatgptAccountChanged()
+        ? 'ChatGPT account changed during submission; delivery outcome requires reconciliation'
+        : 'Prompt submission outcome uncertain: no new user turn or generation detected');
+      error.code = 'SUBMISSION_UNCERTAIN';
+      throw error;
+    }
+    } catch (error) {
+      if (error.code === 'SUBMISSION_NOT_ATTEMPTED') submitAttempted = false;
+      if (!submitAttempted) {
+        // Preserve pre-existing task drafts; clear only text we just inserted.
+        const composer = q(A.input);
+        if (insertedByUs && composer && composerText(composer) === normalizePrompt(text)) {
+          composer.focus();
+          if (composer.tagName === 'TEXTAREA' || composer.tagName === 'INPUT') {
+            composer.select();
+          } else {
+            const selection=window.getSelection(),range=document.createRange();
+            range.selectNodeContents(composer);
+            selection.removeAllRanges();selection.addRange(range);
+          }
+          document.execCommand('delete');
+        }
+        if (!error.code) error.code = 'SUBMISSION_NOT_ATTEMPTED';
+        if (composer && composerText(composer)) {
+          error.message += '; unsent draft remains and must be reconciled before reuse';
+        }
+      } else {
+        error.code = 'SUBMISSION_UNCERTAIN';
+      }
+      throw error;
+    }
   }
 
   // ------------------------------------------------------------- waiting
   // Prefers the DOM selectors; if they find no new assistant message, falls back
   // to reading the page text after the prompt (needs a longer quiet period because
   // there is no reliable "finished" signal in that mode).
+  // A completed worker result must belong to an actual assistant turn.
+  // ChatGPT page-wide text includes transient UI errors and must never be
+  // promoted to a successful assistant answer.
   async function waitForResponse(baselineCount, timeoutMs, promptText) {
     const t0 = Date.now();
     let started = false;
     let lastText = '';
     let stableSince = Date.now();
-
     const read = () => {
-      if (assistantNodes().length > baselineCount) return { mode: 'dom', text: lastAssistantText() };
-      return { mode: 'fallback', text: fallbackReply(promptText) };
+      if (site === 'chatgpt') {
+        const nodes = verifiedAssistantNodes();
+        if (nodes.length <= baselineCount) return {mode:'none',text:''};
+        const last = nodes[nodes.length - 1];
+        return {mode:'dom',text:String(last?.innerText || last?.textContent || '').trim()};
+      }
+      if (assistantNodes().length > baselineCount) {
+        return {mode:'dom',text:lastAssistantText()};
+      }
+      return {mode:'fallback',text:fallbackReply(promptText)};
     };
 
     while (Date.now() - t0 < timeoutMs) {
+      if (chatgptAccountChanged()) {
+        const error = new Error('ChatGPT account changed after prompt submission; response is unverified');
+        error.code = 'SUBMISSION_UNCERTAIN';
+        throw error;
+      }
       const generating = isGenerating();
-      const r = read();
-      const hasReply = r.mode === 'dom' || !!r.text;
-      if (!started && (generating || hasReply)) started = true;
+      const result = read();
+      if (!started && (generating || result.text)) started = true;
       if (!started && Date.now() - t0 > 60000) {
-        throw new Error(
-          'Message was submitted but no reply appeared within 60s (rate limit, login wall, or the page ' +
-            'text could not be read). Run "Diagnose this tab" on the worker.'
-        );
+        throw new Error('Message submitted but no verified assistant response appeared within 60s');
       }
       if (started) {
-        if (r.text !== lastText) {
-          lastText = r.text;
+        if (result.text !== lastText) {
+          lastText = result.text;
           stableSince = Date.now();
         }
-        const quietNeeded = r.mode === 'dom' ? 3000 : 5000;
-        if (!generating && r.text && Date.now() - stableSince > quietNeeded) return r.text;
+        const quietNeeded = result.mode === 'dom' ? 3000 : 5000;
+        if (!generating && result.text && Date.now() - stableSince > quietNeeded) return result.text;
       }
       await sleep(500);
     }
-    throw new Error('Timed out waiting for the response to finish');
+    throw new Error('Timed out waiting for a verified assistant response');
   }
 
   // ------------------------------------------------------------- reading
@@ -340,6 +469,8 @@
     const main = document.querySelector('main');
     return {
       site,
+      submissionTransport:'dom-button-click-v1',
+      taskDraftPolicy:'exact-match-only',
       url: location.href,
       input: count(A.input),
       send: count([...A.send, ...SEND_FALLBACKS]),
@@ -356,6 +487,8 @@
             testId: btn.getAttribute('data-testid'),
           }
         : null,
+      pageReady: pageReadyForSubmission(),
+      documentReady: document.readyState === 'complete',
       generating: isGenerating(),
       assistantMessages: assistantNodes().length,
       userMessages: userNodes().length,
@@ -379,13 +512,21 @@
   // ------------------------------------------------------------- run loop
   let busy = false;
   let completionReceiptUncertain = false;
-  function observeState() {
+  function observeState(expectedText = null) {
     const input = q(A.input);
     const generating = isGenerating();
-    const occupied = !!composerText(input);
+    const draft = composerText(input);
+    const matchesDraft = !!draft && typeof expectedText === 'string' &&
+      draft === normalizePrompt(expectedText);
+    const alreadySubmitted = matchesDraft && matchingUserTurn(expectedText);
     const state = completionReceiptUncertain ? 'uncertain'
-      : !input ? 'unknown' : busy || generating ? 'busy' : occupied ? 'draft' : 'idle';
-    return { site, state, busy: state === 'busy', ready: state === 'idle' };
+      : chatgptAccountChanged() ? 'uncertain'
+      : !pageReadyForSubmission() ? 'loading'
+      : !input ? 'unknown' : busy || generating ? 'busy' : draft ? 'draft' : 'idle';
+    const ready = state === 'idle' || (state === 'draft' && matchesDraft && !alreadySubmitted);
+    return {site,state,busy:state==='busy',ready,matchingDraft:matchesDraft,
+      matchingUserTurn:alreadySubmitted,draftLength:draft.length,
+      documentReady:document.readyState==='complete'};
   }
 
   // Retry only the same completion receipt, NEVER the external chat submission.
@@ -402,24 +543,42 @@
     throw new Error('Worker completion transport acknowledgment is uncertain');
   }
 
-  async function runPrompt({ taskId, receiptNonce, text, timeoutMs }) {
+  async function runPrompt({ taskId, receiptNonce, text, timeoutMs }, onSubmission) {
     busy = true;
     let report;
+    let submissionReported = false;
+    const reportSubmission = (outcome) => {
+      if (submissionReported) return;
+      submissionReported = true;
+      onSubmission(outcome);
+    };
     try {
-      const baseline = assistantNodes().length;
+      const baseline = site === 'chatgpt' ? verifiedAssistantNodes().length : assistantNodes().length;
       await sendPrompt(text);
+      // This ACK confirms the new user turn, not the assistant's answer.
+      // Releasing the startup slot here lets other workers initialize and
+      // submit while this worker's model response continues independently.
+      reportSubmission({ ok: true, submitted: true });
       const result = await waitForResponse(baseline, timeoutMs || 600000, text);
       report = { type: 'task_done', taskId, receiptNonce, ok: true, text: result };
     } catch (err) {
+      const uncertain = err?.code === 'SUBMISSION_UNCERTAIN';
       report = {
         type: 'task_done', taskId, receiptNonce, ok: false,
+        uncertain,
+        notSubmitted: err?.code === 'SUBMISSION_NOT_ATTEMPTED',
         error: String(err?.message || err),
       };
+      if (!submissionReported) {
+        reportSubmission({ok:false,uncertain,notSubmitted:report.notSubmitted,
+          error:report.error});
+      }
+      if (report.uncertain) completionReceiptUncertain = true;
     }
     try {
       await reportTaskCompletion(report);
     } catch {
-      // Fail closed: block the next prompt until a human reconciles/reloads.
+      // Receipt loss is a distinct uncertainty: never replay a submitted chat.
       completionReceiptUncertain = true;
     } finally {
       busy = false;
@@ -433,9 +592,29 @@
         observeState().state !== 'idle') {
       return { ok: false, uncertain: false, error: 'Manager tab is not idle or batch is invalid' };
     }
+    // Clearing the composer is not proof that the chat accepted a queue batch.
+    // Require this batch's unique ID in a user-message bubble; otherwise UNCERTAIN.
+    const batchMarker = /"batch_id":"([0-9a-f-]{36})"/i.exec(text)?.[1];
+    if (!batchMarker) return { ok: false, uncertain: false, error: 'Manager batch ID missing' };
+    const markerVisible = () => {
+      if (userNodes().some((node) =>
+        String(node.innerText || node.textContent || '').includes(batchMarker))) return true;
+      // UI variants may not expose a user-role selector. A visible chat marker
+      // counts only after it has left the active composer.
+      const inPage = String(document.body?.innerText || '').includes(batchMarker);
+      const stillDraft = composerText(q(A.input)).includes(batchMarker);
+      return inPage && !stillDraft;
+    };
+    if (markerVisible()) {
+      completionReceiptUncertain = true;
+      return { ok: false, uncertain: true, error: 'Batch is already visible; reconcile before retry' };
+    }
     busy = true;
     try {
       await sendPrompt(text);
+      if (!(await waitFor(markerVisible, 12000, 250))) {
+        throw new Error('Manager batch not visible after UI submission');
+      }
       return { ok: true, submitted: true };
     } catch {
       completionReceiptUncertain = true;
@@ -448,20 +627,19 @@
   function onMessage(msg, _sender, sendResponse) {
     switch (msg?.cmd) {
       case 'ping':
-        sendResponse({ ok: true, ...observeState() });
+        sendResponse({ok:true,...observeState(msg.expectedText)});
         break;
       case 'observe_state':
-        sendResponse({ ok: true, ...observeState() });
+        sendResponse({ok:true,...observeState(msg.expectedText)});
         break;
       case 'run_prompt': {
-        const observed = observeState();
+        const observed = observeState(msg.text);
         if (!observed.ready) {
           sendResponse({ ok: false, error: `Tab is not safely idle (${observed.state})` });
         } else {
-          runPrompt(msg);
-          sendResponse({ ok: true });
+          void runPrompt(msg, sendResponse);
         }
-        break;
+        return true; // submission receipt is asynchronous; model reply arrives separately
       }
       case 'submit_manager_batch': {
         submitManagerBatch(msg.text).then(sendResponse).catch(() => {

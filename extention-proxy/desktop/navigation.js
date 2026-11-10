@@ -31,7 +31,6 @@
   for (const button of document.querySelectorAll('[data-open-view]')) {
     button.addEventListener('click', () => showView(button.dataset.openView));
   }
-  byId('quick-extension-token').addEventListener('click', () => byId('copy-extension-token').click());
   byId('quick-copy-url').addEventListener('click', () => byId('copy-url').click());
 
   function setStep(id, label, color) {
@@ -46,25 +45,23 @@
     const ext = running && state.extensionConnected;
     const synced = ext && Number(state.agentSettingsSyncRevision) > 0;
     const online = Boolean(state.routeVerified);
-    setStep('quick-extension-status', synced ? 'Ready' : ext ? 'Needs credential' : 'Not connected',
+    setStep('quick-extension-status', synced ? 'Ready' : ext ? 'Syncing' : 'Not connected',
       synced ? 'good' : ext ? 'warn' : '');
     setStep('quick-connector-status', online ? 'Online' : 'Not connected', online ? 'good' : '');
-    byId('quick-extension-token').disabled = !running;
     byId('quick-copy-url').disabled = !state.domain;
     let headline, guidance;
     if (!running) {
       headline = 'Start the local proxy';
-      guidance = 'Use Start proxy below. Your saved credentials and tunnel settings will be reused.';
+      guidance = 'Use Start proxy below. Your saved profile and Ngrok tunnel settings will be reused.';
     } else if (!ext) {
       headline = 'Connect the browser extension';
-      guidance = 'Open Connections, copy the extension-only credential and connect the popup to the local WebSocket URL.';
+      guidance = 'Open Connections, then enter the displayed local WebSocket URL in the extension popup.';
     } else if (!synced) {
-      headline = 'Extension connected, but settings are not authorized';
-      guidance = 'Copy the extension-only credential—not the MCP token—and select Save connection & reconnect in the popup.';
+      headline = 'Extension connected; waiting for settings sync';
+      guidance = 'Check the local WebSocket URL in the extension popup and select Save connection & reconnect.';
     } else if (!online) {
       headline = 'Your extension is ready. Connect the tunnel';
       guidance = 'Add your dedicated ngrok domain and authtoken under Connections, then select Save & connect.';
-    } else {
       headline = 'All connections are ready';
       guidance = 'The extension is synchronized and the MCP route is online. You can delegate tasks from ChatGPT.';
     }

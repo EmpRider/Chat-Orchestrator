@@ -1,10 +1,15 @@
-import crypto from 'node:crypto';
-import fs from 'node:fs';
-import path from 'node:path';
-
 // An explicit, credential-free CLI config avoids AgentBridge's default
 // ngrok.yml. NGROK_AUTHTOKEN is supplied only through the child environment.
 export const ISOLATED_NGROK_CONFIG = 'version: 3\nagent: {}\n';
+
+export const PRIVATE_QUEUE_PREFERENCE_SCHEMA = 1;
+// The former implicit off state migrates once to the new on-by-default behavior.
+// A deliberate opt-out saved after migration is still respected.
+export function resolvePrivateQueuePreference(saved = {}) {
+  return saved?.privateQueuePreferenceSchema === PRIVATE_QUEUE_PREFERENCE_SCHEMA
+    ? saved.privateCoordinationOptIn !== false
+    : true;
+}
 
 export function normalizeProxyPort(input) {
   const value = String(input ?? '').trim();
@@ -40,11 +45,9 @@ export function normalizeNgrokDomain(input) {
   return url.origin;
 }
 
-export function connectorUrl(domain, token) {
-  if (!domain || !token) return '';
-  const url = new URL('/mcp', normalizeNgrokDomain(domain));
-  url.searchParams.set('token', token);
-  return url.toString();
+export function connectorUrl(domain) {
+  if (!domain) return '';
+  return new URL('/mcp', normalizeNgrokDomain(domain)).toString();
 }
 
 export function normalizeNgrokAuthtoken(input) {
@@ -53,22 +56,4 @@ export function normalizeNgrokAuthtoken(input) {
     throw new Error('Enter a valid ngrok authtoken (without spaces).');
   }
   return value;
-}
-
-export function ensureDesktopToken(file, legacyFile, overrideToken) {
-  if (overrideToken) return overrideToken;
-  if (fs.existsSync(file)) {
-    const saved = fs.readFileSync(file, 'utf8').trim();
-    if (!saved) throw new Error('The saved bridge token is empty. Import a valid token.');
-    return saved;
-  }
-
-  let token = crypto.randomBytes(24).toString('hex');
-  if (legacyFile && fs.existsSync(legacyFile)) {
-    const legacy = fs.readFileSync(legacyFile, 'utf8').trim();
-    if (legacy) token = legacy;
-  }
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, token, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
-  return token;
 }

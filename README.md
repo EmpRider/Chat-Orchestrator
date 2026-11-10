@@ -1,26 +1,25 @@
 # Chat Orchestrator (MCP + browser extension)
 
-## Local 0.1.3 redesigned UI release candidate (November 5, 2026)
+## Local 0.1.3 redesigned UI + modular-instructions candidate (November 6, 2026)
 
-This is a **locally built candidate**, not yet a published GitHub Release. It includes a reorganized
-four-page desktop experience (Overview, Connections, Agents & queue, Preferences) and a
-simpler extension popup with direct guidance for the **extension-only** credential.
+This is a local development candidate, not yet a published GitHub Release. It includes
+four-page desktop navigation and a URL-only extension popup; proxy bridge tokens and
+manual scoped agent pairing have been removed.
 
-- Desktop EXE: `extention-proxy/dist/Chat Orchestrator 0.1.3.exe`
-- Browser extension ZIP: `extention-proxy/dist/Chat-Orchestrator-0.1.3-extension.zip`
+- Desktop EXE: `extention-proxy/dist/Chat-Orchestrator-0.1.3-no-bridge-auth.exe`
+- Browser extension ZIP: `extention-proxy/dist/Chat-Orchestrator-0.1.3-no-bridge-auth-extension.zip`
 
 To update an existing installation, exit the old desktop program using its **system tray > Exit**
 command (window X may only hide it), then run the new portable EXE using the **same profile**.
-Settings and credentials live in the Windows profile data folder, not in the EXE. To update the
-browser extension without losing its extension ID and saved credentials, replace the files in
-its existing unpacked folder, choose **Reload** in Edge/Chrome extensions, then refresh chat
-tabs so document-start hooks are installed. In the extension popup, use **Connections >
-Extension-only credential** from the desktop; the MCP token cannot authorize settings sync.
+Settings and the Ngrok authtoken live in the Windows profile data folder, not in the EXE.
+To update the extension, replace the files in its existing unpacked folder, choose **Reload**
+in Edge/Chrome extensions, then refresh chat tabs. Enter only the local WebSocket URL
+in the extension popup; no bridge credential is required.
 
-Local verification: `npm test` (72 passing), isolated real Electron navigation/layout smoke
-(`node test/ui-redesign-runtime.mjs`), and packaged settings WebSocket smoke
-(`node test/packaged-extension-settings-smoke.mjs`). These do **not** mean the separate
-unfinished P0 crash-recovery and final end-to-end release gates are approved.
+Verified after bridge-auth removal: `npm test` 70 PASS / 0 FAIL, tokenless MCP smoke,
+real Electron four-page UI smoke, and isolated packaged EXE settings WebSocket smoke.
+The new portable EXE and extension ZIP were built locally; GitHub release publication,
+P0 crash recovery, independent QA and live-browser end-to-end approval remain outstanding.
 
 
 An orchestrator chat (Claude or ChatGPT) calls MCP tools; a local server forwards them to a
@@ -72,17 +71,14 @@ Orchestrator chat --MCP/HTTPS (tunnel)--> extention-proxy (server.js)
    domain and tunnel remain separate.
 3. Extract the extension ZIP. Open `chrome://extensions`, enable **Developer mode**,
    select **Load unpacked**, and choose the extracted folder containing `manifest.json`.
-   In the extension popup, set the WebSocket URL to `ws://127.0.0.1:8787/bridge`,
-   copy the **Extension-only credential** using the desktop app's separate copy button,
-   and click **Save connection & reconnect**. The ordinary MCP bridge token cannot
-   receive system prompts or proxy settings.
+   In the extension popup, set `ws://127.0.0.1:8787/bridge` (or the configured profile port)
+   and choose **Save and reconnect**. Proxy-managed settings synchronize automatically.
 4. In desktop **Extension settings & system prompts**, select **Advanced browser actions**
    and enter the chat tab ID (from `list_tabs`) to set the legacy orchestrator.
    Log in to your worker-chat sites in that browser profile.
 5. Once the app shows the ngrok route as verified, click **Copy Connector URL**.
    Add that URL as the ChatGPT connector endpoint. It uses your dedicated domain and
-   has the form `https://YOUR-DOMAIN/mcp?token=YOUR-BRIDGE-TOKEN`.
-   Keep this URL private.
+   has the form `https://YOUR-DOMAIN/mcp`, with no bridge token in the URL.
 6. In the orchestrator chat, try:
    *"Use spawn_worker on chatgpt to review this plan, wait up to 45 seconds, then summarise."*
 
@@ -99,7 +95,7 @@ npm run desktop
 
 The default profile uses port `8787`. For a separate independent local proxy, launch
  the EXE with `--profile=work` and choose an unused port in **Tunnel settings**.
- Each profile keeps separate credentials, prompts, Ngrok configuration and settings.
+ Each profile keeps separate Ngrok authentication, prompts, configuration and settings.
  Never run two apps with the same profile and port.
 
 ## Verify the pieces
@@ -121,9 +117,9 @@ The default profile uses port `8787`. For a separate independent local proxy, la
   task timeout, and editable **operation-specific MCP/agent communication instructions** (task,
   workspace, delegation, queue receipt/ACK, child result, status request, tab loss, and failures).
   BA/PM/TL/Council/Watchdog role policies belong in SKILL.md, never in these proxy prompts.
-  The extension popup owns only its WebSocket URL/token and read-only connection status;
-  settings sync over the extension-only authenticated WebSocket.
-- Token required on both `/mcp` and `/bridge`; server binds to `127.0.0.1` only.
+  The extension popup owns only its local WebSocket URL and read-only connection status;
+  settings synchronize over that WebSocket without a proxy-generated token.
+- Neither `/mcp` nor `/bridge` uses a Chat Orchestrator bridge token; the proxy binds locally to `127.0.0.1`.
 - `send_to_tab` refuses the orchestrator tab; `close_worker` only closes tabs it spawned.
 
 ## Known limits
@@ -135,7 +131,13 @@ The default profile uses port `8787`. For a separate independent local proxy, la
 - Gemini is supported for `read_chat`; automated Gemini worker prompting is not
   enabled. Legacy DOM-only reads can still lose formatting and older virtualized turns.
 - Automating the web UIs may conflict with each site's terms; keep it to personal use.
-- Anyone with your token and tunnel URL can drive your logged-in chats: keep the token secret.
+- Ngrok tunnel authentication is preserved, but there is no separate MCP access token.
+  Anyone who can reach your Ngrok `/mcp` URL may control your logged-in browser tabs.
 
 ## Modular proxy instructions (development)
-Operation-specific prompt modules: core, task, workspace, delegation, queue, child_result, status_request, child_tab_lost, failure. The proxy chooses modules by operation/event; roles stay in SKILL.md. Browser chat prompt tags are not privileged model system messages. A recovered child tab gets a new tab ID; the parent must use read_chat and get_result to reconcile the original task. The legacy role-prompt catalog was replaced; the legacy authentication system and orchestrator recovery dialog remain separate workstreams. Private queue delivery needs a registered owner; offline loss requires manual reconciliation. These changes are not a verified packaged release.
+Operation-specific prompt modules: core, task, workspace, delegation, queue, child_result,
+status_request, child_tab_lost and failure. The proxy selects modules by operation/event;
+roles remain defined by SKILL.md. A recovered worker tab gets a new ID; reconcile its
+original task using read_chat and get_result. Bridge tokens and per-agent pairing are removed;
+private FIFO queue still holds uncertain events for manual reconciliation. Packaged release
+verification is still outstanding.

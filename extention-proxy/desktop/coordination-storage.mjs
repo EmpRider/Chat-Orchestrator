@@ -25,7 +25,7 @@ export function inspectPrivateJournal(journalPath) {
 }
 
 
-// Called only by a trusted local desktop action, before a future proxy start.
+// Called by trusted desktop startup or an explicit local action, before proxy start.
 // There is deliberately no automatic repair, truncation, or stale-lock removal.
 export function preparePrivateJournal(journalPath) {
   if (typeof journalPath !== 'string' || !path.isAbsolute(journalPath)) {

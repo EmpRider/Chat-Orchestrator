@@ -7,7 +7,7 @@
   "main": "desktop/main.mjs",
   "scripts": {
     "start": "node server.js",
-    "test": "node test/smoke.mjs && node --test test/agent-settings.test.mjs test/extension-settings-ws.test.mjs test/extension-settings-renderer.test.mjs test/desktop-config.test.mjs test/ngrok-diagnostics.test.mjs test/server-lifecycle.test.mjs test/gateway.test.mjs test/renderer.test.mjs test/tray-lifecycle.test.mjs test/principal-auth.test.mjs test/scoped-mcp-auth.test.mjs test/owner-acl.test.mjs test/private-journal.test.mjs test/private-journal-disk.test.mjs test/coordination-storage.test.mjs test/private-coordination-mcp.test.mjs test/ui-assets.test.mjs test/read-chat-extraction.test.mjs test/read-chat-structured.test.mjs test/read-chat-mcp-e2e.test.mjs test/ui-redesign-contract.test.mjs",
+    "test": "node test/smoke.mjs && node --test --test-force-exit test/tab-presence.test.mjs test/diagnostics.test.mjs test/agent-settings.test.mjs test/extension-settings-ws.test.mjs test/extension-settings-renderer.test.mjs test/desktop-config.test.mjs test/ngrok-reuse.test.mjs test/ngrok-diagnostics.test.mjs test/server-lifecycle.test.mjs test/graceful-journal-shutdown.test.mjs test/gateway.test.mjs test/renderer.test.mjs test/tray-lifecycle.test.mjs test/owner-acl.test.mjs test/managed-browser-workspace.test.mjs test/private-journal.test.mjs test/private-journal-disk.test.mjs test/coordination-storage.test.mjs test/private-coordination-mcp.test.mjs test/tab-registry.test.mjs test/ui-assets.test.mjs test/read-chat-extraction.test.mjs test/read-chat-structured.test.mjs test/read-chat-mcp-e2e.test.mjs test/chatgpt-submit.test.mjs test/chatgpt-composer.test.mjs test/browser-page-settling.test.mjs test/chatgpt-readiness-state.test.mjs test/ui-redesign-contract.test.mjs",
     "desktop": "electron .",
     "dist:win": "electron-builder --win portable"
   },
@@ -17,6 +17,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.17.0",
     "express": "^4.21.0",
+    "loglayer": "9.4.0",
     "ws": "^8.18.0",
     "zod": "^3.25.0"
   },
@@ -27,8 +28,10 @@
     "files": [
       "desktop/**/*",
       "server.js",
+      "diagnostics.mjs",
+      "tab-presence.mjs",
+      "tab-registry.mjs",
       "agent-settings.mjs",
-      "principal-auth.mjs",
       "package.json",
       "node_modules/**/*"
     ],

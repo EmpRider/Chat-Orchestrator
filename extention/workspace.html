@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Chat Orchestrator Workspace</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, -apple-system, Segoe UI, sans-serif; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #101827; color: #e6edf7; }
+    main { max-width: 610px; margin: 2rem; padding: 2rem; border: 1px solid #34435c; border-radius: 18px; background: #172237; }
+    h1 { font-size: 1.7rem; margin: 0 0 .8rem; }
+    p { color: #bbcbe1; line-height: 1.65; }
+    .mark { color: #75b5ff; font-weight: 700; letter-spacing: .05em; font-size: .8rem; }
+    .note { padding: 1rem; border-radius: 12px; background: #22314a; margin-top: 1.4rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="mark">CHAT ORCHESTRATOR</div>
+    <h1>Managed browser workspace</h1>
+    <p>This window contains the background worker conversations controlled by your local Chat Orchestrator proxy. Workers are organized into tab groups by root orchestrator.</p>
+    <div class="note">You can switch to a worker to inspect it. Closing this tab or window does not complete, acknowledge, or approve any worker task. The proxy keeps its own task and parent-child records.</div>
+  </main>
+</body>
+</html>
