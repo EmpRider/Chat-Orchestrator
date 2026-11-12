@@ -330,7 +330,7 @@ journal and lock files, verify no process is using this specific profile,
 and reconcile unacknowledged or uncertain queue operations before an
 operator-controlled recovery. Never run an automated stale-lock deletion.
 
-The internal event journal is **enabled by default**. Desktop startup prepares the bounded journal before launching the proxy. Existing settings from the old default-off release migrate once to this new default; an explicit opt-out saved afterward is respected. Journal provisioning never removes stale locks or repairs damaged history. The desktop Coordination
+The internal event journal is **enabled by default**. Desktop startup creates it in a fresh temporary directory for this run; saved profile settings and credentials remain available across launches. On normal exit the runtime directory is removed. A crashed run may leave its temporary directory behind; the next launch still starts with a fresh worker queue. The desktop Coordination
 panel shows a read-only journal inspection (presence, byte size and whether an
 owner lock exists). A lock's presence **does not prove its writer is alive**.
 After a crash or interrupted shutdown, treat any remaining `.lock` file or
@@ -349,6 +349,5 @@ incomplete/checksum-invalid event as **manual reconciliation required**.
    ambiguous chat submissions, or close workers**. Leave this profile stopped
    if the evidence is incomplete; use a distinct profile for other work.
 
-The Windows user-data directory and journal path are profile-specific. This is
-an evidence-preserving recovery procedure, **not** a claim of fully automated
-restart recovery or power-loss durability.
+Each run uses a separate temporary journal path. Existing user-data files are
+left untouched; no cross-run queue recovery is attempted.

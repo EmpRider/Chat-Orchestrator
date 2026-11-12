@@ -4,7 +4,7 @@ import {fileURLToPath} from 'node:url';
 import path from 'node:path';
 import {runInNewContext} from 'node:vm';
 import {test} from 'node:test';
-import {normalizeAgentSettings} from '../agent-settings.mjs';
+import {composeAgentPrompt,normalizeAgentSettings} from '../agent-settings.mjs';
 
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
 const clone=(x)=>JSON.parse(JSON.stringify(x));
@@ -31,7 +31,8 @@ test('operation module editor persists edits independently and previews without 
   status:async()=>state,onState(){},
   getAgentSettings:async()=>clone(initial),getDefaultAgentSettings:async()=>clone(initial),
   saveAgentSettings:async(value)=>{persisted=clone(value);return clone(value);},
-  previewPrompt:async(value)=>{previewed=clone(value);return '<system_instructions>Preview</system_instructions>';},
+  previewPrompt:async(value)=>{previewed=clone(value);return composeAgentPrompt(
+   {...initial,promptModules:value.promptModules},value);},
  }};
  const document={getElementById:element,createElement:()=>({textContent:'',className:'',append(){}})};
  runInNewContext(readFileSync(path.join(root,'desktop','renderer.js'),'utf8'),
@@ -50,6 +51,7 @@ test('operation module editor persists edits independently and previews without 
  await new Promise(resolve=>setImmediate(resolve));
  assert.equal(previewed.kind,'queue');
  assert.equal(previewed.promptModules.queue,'Custom queue guidance');
+ assert.match(element('agent-prompt-preview-output').textContent,/Custom queue guidance/);
  assert.equal(element('agent-prompt-preview-output').hidden,false);
  element('agent-max-tasks').value='33';
  await element('agent-settings-save').dispatch('click');

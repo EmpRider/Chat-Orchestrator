@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { connectorUrl, ISOLATED_NGROK_CONFIG, normalizeNgrokAuthtoken, normalizeNgrokDomain, normalizeProxyPort, normalizeProfileName, PRIVATE_QUEUE_PREFERENCE_SCHEMA, resolvePrivateQueuePreference } from './config.mjs';
 import { createNgrokLogReader } from './ngrok-diagnostics.mjs';
@@ -58,6 +59,7 @@ let coordinationSnapshot = null; // Owned utilityProcess emits redacted, read-on
 let stopping = false;
 let agentSettings = normalizeAgentSettings({});
 let agentSettingsSyncRevision = 0;
+const sessionDir = path.join(os.tmpdir(), `chat-orchestrator-session-${crypto.randomUUID()}`);
 
 // Optional loopback CDP is test-only; packaged releases never expose DevTools.
 if (E2E_MODE && !app.isPackaged && process.env.CHAT_ORCH_E2E_CDP_PORT) {
@@ -106,7 +108,7 @@ const diagnostics = createDiagnostics({component:'desktop',directory:dataDir()})
 const settingsFile = () => path.join(dataDir(), 'settings.json');
 const ngrokAuthFile = () => path.join(dataDir(), 'ngrok-auth.bin');
 const ngrokConfigFile = () => path.join(dataDir(), 'ngrok-isolated.yml');
-const privateCoordinationJournalPath = () => path.join(dataDir(), 'coordination.events.journal');
+const privateCoordinationJournalPath = () => path.join(sessionDir, 'coordination.events.journal');
 
 // Provision from trusted desktop startup or IPC. A future start may use the journal,
 // but no record is ACKed merely because this file was created. On Windows,
@@ -408,7 +410,8 @@ function startProxy() {
         ...process.env,
         PORT: String(PORT),
         HOST: '127.0.0.1',
-        CHAT_ORCH_PROFILE_DIR: dataDir(),
+        CHAT_ORCH_PROFILE_DIR: sessionDir,
+        CHAT_ORCH_SETTINGS_DIR: dataDir(),
         CHAT_ORCH_PRIVATE_COORDINATION: privateCoordinationOptIn ? '1' : '0',
       },
     });
@@ -571,7 +574,7 @@ function requireTrustedWindow(event) {
   }
 }
 
-function desktopExtensionAction(action, tabId, nonce) {
+function desktopExtensionAction(action, tabId, nonce, browserSessionId) {
   if (!child || phase !== 'running') return Promise.reject(new Error('Start proxy and connect extension first'));
   if (!['set_orchestrator','diagnose','close_legacy_workers','inspect_root_repair','confirm_root_repair'].includes(action)) {
     return Promise.reject(new Error('Unsupported desktop action'));
@@ -579,8 +582,13 @@ function desktopExtensionAction(action, tabId, nonce) {
   if (action !== 'close_legacy_workers' && (!Number.isSafeInteger(tabId) || tabId <= 0)) {
     return Promise.reject(new Error('Enter an actual positive tab ID'));
   }
-  if (action === 'confirm_root_repair' && (typeof nonce !== 'string' || !/^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(nonce))) {
-    return Promise.reject(new Error('Root recovery requires its one-use confirmation nonce'));
+  if (browserSessionId != null &&
+      (typeof browserSessionId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(browserSessionId))) {
+    return Promise.reject(new Error('Enter a valid browser session ID from list_tabs'));
+  }
+  if (action === 'confirm_root_repair' && (typeof nonce !== 'string' || !/^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(nonce) ||
+      !browserSessionId)) {
+    return Promise.reject(new Error('Root recovery requires its one-use nonce and browser session ID'));
   }
   const owned = child;
   const id = crypto.randomUUID();
@@ -588,19 +596,21 @@ function desktopExtensionAction(action, tabId, nonce) {
     const timer = setTimeout(() => {desktopExtensionActions.delete(id);
       reject(new Error('Extension action timed out; outcome unknown'));}, 15000);
     desktopExtensionActions.set(id, {resolve,reject,timer});
-    try {owned.postMessage({type:'desktop_extension_action', request_id:id, action, tab_id:tabId, confirmation_nonce:nonce});}
+    try {owned.postMessage({type:'desktop_extension_action', request_id:id, action, tab_id:tabId,
+      confirmation_nonce:nonce,browser_session_id:browserSessionId});}
     catch (error) {clearTimeout(timer); desktopExtensionActions.delete(id); reject(error);}
   });
 }
 
 function registerActions() {
-  ipcMain.handle('bridge:extensionAction', (event, action, tabId, nonce) => {
+  ipcMain.handle('bridge:extensionAction', (event, action, tabId, nonce, browserSessionId) => {
     requireTrustedWindow(event);
-    return desktopExtensionAction(action, tabId, nonce);
+    return desktopExtensionAction(action, tabId, nonce, browserSessionId);
   });
   ipcMain.handle('bridge:previewPrompt', (event, input) => {
     requireTrustedWindow(event);
-    return composeAgentPrompt(agentSettings, input);
+    return composeAgentPrompt(input?.promptModules
+      ? {...agentSettings, promptModules: input.promptModules} : agentSettings, input);
   });
   ipcMain.handle('bridge:getAgentSettings', (event) => {
     requireTrustedWindow(event);
@@ -747,6 +757,11 @@ async function shutdownOwnedServices() {
   try {
     await Promise.allSettled([stopNgrok(), stopProxy()]);
   } finally {
+    // Preserve the journal if the proxy did not confirm its lock was released.
+    if (phase === 'stopped' && !fs.existsSync(privateCoordinationJournalPath() + '.lock')) {
+      try { fs.rmSync(sessionDir, {recursive:true,force:true}); }
+      catch (error) { console.error('[desktop] Session cleanup failed:', error.message); }
+    } else console.error('[desktop] Session journal needs inspection; not removing it.');
     tray?.destroy();
     tray = null;
     exitReady = true;
@@ -778,6 +793,7 @@ if (hasInstanceLock) {
   app.on('second-instance', restoreWindow);
   app.whenReady().then(() => {
     debug('app ready');
+    fs.mkdirSync(sessionDir, {mode:0o700});
     loadSettings();
     registerActions();
     createTray();

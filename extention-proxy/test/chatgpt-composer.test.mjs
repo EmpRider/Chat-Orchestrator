@@ -82,6 +82,7 @@ function composerHarness({textarea,extraEnabledButton,neverEnableSend=false,netw
   const chrome={runtime:{onMessage:{
     addListener(fn){messageHandler=fn;},removeListener(){},
   },sendMessage:async(message)=>{
+    if(message.type==='worker_diagnostic') return {ok:true};
     if(message.type==='composer_send_click') throw new Error('DOM sending must not use CDP transport');
     networkChecks++;
     if(networkBusyAfterInput && trustedEvents>0) {

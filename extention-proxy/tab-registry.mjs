@@ -8,6 +8,7 @@ const uuid = (value) => typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[
 
 export function createTabRegistry(file, {sessionOnly = false} = {}) {
   const entries = new Map();
+  const sessionEntries = new Map();
   let serial = Promise.resolve();
   let closed = false;
   if (!sessionOnly && fs.existsSync(file)) {
@@ -63,6 +64,13 @@ export function createTabRegistry(file, {sessionOnly = false} = {}) {
     }
   }
 
+  function tableFor(sessionId) {
+    if (!sessionOnly || !sessionId) return entries;
+    let table=sessionEntries.get(sessionId);
+    if (!table) {table=new Map();sessionEntries.set(sessionId,table);}
+    return table;
+  }
+
   function observed(inspection) {
     if (!inspection || !positive(inspection.tab_id) || !uuid(inspection.incarnation_id) ||
         !uuid(inspection.browser_session_id) ||
@@ -74,7 +82,8 @@ export function createTabRegistry(file, {sessionOnly = false} = {}) {
 
   function registerRoot(inspection) {
     const live = observed(inspection);
-    const old = entries.get(live.tab_id);
+    const table=tableFor(live.browser_session_id);
+    const old = table.get(live.tab_id);
     if (old) {
       if (old.browserSessionId !== live.browser_session_id ||
           old.incarnationId !== live.incarnation_id || old.site !== live.site) {
@@ -83,32 +92,34 @@ export function createTabRegistry(file, {sessionOnly = false} = {}) {
       return old;
     }
     if (live.is_managed_worker) throw new Error('Unregistered worker cannot be promoted to orchestrator');
-    if (entries.size >= 200) throw new Error('Tab registry full');
+    if (table.size >= 200) throw new Error('Tab registry full');
     const record = Object.freeze({tabId:live.tab_id,parentTabId:null,rootTabId:live.tab_id,
       incarnationId:live.incarnation_id,browserSessionId:live.browser_session_id,site:live.site,
       phase:'root'});
-    entries.set(record.tabId,record);
+    table.set(record.tabId,record);
     return record;
   }
 
   function reconcileRoot(inspection, expectedIncarnationId) {
     const live=observed(inspection);
-    const old=entries.get(live.tab_id);
+    const table=tableFor(live.browser_session_id);
+    const old=table.get(live.tab_id);
     if (!old || old.parentTabId !== null || old.phase !== 'root' ||
         live.is_managed_worker || old.rootTabId !== old.tabId ||
         old.browserSessionId !== live.browser_session_id ||
         old.site !== live.site || old.incarnationId !== expectedIncarnationId ||
-        [...entries.values()].some((entry)=>entry.parentTabId === old.tabId)) {
+        [...table.values()].some((entry)=>entry.parentTabId === old.tabId)) {
       throw new Error('Root reconciliation refused: registry ancestry/session changed');
     }
     const updated=Object.freeze({...old,incarnationId:live.incarnation_id});
-    entries.set(updated.tabId,updated);
+    table.set(updated.tabId,updated);
     return updated;
   }
 
   function registerChild(parentId, inspection) {
     const live = observed(inspection);
-    const parent = entries.get(parentId);
+    const table=tableFor(live.browser_session_id);
+    const parent = table.get(parentId);
     if (!parent) throw new Error('Parent tab was not registered');
     // Never extend an orphaned or changed ancestry chain.
     let ancestor = parent;
@@ -116,56 +127,59 @@ export function createTabRegistry(file, {sessionOnly = false} = {}) {
     while (ancestor.parentTabId !== null) {
       if (visited.has(ancestor.tabId)) throw new Error('Parent ancestry cycle');
       visited.add(ancestor.tabId);
-      const next = entries.get(ancestor.parentTabId);
+      const next = table.get(ancestor.parentTabId);
       if (!next || next.incarnationId !== ancestor.parentIncarnationId)
         throw new Error('Parent ancestry requires manual reconciliation');
       ancestor = next;
     }
     if (ancestor.tabId !== parent.rootTabId) throw new Error('Root ancestry mismatch');
-    const existing = entries.get(live.tab_id);
+    const existing = table.get(live.tab_id);
     if (existing) {
       if (existing.parentTabId !== parentId || existing.incarnationId !== live.incarnation_id ||
           existing.browserSessionId !== live.browser_session_id || existing.site !== live.site)
         throw new Error('Child tab collision or parent change');
       return existing;
     }
-    if (parent.tabId === live.tab_id || entries.size >= 200 || live.is_managed_worker !== true)
+    if (parent.tabId === live.tab_id || table.size >= 200 || live.is_managed_worker !== true)
       throw new Error('Invalid or unowned child tab');
     if (parent.browserSessionId !== live.browser_session_id)
       throw new Error('Parent and child browser sessions differ');
     const record = Object.freeze({tabId:live.tab_id,parentTabId:parentId,rootTabId:parent.rootTabId,
       incarnationId:live.incarnation_id,browserSessionId:live.browser_session_id,site:live.site,
       parentIncarnationId:parent.incarnationId,phase:'prepared'});
-    entries.set(record.tabId,record);
+    table.set(record.tabId,record);
     return record;
   }
 
-  function within(callerId, targetId) {
-    let node = entries.get(targetId);
+  function within(callerId, targetId, sessionId) {
+    const table=tableFor(sessionId);
+    let node = table.get(targetId);
     const seen = new Set();
     while (node && !seen.has(node.tabId)) {
       if (node.tabId === callerId) return true;
       seen.add(node.tabId);
-      const next = node.parentTabId === null ? null : entries.get(node.parentTabId);
+      const next = node.parentTabId === null ? null : table.get(node.parentTabId);
       if (next && next.incarnationId !== node.parentIncarnationId) break;
       node = next;
     }
     return false;
   }
 
-  function directChild(parentId, childId) {
-    const child = entries.get(childId);
-    const parent = entries.get(parentId);
+  function directChild(parentId, childId, sessionId) {
+    const table=tableFor(sessionId);
+    const child = table.get(childId);
+    const parent = table.get(parentId);
     return Boolean(parent && child && child.parentTabId === parentId &&
       child.parentIncarnationId === parent.incarnationId);
   }
 
-  function hasChildren(tabId) {
-    return [...entries.values()].some((entry)=>entry.parentTabId===tabId);
+  function hasChildren(tabId, sessionId) {
+    return [...tableFor(sessionId).values()].some((entry)=>entry.parentTabId===tabId);
   }
 
-  function setPhase(tabId, phase) {
-    const current = entries.get(tabId);
+  function setPhase(tabId, phase, sessionId) {
+    const table=tableFor(sessionId);
+    const current = table.get(tabId);
     if (!current || current.parentTabId === null) throw new Error('Unknown worker tab');
     const allowed = {
       prepared:['started','uncertain','reattached'],
@@ -176,41 +190,47 @@ export function createTabRegistry(file, {sessionOnly = false} = {}) {
     if (phase !== current.phase && !allowed[current.phase]?.includes(phase))
       throw new Error('Worker phase requires manual reconciliation');
     const updated = Object.freeze({...current,phase});
-    entries.set(tabId,updated);
+    table.set(tabId,updated);
     return updated;
   }
 
-  function mutate(action) {
+  function mutate(action, sessionId) {
     const operation = serial.then(async () => {
       if (closed) throw new Error('Tab registry session is closed');
-      const previous = new Map(entries);
+      const table=tableFor(sessionId);
+      const previous = new Map(table);
       try { const result = action(); await persist(); return result; }
-      catch (error) { entries.clear(); for(const [id,e] of previous)entries.set(id,e); throw error; }
+      catch (error) { table.clear(); for(const [id,e] of previous)table.set(id,e); throw error; }
     });
     serial = operation.catch(()=>{});
     return operation;
   }
 
   return Object.freeze({
-    get: (id)=>entries.get(id)||null,
-    list: ()=>[...entries.values()],
+    get: (id,sessionId)=>sessionId ? tableFor(sessionId).get(id)||null
+      : entries.get(id) || [...sessionEntries.values()].map((table)=>table.get(id))
+        .find((entry)=>entry) || null,
+    list: (sessionId)=>sessionId ? [...tableFor(sessionId).values()]
+      : [...entries.values(),...[...sessionEntries.values()].flatMap((table)=>[...table.values()])],
     within,
     directChild,
     hasChildren,
-    setPhase:(tabId,phase)=>mutate(()=>setPhase(tabId,phase)),
-    registerRoot: (inspection)=>mutate(()=>registerRoot(inspection)),
-    reconcileRoot: (inspection,expectedIncarnationId)=>mutate(()=>
-      reconcileRoot(inspection,expectedIncarnationId)),
-    registerChild: (parentId,inspection)=>mutate(()=>registerChild(parentId,inspection)),
+    setPhase:(tabId,phase,sessionId)=>mutate(()=>setPhase(tabId,phase,sessionId),sessionId),
+    registerRoot:(inspection)=>mutate(()=>registerRoot(inspection),inspection.browser_session_id),
+    reconcileRoot:(inspection,expectedIncarnationId)=>mutate(()=>
+      reconcileRoot(inspection,expectedIncarnationId),inspection.browser_session_id),
+    registerChild:(parentId,inspection)=>mutate(()=>registerChild(parentId,inspection),
+      inspection.browser_session_id),
     // Intentional closure removes one record. Descendants stay orphaned and
     // cannot silently become roots; their saved parent link remains visible.
-    remove: (id)=>mutate(()=>entries.delete(id)),
+    remove:(id,sessionId)=>mutate(()=>tableFor(sessionId).delete(id),sessionId),
     // Wait for all queued mutations before dropping volatile ownership.
     // Calling this on a persistent registry does NOT delete its ledger.
     closeSession: async () => {
       closed = true;
       await serial;
       entries.clear();
+      sessionEntries.clear();
     },
   });
 }

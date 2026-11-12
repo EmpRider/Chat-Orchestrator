@@ -16,6 +16,12 @@ const TAB_PATTERNS = [
 const DEFAULTS = { serverUrl: 'ws://localhost:8787/bridge', orchestratorTabId: null };
 let proxySettings = null;
 let proxySettingsRevision = 0;
+let proxySessionId = null;
+let socketGeneration = 0;
+let connectionGeneration = 0;
+let lastHeartbeatAck = Date.now();
+let heartbeatNonce = null;
+let connectPromise = null;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // A page can keep heartbeats, analytics and streaming requests open forever.
@@ -24,45 +30,70 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const pageSettling = (() => {
   const SETTLE_MS = 2500;
   const loaded = new Map(); // tab ID -> completion time + URL; in-memory only
+  const lastSnapshot=new Map();
 
+  const trace=(tabId,step,fields={})=>extensionDiagnostic('debug','page_settling.'+step,{tabId,...fields});
   function complete(tabId, tab) {
     if (tab?.status !== 'complete' || !siteOfUrl(tab.url)) return;
     const previous = loaded.get(tabId);
     if (!previous || previous.url !== tab.url) {
       loaded.set(tabId, {url:tab.url,at:Date.now()});
+      trace(tabId,'document_complete',{site:siteOfUrl(tab.url),urlChanged:Boolean(previous)});
     }
   }
   function onUpdated(tabId, changeInfo, tab) {
-    if (changeInfo?.status === 'loading') loaded.delete(tabId);
+    if (changeInfo?.status === 'loading') {
+      const wasTracked=loaded.delete(tabId);
+      trace(tabId,'document_loading',{wasTracked,site:siteOfUrl(tab?.url || '') || 'unsupported'});
+    }
     if (changeInfo?.status === 'complete') complete(tabId,tab);
   }
   async function snapshot(tabId) {
     const tab=await chrome.tabs.get(tabId).catch(()=>null);
     const documentComplete=tab?.status==='complete' && !!siteOfUrl(tab?.url);
     if (!documentComplete) {
-      loaded.delete(tabId);
-      return {ready:false,documentComplete:false,settledMs:0,remainingMs:SETTLE_MS};
+      const wasTracked=loaded.delete(tabId);
+      const result={ready:false,documentComplete:false,settledMs:0,remainingMs:SETTLE_MS};
+      const signature=[false,tab?.status || 'missing',wasTracked].join(':');
+      if(lastSnapshot.get(tabId)!==signature){
+        trace(tabId,'snapshot_incomplete',{tabExists:Boolean(tab),tabStatus:tab?.status || 'missing',wasTracked});
+        lastSnapshot.set(tabId,signature);
+      }
+      return result;
     }
     // On service-worker restart the original load event may be gone.
     // Begin a fresh settling interval rather than trusting stale readiness.
     complete(tabId,tab);
     const settledMs=Math.max(0,Date.now()-loaded.get(tabId).at);
-    return {ready:settledMs>=SETTLE_MS,documentComplete:true,
+    const result={ready:settledMs>=SETTLE_MS,documentComplete:true,
       settledMs,remainingMs:Math.max(0,SETTLE_MS-settledMs)};
+    const signature=[true,result.ready,Math.floor(settledMs/500)].join(':');
+    if(lastSnapshot.get(tabId)!==signature){
+      trace(tabId,'snapshot',{ready:result.ready,settledMs,remainingMs:result.remainingMs});
+      lastSnapshot.set(tabId,signature);
+    }
+    return result;
   }
   async function waitForReady(tabId, timeoutMs=45000) {
-    const deadline=Date.now()+timeoutMs;
-    let last;
+    const startedAt=Date.now(),deadline=startedAt+timeoutMs;
+    let last, polls=0;
+    trace(tabId,'wait_begin',{timeoutMs});
     do {
+      polls++;
       last=await snapshot(tabId);
-      if(last.ready) return last;
+      if(last.ready) {
+        trace(tabId,'wait_ready',{polls,durationMs:Date.now()-startedAt,settledMs:last.settledMs});
+        return last;
+      }
       await sleep(Math.min(200,Math.max(1,deadline-Date.now())));
     } while(Date.now()<deadline);
+    trace(tabId,'wait_timeout',{polls,durationMs:Date.now()-startedAt,
+      documentComplete:last?.documentComplete===true,remainingMs:last?.remainingMs ?? null});
     throw new Error('Browser page did not settle after load for tab '+tabId+
       ': documentComplete='+last?.documentComplete+
       ', remainingMs='+last?.remainingMs);
   }
-  function forget(tabId) {loaded.delete(tabId);}
+  function forget(tabId) {loaded.delete(tabId);lastSnapshot.delete(tabId);trace(tabId,'forgotten',{});}
   return {snapshot,waitForReady,onUpdated,forget};
 })();
 
@@ -122,9 +153,19 @@ const waiters = {}; // taskId -> [resolve]
 // Privacy-preserving extension diagnostics: schema is intentionally small.
 // Never serialize a prompt, response, URL, token, error.message or full tab.
 const DIAG_FIELDS = new Set(['tabId','rootTabId','parentTabId','windowId','groupId',
-  'expectedWindowId','actualWindowId','expectedGroupId','actualGroupId',
-  'requestId','batchId','taskId','method','phase','site','reason','attempt',
-  'count','batchSize','success','reused','connected','build']);
+  'expectedWindowId','actualWindowId','expectedGroupId','actualGroupId','requestId',
+  'batchId','taskId','method','phase','site','reason','attempt','count','batchSize',
+  'success','reused','connected','build','durationMs','settledMs','remainingMs','polls',
+  'timeoutMs','wasTracked','urlChanged','tabExists','tabStatus','documentComplete',
+  'ready','active','browserSessionId','taskLength','lineCount','deferred','roleScopePresent',
+  'promptLength','contextLength','maxWorkers','maxTasksPerHour','taskTimeoutMin','expectedLength',
+  'tasksLastHour','focused','workerOwned','incarnationPresent','createdTab','blockingCount',
+  'scriptCount','errorType','replyOk','state','draftLength','expectedLength','matchingDraft',
+  'whitespaceEquivalent','uncertain','notSubmitted','unresolved','cmd','senderTabId',
+  'frameId','ok','selectedIndex','newlineCount','actualCodePoint','expectedCodePoint',
+  'actualLength','reusedTab','prepared','workerCount','taskCount','status','exactMatch',
+  'whitespaceMatch','firstDifference','formTestId','activeTag','activeRole','contentEditable',
+  'ariaLabel','testId','enabled','disabled','ariaDisabled','inComposer','scopeTag','scopeTestId']);
 function extensionDiagnostic(level,event,fields={}) {
   try {
     if (!['debug','info','warn','error'].includes(level) ||
@@ -147,7 +188,8 @@ function extensionDiagnostic(level,event,fields={}) {
 }
 
 const stateReady = (async () => {
-  const s = await chrome.storage.session.get(['tasks', 'workers', 'taskLog', 'workerOwners', 'workerIncarnations', 'roleSeats', 'managerWakes', 'browserSessionId', 'managerIncarnations', 'managerSites', 'workerUrls', 'lostWorkers','workspaceWindow','workspaceGroups']);
+  const s = await chrome.storage.session.get(['tasks', 'workers', 'taskLog', 'workerOwners', 'workerIncarnations', 'roleSeats', 'managerWakes', 'browserSessionId', 'managerIncarnations', 'managerSites', 'workerUrls', 'lostWorkers','workspaceWindow','workspaceGroups','proxySessionId']);
+  proxySessionId = s.proxySessionId || null;
   tasks = s.tasks || {};
   workers = s.workers || [];
   taskLog = s.taskLog || [];
@@ -169,10 +211,30 @@ const stateReady = (async () => {
 
 const saveState = () => chrome.storage.session.set({ tasks, workers, taskLog, workerOwners, workerIncarnations, workerUrls, lostWorkers, roleSeats, managerWakes, browserSessionId, managerIncarnations,managerSites,workspaceWindow,workspaceGroups });
 
+async function resetSession() {
+  await stateReady;
+  for (const resolvers of Object.values(waiters)) resolvers.forEach((resolve) => resolve());
+  for (const key of Object.keys(waiters)) delete waiters[key];
+  tasks = {}; workers = []; taskLog = [];
+  workerOwners = {}; workerIncarnations = {}; workerUrls = {}; lostWorkers = {};
+  roleSeats = {}; managerWakes = {}; managerIncarnations = {}; managerSites = {};
+  workspaceWindow = null; workspaceGroups = {};
+  browserSessionId = crypto.randomUUID();
+  proxySessionId = null;
+  connectionGeneration = 0;
+  await chrome.storage.session.remove(['proxySessionId',
+    'tasks','workers','taskLog','workerOwners','workerIncarnations','workerUrls','lostWorkers',
+    'roleSeats','managerWakes','browserSessionId','managerIncarnations','managerSites',
+    'workspaceWindow','workspaceGroups']);
+  await saveState();
+}
+
 function callerOwner(p = {}) {
   const principal = p.__trustedPrincipal;
   if (!principal || principal.mode === 'legacy') return 'legacy';
   if (principal.mode !== 'profile' ||
+      typeof principal.browserSessionId !== 'string' ||
+      !/^[0-9a-f-]{36}$/i.test(principal.browserSessionId) ||
       !/^[0-9a-f-]{36}$/i.test(principal.credentialId) ||
       !Number.isSafeInteger(principal.callerTabId) || principal.callerTabId <= 0) {
     throw new Error('Invalid profile caller context');
@@ -522,7 +584,8 @@ async function listTabs(p = {}) {
   const tabs = await chrome.tabs.query({ url: TAB_PATTERNS });
   if (p.__discoveryOnly === true) {
     return tabs.map((t) => ({tab_id:t.id,site:siteOfUrl(t.url),
-      role:workers.includes(t.id)?'worker':'unregistered',active:t.active}));
+      role:workers.includes(t.id)?'worker':
+        t.id === cfg.orchestratorTabId ? 'orchestrator' : 'other',active:t.active}));
   }
   const managerTabId = await callerManagerTab(p, cfg);
   return tabs.filter((t) => t.id === managerTabId || ownedWorker(t.id, owner)).map((t) => ({
@@ -560,32 +623,41 @@ async function resolveTab(ref) {
 // Tabs opened before the extension was (re)loaded have no live content script.
 // Inject it on demand instead of asking the user to refresh the page.
 async function injectContentScript(tabId) {
+  extensionDiagnostic('debug','content_injection.begin',{tabId});
   const tab = await chrome.tabs.get(tabId);
   const site = siteOfUrl(tab.url);
   const target = { tabId };
   const base = 'reference-exporter/';
+  extensionDiagnostic('debug','content_injection.target_resolved',{tabId,site:site || 'unsupported',
+    tabStatus:tab.status || 'unknown'});
   if (site === 'chatgpt' && /^https:\/\/chatgpt\.com\//.test(tab.url)) {
     await chrome.scripting.executeScript({ target, world: 'MAIN', files: [`${base}adapters/chatgpt/hook-main.js`] });
+    extensionDiagnostic('debug','content_injection.main_hook_done',{tabId,site});
     await chrome.scripting.executeScript({ target, files: [
       `${base}adapters/chatgpt/hook-iso.js`, `${base}core/utils.js`,
       `${base}adapters/chatgpt/api.js`, `${base}adapters/chatgpt/genui.js`,
       `${base}adapters/chatgpt/normalize.js`, 'structured-reader.js', 'content.js',
     ] });
+    extensionDiagnostic('debug','content_injection.isolated_scripts_done',{tabId,site,scriptCount:7});
   } else if (site === 'claude') {
     await chrome.scripting.executeScript({ target, files: [
       `${base}core/utils.js`, `${base}adapters/claude/api.js`,
       `${base}adapters/claude/widgets.js`, `${base}adapters/claude/normalize.js`,
       'structured-reader.js', 'content.js',
     ] });
+    extensionDiagnostic('debug','content_injection.scripts_done',{tabId,site,scriptCount:6});
   } else if (site === 'gemini') {
     await chrome.scripting.executeScript({ target, world: 'MAIN', files: [`${base}adapters/gemini/hook-main.js`] });
+    extensionDiagnostic('debug','content_injection.main_hook_done',{tabId,site});
     await chrome.scripting.executeScript({ target, files: [
       `${base}adapters/gemini/hook-iso.js`, `${base}core/utils.js`,
       `${base}adapters/gemini/api.js`, `${base}adapters/gemini/normalize.js`,
       'structured-reader.js', 'content.js',
     ] });
+    extensionDiagnostic('debug','content_injection.isolated_scripts_done',{tabId,site,scriptCount:6});
   } else {
     await chrome.scripting.executeScript({ target, files: ['content.js'] });
+    extensionDiagnostic('debug','content_injection.scripts_done',{tabId,site:site || 'fallback',scriptCount:1});
   }
 }
 
@@ -599,11 +671,20 @@ async function injectIntoOpenTabs() {
 }
 
 async function tabMessage(tabId, msg) {
+  const requestId=crypto.randomUUID(),startedAt=Date.now();
+  const safeCmd=typeof msg?.cmd==='string'?msg.cmd:'internal';
+  extensionDiagnostic('debug','tab_message.begin',{tabId,requestId,method:safeCmd});
   let firstErr;
   try {
-    return await chrome.tabs.sendMessage(tabId, msg);
+    const result=await chrome.tabs.sendMessage(tabId,msg);
+    extensionDiagnostic('debug','tab_message.reply',{tabId,requestId,method:safeCmd,
+      durationMs:Date.now()-startedAt,success:true,replyOk:result?.ok!==false,
+      state:typeof result?.state==='string'?result.state:'none'});
+    return result;
   } catch (e) {
     firstErr = e;
+    extensionDiagnostic('warn','tab_message.initial_failure',{tabId,requestId,method:safeCmd,
+      durationMs:Date.now()-startedAt,errorType:e?.name || 'Error'});
   }
   const tab = await chrome.tabs.get(tabId).catch(() => null);
   if (!tab) throw new Error(`Tab ${tabId} no longer exists (it was closed).`);
@@ -613,16 +694,24 @@ async function tabMessage(tabId, msg) {
   let injectErr = null;
   try {
     await injectContentScript(tabId);
+    extensionDiagnostic('debug','content_injection.recovery_done',{tabId,requestId});
   } catch (e) {
     injectErr = e;
+    extensionDiagnostic('warn','content_injection.recovery_failed',{tabId,requestId,
+      errorType:e?.name || 'Error'});
   }
   let lastErr = firstErr;
   for (let i = 0; i < 6; i++) {
     await sleep(300);
     try {
-      return await chrome.tabs.sendMessage(tabId, msg);
+      const result=await chrome.tabs.sendMessage(tabId,msg);
+      extensionDiagnostic('debug','tab_message.retry_reply',{tabId,requestId,method:safeCmd,
+        attempt:i+1,durationMs:Date.now()-startedAt,success:true,replyOk:result?.ok!==false});
+      return result;
     } catch (e) {
       lastErr = e;
+      extensionDiagnostic('debug','tab_message.retry_failed',{tabId,requestId,method:safeCmd,
+        attempt:i+1,errorType:e?.name || 'Error'});
     }
   }
   throw new Error(
@@ -634,33 +723,92 @@ async function tabMessage(tabId, msg) {
 async function waitReady(tabId, expectedText, timeoutMs = 45000) {
   const deadline = Date.now() + timeoutMs;
   let stableSince = null;
+  let mismatchedDraftSince = null;
   let lastState = 'unobserved';
   let lastPage = null;
   let lastError = '';
+  let lastLoggedState = '';
+  let lastDraftLength = 0;
+  let lastExpectedLength = 0;
+  let lastMatchingDraft = false;
+  let lastWhitespaceEquivalent = false;
   while (Date.now() < deadline) {
     try {
       lastPage = await pageSettling.snapshot(tabId);
       const tab = await chrome.tabs.get(tabId);
       if (lastPage.ready && tab?.active) {
+        extensionDiagnostic('debug','worker.readiness_ping_begin',{tabId,settledMs:lastPage.settledMs,
+          active:tab.active});
         const observed = await tabMessage(tabId,{cmd:'ping',expectedText});
+        extensionDiagnostic('debug','worker.readiness_ping_done',{tabId,ready:observed?.ready===true,
+          state:observed?.state || 'unknown',draftLength:observed?.draftLength ?? 0,
+          expectedLength:observed?.expectedLength ?? expectedText?.length ?? 0,
+          matchingDraft:observed?.matchingDraft===true});
         lastState = observed?.state || 'unknown';
+        lastDraftLength = observed?.draftLength ?? 0;
+        lastExpectedLength = observed?.expectedLength ?? 0;
+        lastMatchingDraft = observed?.matchingDraft === true;
+        lastWhitespaceEquivalent = observed?.whitespaceEquivalent === true;
+        const signature = [lastState,observed?.ready,observed?.matchingDraft,
+          observed?.draftLength,observed?.expectedLength,observed?.whitespaceEquivalent,
+          observed?.documentReady].join(':');
+        if (signature !== lastLoggedState) {
+          console.info('[chat-orch:background]',{step:'worker_readiness_observed',tabId,
+            state:lastState,ready:observed?.ready === true,
+            matchingDraft:observed?.matchingDraft === true,draftLength:observed?.draftLength ?? 0,
+            expectedLength:observed?.expectedLength ?? 0,
+            whitespaceEquivalent:observed?.whitespaceEquivalent === true,
+            documentReady:observed?.documentReady === true,remainingSettleMs:lastPage.remainingMs});
+          lastLoggedState = signature;
+        }
+        if (observed?.state === 'draft' && observed.matchingDraft !== true) {
+          mismatchedDraftSince ??= Date.now();
+          if (Date.now() - mismatchedDraftSince >= 1200) {
+            const error = new Error('Worker composer contains a different unsent draft; inspect it before retrying');
+            error.code = 'COMPOSER_DRAFT_MISMATCH';
+            throw error;
+          }
+        } else mismatchedDraftSince = null;
         if (observed?.ok === true && observed.ready === true &&
             observed.documentReady === true) {
           if (stableSince === null) stableSince = Date.now();
-          if (Date.now() - stableSince >= 1200) return;
+          if (Date.now() - stableSince >= 1200) {
+            console.info('[chat-orch:background]',{step:'worker_readiness_confirmed',tabId,
+              state:lastState,matchingDraft:observed.matchingDraft === true});
+            return;
+          }
         } else stableSince = null;
       } else {
         lastState = !tab?.active ? 'not-focused' :
           lastPage.documentComplete ? 'post-load-settling' : 'document-loading';
+        if (lastState !== lastLoggedState) {
+          console.info('[chat-orch:background]',{step:'worker_readiness_observed',tabId,
+            state:lastState,active:tab?.active === true,remainingSettleMs:lastPage.remainingMs});
+          lastLoggedState = lastState;
+        }
         stableSince = null;
+        mismatchedDraftSince = null;
       }
     } catch (error) {
+      if (error?.code === 'COMPOSER_DRAFT_MISMATCH') throw error;
       lastError = String(error?.message || error);
+      if (lastLoggedState !== 'observation_error') {
+        console.warn('[chat-orch:background]',{step:'worker_readiness_error',tabId,
+          errorType:error?.name || 'Error'});
+        lastLoggedState = 'observation_error';
+      }
       stableSince = null;
+      mismatchedDraftSince = null;
     }
     await sleep(250);
   }
+  console.warn('[chat-orch:background]',{step:'worker_readiness_timeout',tabId,
+    state:lastState,draftLength:lastDraftLength,expectedLength:lastExpectedLength,
+    matchingDraft:lastMatchingDraft,whitespaceEquivalent:lastWhitespaceEquivalent,
+    remainingSettleMs:lastPage?.remainingMs});
   throw new Error('Worker composer did not become stably ready: state='+lastState+
+    ', draftLength='+lastDraftLength+', expectedLength='+lastExpectedLength+
+    ', matchingDraft='+lastMatchingDraft+', whitespaceEquivalent='+lastWhitespaceEquivalent+
     ', documentComplete='+lastPage?.documentComplete+
     ', remainingSettleMs='+lastPage?.remainingMs+
     ', lastError='+lastError.slice(0,180));
@@ -701,11 +849,17 @@ async function closeWorkerTab(tabId) {
 async function confirmTabIdle(tabId, expectedText = null) {
   await pageSettling.waitForReady(tabId);
   const first = await tabMessage(tabId, {cmd:'observe_state',expectedText});
+  console.info('[chat-orch:background]',{step:'worker_idle_first',tabId,state:first?.state,
+    ready:first?.ready === true,matchingDraft:first?.matchingDraft === true,
+    draftLength:first?.draftLength ?? 0});
   if (first?.ok !== true || first.ready !== true) {
     throw new Error('Worker tab is not ready ('+(first?.state || 'unknown')+')');
   }
   await sleep(600);
   const second = await tabMessage(tabId, {cmd:'observe_state',expectedText});
+  console.info('[chat-orch:background]',{step:'worker_idle_second',tabId,state:second?.state,
+    ready:second?.ready === true,matchingDraft:second?.matchingDraft === true,
+    draftLength:second?.draftLength ?? 0});
   if (second?.ok !== true || second.ready !== true) {
     throw new Error('Worker tab is not stably ready ('+(second?.state || 'unknown')+')');
   }
@@ -724,25 +878,63 @@ async function focusWorkerForStartup(tabId) {
   const tab = await chrome.tabs.get(tabId);
   if (!tab || !ownedWorker(tabId, workerOwners[tabId]))
     throw new Error('Worker tab is unavailable or no longer owned');
-  await chrome.tabs.update(tabId,{active:true});
-  await chrome.windows.update(tab.windowId,{focused:true});
-  const visibleTab = await chrome.tabs.get(tabId);
-  if (!visibleTab?.active || visibleTab.windowId !== tab.windowId)
-    throw new Error('Worker tab could not be activated for page initialization');
+  // Edge briefly locks tab edits while settling a freshly created group.
+  // Only retry that transient failure; never create another worker tab.
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    try {
+      await chrome.tabs.update(tabId,{active:true});
+      await chrome.windows.update(tab.windowId,{focused:true});
+      const visibleTab = await chrome.tabs.get(tabId);
+      if (!visibleTab?.active || visibleTab.windowId !== tab.windowId)
+        throw new Error('Worker tab could not be activated for page initialization');
+      console.info('[chat-orch:background]',{step:'worker_focus_confirmed',tabId,attempt});
+      return;
+    } catch (error) {
+      const transient = /tabs cannot be edited right now/i.test(String(error?.message || error));
+      console.warn('[chat-orch:background]',{step:'worker_focus_failed',tabId,attempt,
+        transient,errorType:error?.name || 'Error',reason:transient?'TAB_EDIT_LOCK':
+          /activated for page initialization/.test(String(error?.message))?'FOCUS_UNCONFIRMED':'OTHER'});
+      if (!transient || attempt === 5) throw error;
+      await sleep(300 * attempt);
+    }
+  }
 }
 
 async function startTask(tabId, site, text, waitSecs, cfg, autoClose = false, owner = 'legacy') {
   // Serializing submission—not inference—prevents an unfocused second tab
   // from racing against the first tab's deferred application initialization.
   const id = await serializePromptStartup(async () => {
-    if (Object.values(tasks).some((task) => task.tabId === tabId &&
-        ['running', 'uncertain'].includes(task.status))) {
+    const blockingTasks=Object.values(tasks).filter((task)=>task.tabId===tabId&&
+      ['running','uncertain'].includes(task.status));
+    extensionDiagnostic('debug','worker.startup_existing_tasks_checked',{tabId,
+      blockingCount:blockingTasks.length,status:blockingTasks[0]?.status || 'none'});
+    if (blockingTasks.length) {
       throw new Error('Worker has an outstanding task (running or uncertain); reconcile before reuse');
     }
-    await focusWorkerForStartup(tabId);
-    await waitReady(tabId,text);
-    await confirmTabIdle(tabId,text);
+    console.info('[chat-orch:background]', {step:'worker_focus', tabId, site});
+    try {
+      await focusWorkerForStartup(tabId);
+      extensionDiagnostic('info','worker.startup_focus_complete',{tabId,site});
+    } catch (error) {
+      console.warn('[chat-orch:background]',{step:'worker_startup_blocked',tabId,site,
+        phase:'focus',errorType:error?.name || 'Error'});
+      throw error;
+    }
+    console.info('[chat-orch:background]', {step:'worker_readiness', tabId, site});
+    try {
+      await waitReady(tabId,text);
+      extensionDiagnostic('info','worker.readiness_complete',{tabId,site});
+      await confirmTabIdle(tabId,text);
+      extensionDiagnostic('info','worker.idle_confirmation_complete',{tabId,site});
+    } catch (error) {
+      console.warn('[chat-orch:background]',{step:'worker_startup_blocked',tabId,site,
+        phase:'readiness',errorType:error?.name || 'Error',
+        reason:error?.code === 'COMPOSER_DRAFT_MISMATCH' || /state=draft/.test(String(error?.message))?'COMPOSER_DRAFT':
+          /not stably ready/.test(String(error?.message))?'READINESS_TIMEOUT':'OTHER'});
+      throw error;
+    }
 
+    extensionDiagnostic('info','worker.task_record_begin',{tabId,site});
     const taskId = crypto.randomUUID();
     const receiptNonce = crypto.randomUUID();
     const task = { id:taskId, tabId, site, status:'running', startedAt:Date.now(),
@@ -751,14 +943,22 @@ async function startTask(tabId, site, text, waitSecs, cfg, autoClose = false, ow
     tasks[taskId] = task;
     taskLog.push(Date.now());
     await saveState();
+    extensionDiagnostic('info','worker.task_record_saved',{tabId,taskId,site});
+    console.info('[chat-orch:background]', {step:'worker_dispatch', taskId, tabId, site});
 
     let ack;
     try {
       // The content script now acknowledges only after it confirms that
       // the user message was submitted; response collection continues async.
+      extensionDiagnostic('info','worker.content_dispatch_begin',{tabId,taskId,site});
       ack = await tabMessage(tabId, {cmd:'run_prompt',taskId,receiptNonce,
         text,timeoutMs:cfg.taskTimeoutMin * 60000});
-    } catch {
+      extensionDiagnostic('info','worker.content_dispatch_ack',{tabId,taskId,
+        success:ack?.ok===true,uncertain:ack?.uncertain===true,notSubmitted:ack?.notSubmitted===true});
+    } catch (error) {
+      console.warn('[chat-orch:background]', {step:'worker_dispatch_error', taskId, tabId,
+        errorType:error?.name || 'Error'});
+      extensionDiagnostic('error','worker.content_dispatch_error',{tabId,taskId,reason:'NO_CONTENT_ACK'});
       if (task.status === 'running') {
         task.status = 'uncertain';
         task.error = 'Prompt submission receipt lost; inspect this tab before retrying';
@@ -768,6 +968,9 @@ async function startTask(tabId, site, text, waitSecs, cfg, autoClose = false, ow
       }
       return taskId;
     }
+    console.info('[chat-orch:background]', {step:'worker_submission_receipt',taskId,tabId,
+      ok:ack?.ok === true,uncertain:ack?.uncertain === true,
+      notSubmitted:ack?.notSubmitted === true});
     if (!ack?.ok && task.status === 'running') {
       finishTask(taskId,ack?.uncertain
         ? {status:'uncertain',error:ack.error || 'Submission outcome uncertain'}
@@ -835,7 +1038,7 @@ async function handleCall(method, p = {}) {
       await saveState();
       return { tab_id: tab.id, browser_session_id: browserSessionId,
         incarnation_id: workerIncarnations[tab.id] || managerIncarnations[tab.id],
-        connection_generation: 1 };
+        connection_generation: connectionGeneration };
     }
     case 'inspect_tab':
       return inspectChatTab(p.tab_id);
@@ -974,9 +1177,17 @@ async function handleCall(method, p = {}) {
         next_step:'Use read_chat on this tab and get_result with original_task_id; reconcile before continuing.'};
     }
     case 'spawn_worker': {
+      extensionDiagnostic('info','worker.spawn_received',{site:p.site,
+        taskLength:typeof p.task==='string'?p.task.length:0,
+        lineCount:typeof p.task==='string'?p.task.split(/\r?\n/).length:0,
+        operation:p.operation || 'task',deferred:p.__defer_start===true,
+        roleScopePresent:typeof p.role_scope==='string'});
       const site = SITES[p.site];
+      extensionDiagnostic('debug','worker.site_validated',{site:p.site,supported:Boolean(site)});
       if (!site) throw new Error(`Unknown site "${p.site}". Use "chatgpt", "claude" or "gemini".`);
       const seatKey = roleSeatKey(p, owner);
+      extensionDiagnostic('debug','worker.seat_resolved',{hasSeat:Boolean(seatKey),reserved:Boolean(seatKey&&roleSeatReservations.has(seatKey)),
+        priorSeat:Boolean(seatKey&&roleSeats[seatKey])});
       if (seatKey && roleSeatReservations.has(seatKey)) {
         throw new Error('Role seat is already being started; retry after its startup finishes');
       }
@@ -1006,11 +1217,18 @@ async function handleCall(method, p = {}) {
           delete roleSeats[seatKey];
           await saveState();
         }
+        extensionDiagnostic('debug','worker.guard_begin',{newWorker:true});
         const cfg = await guard({ newWorker: true });
+        extensionDiagnostic('debug','worker.guard_complete',{enabled:cfg.enabled,maxWorkers:cfg.maxWorkers,
+          maxTasksPerHour:cfg.maxTasksPerHour,taskTimeoutMin:cfg.taskTimeoutMin,
+          runningTasks:Object.values(tasks).filter((task)=>task.status==='running').length,
+          workers:workers.length});
         if (p.auto_close === true || (p.keep_open !== true && cfg.autoCloseWorkers)) {
           throw new Error('Automatic worker closure is disabled; parent review and explicit close_worker are required');
         }
+        extensionDiagnostic('debug','worker.manager_resolve_begin',{configuredManager:Number.isSafeInteger(cfg.orchestratorTabId)});
         const managerTabId = await callerManagerTab(p, cfg);
+        extensionDiagnostic('debug','worker.manager_resolve_done',{tabId:managerTabId});
         let contextTranscript = '';
         if (p.share_context_from) {
           const srcId = p.share_context_from === 'orchestrator' ? managerTabId : await resolveTab(p.share_context_from);
@@ -1018,9 +1236,17 @@ async function handleCall(method, p = {}) {
           const chat = await tabMessage(srcId, { cmd: 'read_chat' });
           contextTranscript = chat.transcript;
         }
+        extensionDiagnostic('debug','worker.prompt_build_begin',{taskLength:p.task.length,
+          contextLength:contextTranscript.length,composedPromptPresent:typeof p.prompt_text==='string',
+          composedPromptLength:typeof p.prompt_text==='string'?p.prompt_text.length:0});
         const prompt = buildWorkerPrompt(cfg, p.task, contextTranscript, p.role, p.prompt_text);
+        extensionDiagnostic('debug','worker.prompt_build_done',{promptLength:prompt.length,
+          lineCount:prompt.split(/\r?\n/).length,contextLength:contextTranscript.length});
+        extensionDiagnostic('info','worker.tab_creation_begin',{rootTabId:managerTabId,site});
         const createdTab = await createManagedWorkerTab(site.newChatUrl,p,managerTabId);
         const tabId = createdTab.id;
+        extensionDiagnostic('info','worker.tab_creation_done',{tabId,site,
+          windowId:createdTab.windowId,groupId:createdTab.groupId});
         workers.push(tabId);
         workerOwners[tabId] = owner;
         workerIncarnations[tabId] = crypto.randomUUID();
@@ -1170,31 +1396,51 @@ let reconnectTimer = null;
 let attempts = 0;
 
 async function connect() {
+  if (connectPromise) return connectPromise;
+  connectPromise = connectOnce().finally(() => { connectPromise = null; });
+  return connectPromise;
+}
+
+async function connectOnce() {
   const cfg = await getConfig();
   clearTimeout(reconnectTimer);
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
 
   wsState = 'connecting';
-  try {
-    ws = new WebSocket(cfg.serverUrl);
-  } catch (err) {
-    wsState = `error: ${err.message}`;
-    return scheduleReconnect();
+  let thisSocket;
+  try { thisSocket = new WebSocket(cfg.serverUrl); }
+  catch (error) {
+    wsState = `error: ${error.message}`;
+    scheduleReconnect();
+    return;
   }
-
-  const thisSocket = ws;
-  ws.onopen = () => {
+  socketGeneration++;
+  ws = thisSocket;
+  thisSocket.onopen = () => {
     if (thisSocket !== ws) return;
-    wsState = 'connected';
+    wsState = 'registering';
+    connectionGeneration++;
     extensionDiagnostic('info','bridge.connected',{connected:true});
-    extensionDiagnostic('info','extension.build_loaded',{build:'grouping-20261108-v3'});
+    extensionDiagnostic('info','extension.build_loaded',{build:'worker-diagnostics-20261111-v1'});
     proxySettings = null;
     proxySettingsRevision = 0;
     privateQueueMode = 'unknown';
     attempts = 0;
+    lastHeartbeatAck = Date.now();
+    thisSocket.send(JSON.stringify({type:'register_session',browser_session_id:browserSessionId,
+      connection_generation:connectionGeneration,proxy_session_id:proxySessionId}));
     clearInterval(keepTimer);
-    // Regular traffic also keeps the MV3 service worker alive.
-    keepTimer = setInterval(() => ws?.readyState === 1 && ws.send(JSON.stringify({ type: 'ping' })), 20000);
+    keepTimer = setInterval(() => {
+      if (thisSocket !== ws || thisSocket.readyState !== WebSocket.OPEN) return;
+      if (Date.now() - lastHeartbeatAck > 45000) {
+        extensionDiagnostic('warn','bridge.heartbeat_timeout',{attempt:1});
+        thisSocket.close(4000,'heartbeat timeout');
+        return;
+      }
+      heartbeatNonce = crypto.randomUUID();
+      thisSocket.send(JSON.stringify({type:'session_heartbeat',nonce:heartbeatNonce,
+        browser_session_id:browserSessionId,connection_generation:connectionGeneration}));
+    },15000);
   };
 
   ws.onmessage = async (ev) => {
@@ -1203,6 +1449,32 @@ async function connect() {
     try {
       msg = JSON.parse(ev.data);
     } catch {
+      return;
+    }
+    if (msg.type === 'session_registered') {
+      if (msg.session_id !== browserSessionId || msg.connection_generation !== connectionGeneration) {
+        thisSocket.close(4002,'session registration mismatch');
+        return;
+      }
+      if (proxySessionId && proxySessionId !== msg.proxy_session_id) {
+        try { await resetSession(); }
+        finally {
+          thisSocket.close(4000,'proxy session changed; reconnecting with fresh browser state');
+        }
+        return;
+      }
+      proxySessionId = msg.proxy_session_id;
+      await chrome.storage.session.set({proxySessionId});
+      privateQueueMode = msg.queue_enabled === true ? 'enabled' : 'disabled';
+      wsState = 'connected';
+      lastHeartbeatAck = Date.now();
+      thisSocket.send(JSON.stringify({type:'session_ready'}));
+      return;
+    }
+    if (msg.type === 'session_heartbeat_ack') {
+      if (msg.nonce === heartbeatNonce && msg.proxy_session_id === proxySessionId) {
+        lastHeartbeatAck = Date.now();
+      }
       return;
     }
     if (msg.type === 'settings_snapshot') {
@@ -1216,6 +1488,10 @@ async function connect() {
       return;
     }
     if (msg.type === 'coordination_capabilities') {
+      if (typeof msg.session_id !== 'string' || !/^[0-9a-f-]{36}$/i.test(msg.session_id)) return;
+      if (proxySessionId && proxySessionId !== msg.session_id) await resetSession();
+      proxySessionId = msg.session_id;
+      await chrome.storage.session.set({proxySessionId});
       privateQueueMode = msg.queue_enabled === true ? 'enabled' : 'disabled';
       return;
     }
@@ -1236,15 +1512,19 @@ async function connect() {
       const result = await handleCall(msg.method, msg.params || {});
       extensionDiagnostic('debug','bridge.call_completed',{requestId:msg.id,
         method:msg.method,success:true});
+      extensionDiagnostic('debug','bridge.result_send_begin',{requestId:msg.id,method:msg.method});
       socket.send(JSON.stringify({ type: 'result', id: msg.id, ok: true, result }));
+      extensionDiagnostic('debug','bridge.result_send_done',{requestId:msg.id,method:msg.method});
     } catch (err) {
       extensionDiagnostic('warn','bridge.call_failed',{requestId:msg.id,
         method:msg.method,success:false});
-      socket.send(JSON.stringify({ type: 'result', id: msg.id, ok: false, error: String(err?.message || err) }));
+      socket.send(JSON.stringify({ type: 'result', id: msg.id, ok: false,
+        error: String(err?.message || err),
+        error_code: err?.code === 'COMPOSER_DRAFT_MISMATCH' ? err.code : undefined }));
     }
   };
 
-  ws.onclose = () => {
+  thisSocket.onclose = (event) => {
     if (thisSocket !== ws) return;
     wsState = 'disconnected';
     extensionDiagnostic('warn','bridge.disconnected',{connected:false});
@@ -1257,9 +1537,12 @@ async function connect() {
       workerReceiptWaiters.delete(id);
     }
     clearInterval(keepTimer);
-    scheduleReconnect();
+    if (event.code === 4001) {
+      void resetSession().catch((error) => console.warn('[chat-orch] Session reset failed:', error.message))
+        .finally(scheduleReconnect);
+    } else if (event.code !== 4003) scheduleReconnect();
   };
-  ws.onerror = () => {};
+  thisSocket.onerror = () => {};
 }
 
 // A server fsync ACK is the only successful private event receipt.
@@ -1282,7 +1565,7 @@ async function submitPrivateWorkerReceipt(task) {
     type: 'worker_done', request_id: requestId,
     task_id: task.id, tab_id: task.tabId,
     credential_id: task.owner.slice('credential:'.length),
-    worker_incarnation_id: task.workerIncarnationId,
+    worker_incarnation_id: task.workerIncarnationId,browser_session_id:browserSessionId,
   }));
   const response = await receipt;
   if (!response?.durably_recorded) throw new Error('Private queue did not durably acknowledge receipt');
@@ -1306,7 +1589,8 @@ function reconnectNow() {
     pending.reject(new Error('Reconnect invalidated outstanding receipt; outcome UNCERTAIN'));
     workerReceiptWaiters.delete(id);
   }
-  try { ws?.close(); } catch {}
+  clearTimeout(reconnectTimer);
+  try { ws?.close(4003,'extension settings changed'); } catch {}
   clearInterval(keepTimer);
   ws = null;
   attempts = 0;
@@ -1352,7 +1636,7 @@ async function reportLostWorker(info) {
   });
   ws.send(JSON.stringify({type:'worker_lost',request_id:requestId,event_key:crypto.randomUUID(),
     task_id:info.task.id,tab_id:info.tabId,credential_id:info.owner.slice('credential:'.length),
-    worker_incarnation_id:info.incarnation,saved_url:safeUrl}));
+    worker_incarnation_id:info.incarnation,saved_url:safeUrl,browser_session_id:browserSessionId}));
   try {
     const result=await receipt;
     if (result?.durably_recorded !== true) throw new Error('No durable receipt');
@@ -1412,7 +1696,100 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
     await stateReady;
     switch (msg?.type) {
+      case 'worker_diagnostic': {
+        const diagnostic=msg.diagnostic;
+        if (sender.id!==chrome.runtime.id || sender.frameId!==0 ||
+            !Number.isSafeInteger(sender.tab?.id) || !workers.includes(sender.tab.id) ||
+            !diagnostic || typeof diagnostic!=='object' ||
+            diagnostic.site!==siteOfUrl(sender.tab.url) || typeof diagnostic.step!=='string' ||
+            !/^[a-z][a-z0-9_]{0,63}$/.test(diagnostic.step)) {
+          sendResponse({ok:false});
+          break;
+        }
+        const allowed=new Set(['taskId','at','textLength','documentReady','composers','cmd',
+          'senderTabId','frameId','requestId','ok','lineCount','status','workerCount','taskCount',
+          'composerTag','durationMs','composer','inputCounts','selectedIndex','candidates',
+          'selector','visible','tag','role','contentEditable','testId','ariaLabel','active',
+          'textLength','expectedLength','exactMatch','whitespaceMatch','firstDifference','actualCodePoint','expectedCodePoint',
+          'actualClass','expectedClass','actualCollapsedLength','expectedCollapsedLength',
+          'actualShape','expectedShape','kind','lines','lineCount','sectionDifferences','name',
+          'present','presentActual','presentExpected','actualLength','expectedLength',
+          'collapsedEqual','collapsedFirstDifference',
+          'collapsedEqual','collapsedFirstDifference','whitespace',
+          'index','actualCodePoint','expectedCodePoint','actualLength','newlineCount',
+          'formTestId','formAction','activeTag','activeRole','scopeTag','scopeTestId',
+          'buttons','enabled','disabled','ariaDisabled','inComposer','connected','step',
+          'existingDraftLength','matchesTask','whitespaceEquivalent','sendButtons',
+          'userTurnCount','generating','line','accepted','lineLength','valueLength',
+          'dispatchAccepted','exact','selectedStart','selectedEnd','rangeCount',
+          'selectedTextLength','composerPolls','poll','found','elapsedMs','state',
+          'button','sameComposer','matchesTask','testId','userTurnsBefore','confirmed',
+          'readinessState','readinessDurationMs','success','replyOk','uncertain',
+          'notSubmitted','taskCount','workerCount','operation','promptLength',
+          'contextLength','browserSessionId','windowId','groupId','blockerCount',
+          'phase','workerOwned','focused','incarnationPresent','tasksLastHour',
+          'userTurnsAfter','draftLength','accountChanged','code','reason','submitAttempted',
+          'insertedByUs','receiptNonceValid','timeoutMs','baselineAssistantTurns',
+          'operation','lineCount','prepared','reusedTab',
+          'resultLength','resultType','errorType','attempt','stage','site','cmd','senderTabId',
+          'frameId','requestId','ok','timeoutMs','selectedIndex','newlineCount',
+          'actualCodePoint','expectedCodePoint','actualLength','textLength','lineCount',
+          'reusedTab','prepared','workerCount','taskCount','status','success',
+          'remainingMs','settledMs','polls','wasTracked','urlChanged','tabStatus',
+          'tabExists','documentComplete','active','durationMs','errorType',
+          'exactMatch','whitespaceMatch','firstDifference','formTestId','activeTag',
+          'activeRole','contentEditable','ariaLabel','testId','enabled','disabled',
+          'ariaDisabled','inComposer','connected','scopeTag','scopeTestId','buttons',
+          'candidateCount','selectorCount','inputIndex','delayMs','sameAsBefore','composerConnected',
+          'selectors','pollIntervalMs','total','scopeKind','scope','reason','allMatchesDisabled',
+          'rootPresent','found','matched','candidateCount','enabledCount','durationMs',
+          'inputPresent','connected','charsBefore','activeBefore','activeAfter','selectedStart',
+          'selectedEnd','selectionStart','selectionEnd','accepted','exact','valueLength',
+          'lineLength','dispatchAccepted','inputLength','empty','remainingLength',
+          'candidateCount','userTurnCount','generating','testId','ariaLabel','sameComposer',
+          'clearOnlyOwnInsertedDraft','expectedLength','draftLength','matchesTask',
+          'whitespaceEquivalent','buttonConnected','buttonEnabled','enabled','disabled',
+          'dataDisabled','ariaDisabled','pageReady','documentReady','accountChanged',
+          'confirmed','polls','elapsedMs','submitted','resultLength','baselineAssistantTurns',
+          'timeoutMs','receiptNonceValid','readinessState','errorType','stage',
+          'submissionReported','uncertain','notSubmitted','ok','success',
+          'attempt','requestId','cmd','senderTabId','frameId','selected','button',
+          'buttonCount','candidateCount','scopeTag','scopeTestId','expectedLength',
+          'actualLength','actualCodePoint','expectedCodePoint','actualClass','expectedClass',
+          'actualCollapsedLength','expectedCollapsedLength','collapsedEqual','index',
+          'newlineCount','textLength','lineCount','at','site','taskId',
+          'draftMatches','selected','rootPresent','matched','enabledCount','buttonConnected',
+          'buttonEnabled','pageReady','confirmationPolls','clearOnlyOwnInsertedDraft',
+          'remainingLength','inputPolls','sendPolls','scopeName','selector','candidateIndex',
+          'total','visible','matched','found','selected','durationMs','started',
+          'quietMs','quietNeeded','generationStarted','resultMode','completionAttempt',
+          'baselineCount','responseLength','timeoutMs','delayMs','accountChanged',
+          'draftLength','expectedLength','buttonCount','buttonEnabled','buttonConnected',
+          'scopeKind','scopeTestId','scopeTag','dataDisabled','candidateCount','enabledCount',
+          'replyOk','responseAccepted','duplicate','submitted','reason','expectedClass',
+          'actualClass','expectedCollapsedLength','actualCollapsedLength','collapsedEqual',
+          'collapsedFirstDifference','whitespace','allMatchesDisabled']);
+        const clean=(value,depth=0)=>{
+          if(value===null||typeof value==='boolean')return value;
+          if(typeof value==='number')return Number.isFinite(value)?value:null;
+          if(typeof value==='string')return value.slice(0,160);
+          if(depth>=4)return undefined;
+          if(Array.isArray(value))return value.slice(0,8).map((item)=>clean(item,depth+1))
+            .filter((item)=>item!==undefined);
+          if(typeof value!=='object')return undefined;
+          const output={};
+          for(const [key,item] of Object.entries(value))
+            if(allowed.has(key)){const safe=clean(item,depth+1);if(safe!==undefined)output[key]=safe;}
+          return output;
+        };
+        const safe=clean(diagnostic);
+        console.info('[chat-orch:content]',JSON.stringify({...safe,tabId:sender.tab.id}));
+        sendResponse({ok:true});
+        break;
+      }
       case 'browser_page_settled': {
+        extensionDiagnostic('debug','readiness.request_received',{tabId:sender.tab?.id,
+          documentComplete:sender.tab?.status==='complete'});
         if (sender.id !== chrome.runtime.id || sender.frameId !== 0 ||
             !Number.isSafeInteger(sender.tab?.id) ||
             !siteOfUrl(sender.tab?.url)) {
@@ -1421,8 +1798,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         const timeout = Number.isSafeInteger(msg.timeoutMs)
           ? Math.min(45000,Math.max(1000,msg.timeoutMs)) : 12000;
-        const ready = await pageSettling.waitForReady(sender.tab.id,timeout);
-        sendResponse({ok:true,...ready});
+        const startedAt=Date.now();
+        try {
+          const ready = await pageSettling.waitForReady(sender.tab.id,timeout);
+          extensionDiagnostic('debug','readiness.request_completed',{tabId:sender.tab.id,
+            success:true,durationMs:Date.now()-startedAt});
+          sendResponse({ok:true,...ready});
+        } catch (error) {
+          extensionDiagnostic('warn','readiness.request_failed',{tabId:sender.tab.id,
+            success:false,durationMs:Date.now()-startedAt,reason:'PAGE_NOT_SETTLED'});
+          sendResponse({ok:false,ready:false,error:String(error?.message || error)});
+        }
         break;
       }
       case 'task_done': {
@@ -1448,6 +1834,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           }
           break;
         }
+        console.info('[chat-orch:background]', {step:'worker_completion',taskId:msg.taskId,
+          tabId:task.tabId,ok:msg.ok,uncertain:msg.uncertain === true,
+          notSubmitted:msg.notSubmitted === true});
         if (msg.uncertain === true && msg.ok === false) {
           finishTask(msg.taskId, {status:'uncertain',error:msg.error});
           sendResponse({ok:true,uncertain:true});

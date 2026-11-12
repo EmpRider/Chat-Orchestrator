@@ -9,10 +9,12 @@ export function normalizeOpenChatTabs(observed) {
   const tabs = [];
   for (const item of observed) {
     const tabId = item?.tab_id;
+    const browserSessionId=item?.browser_session_id;
+    const key=(browserSessionId || '')+':'+tabId;
     if (!Number.isSafeInteger(tabId) || tabId <= 0 ||
-        !CHAT_SITES.has(item.site) || ids.has(tabId)) continue;
-    ids.add(tabId);
-    tabs.push({tabId, site:item.site});
+        !CHAT_SITES.has(item.site) || ids.has(key)) continue;
+    ids.add(key);
+    tabs.push({tabId, site:item.site,...(browserSessionId ? {browserSessionId} : {})});
     if (tabs.length >= 500) break;
   }
   return tabs;
@@ -22,10 +24,10 @@ export function annotateTabPresence(registryEntries, observation) {
   const available = observation?.status === 'observed' &&
     Array.isArray(observation.tabs);
   const byId = available
-    ? new Map(observation.tabs.map((tab)=>[tab.tabId,tab]))
+    ? new Map(observation.tabs.map((tab)=>[(tab.browserSessionId || '')+':'+tab.tabId,tab]))
     : new Map();
   return (registryEntries || []).map((entry)=>{
-    const observed = byId.get(entry.tabId);
+    const observed = byId.get((entry.browserSessionId || '')+':'+entry.tabId);
     return {
       ...entry,
       presence: !available ? 'unknown' : !observed ? 'not_open'

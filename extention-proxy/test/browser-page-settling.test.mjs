@@ -20,15 +20,20 @@ function fixture() {
     static offset=0;
     static now(){return Date.now()+this.offset;}
   }
+  const session={tasks:{example:{status:'done'}},workers:[201],taskLog:[Date.now()],
+    proxySessionId:'00000000-0000-4000-8000-000000000001'};
+  const local={serverUrl:'ws://127.0.0.1:8787/bridge',orchestratorTabId:101};
   const chrome={
-    storage:{session:{async get(){return {};},async set(){}},
-      local:{async get(){return {};}},onChanged:{addListener(){}}},
+    storage:{session:{async get(){return session;},async set(next){Object.assign(session,next);},
+      async remove(keys){for(const key of keys)delete session[key];}},
+      local:{async get(){return local;}},onChanged:{addListener(){}}},
     tabs:{
       async get(id){return tabs.get(id)||null;},
       async sendMessage(_id,msg) {
         const matches=!!draftText && draftText===msg.expectedText;
         return {ok:true,state:!composerReady?'loading':draftText?'draft':'idle',
-          ready:composerReady&&(!draftText||matches),documentReady:true};
+          ready:composerReady&&(!draftText||matches),matchingDraft:matches,
+          draftLength:draftText.length,documentReady:true};
       },
       onUpdated:{addListener(fn){updated=fn;}},
       onRemoved:{addListener(fn){removed=fn;}},
@@ -44,6 +49,9 @@ function fixture() {
   runInContext(source,ctx);
   return {
     settling:runInContext('pageSettling',ctx),
+    resetSession:runInContext('resetSession',ctx),
+    setConnectionGeneration:(value)=>runInContext(`connectionGeneration=${value}`,ctx),
+    attest:(tabId)=>runInContext(`handleCall('attest_profile_manager',{tab_id:${tabId}})`,ctx),
     waitReady:runInContext('waitReady',ctx),
     async requestPageReady(tabId,timeoutMs=12000) {
       return new Promise(resolve=>runtimeHandler(
@@ -59,9 +67,30 @@ function fixture() {
     advance(ms){VirtualDate.offset+=ms;},
     setComposerReady(value){composerReady=value;},
     setDraft(value){draftText=value;},
-    chrome,
+    chrome,session,local,
   };
 }
+
+test('session reset clears worker state without changing saved connection settings',async()=>{
+  const f=fixture();
+  const oldId=f.session.browserSessionId;
+  await f.resetSession();
+  assert.equal(Object.keys(f.session.tasks).length,0);
+  assert.equal(f.session.workers.length,0);
+  assert.equal(f.session.taskLog.length,0);
+  assert.equal(f.session.proxySessionId,undefined);
+  assert.notEqual(f.session.browserSessionId,oldId);
+  assert.equal(f.local.serverUrl,'ws://127.0.0.1:8787/bridge');
+  assert.equal(f.local.orchestratorTabId,101);
+});
+
+test('manager attestation uses the active WebSocket generation after reconnect',async()=>{
+  const f=fixture();
+  f.setConnectionGeneration(3);
+  const result=await f.attest(101);
+  assert.equal(result.connection_generation,3);
+  assert.equal(result.browser_session_id,f.session.browserSessionId);
+});
 
 test('ChatGPT, Claude and Gemini settle 2.5 seconds after document completion with no debugger',async()=>{
   const f=fixture();
@@ -120,7 +149,8 @@ test('matching task draft passes readiness, unrelated draft does not',async()=>{
   f.advance(2500);
   f.setDraft(prompt);
   await f.waitReady(101,prompt,2600);
-  await assert.rejects(f.waitReady(101,'wrong prompt',650),/stably ready/);
+  await assert.rejects(f.waitReady(101,'wrong prompt',2600),
+    /different unsent draft/,'a mismatched draft fails promptly without a 45-second wait');
 });
 
 test('service-worker restart starts a new settling interval',async()=>{

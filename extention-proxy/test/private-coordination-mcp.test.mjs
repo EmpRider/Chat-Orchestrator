@@ -20,11 +20,11 @@ test('tokenless profile keeps durable FIFO worker reports, barriers and processe
   fs.writeFileSync(journal, '');
   const browserSession = randomUUID();
   const managerIncarnation = randomUUID();
-  const workerIncarnation = randomUUID();
+  const initialWorkerIncarnation = randomUUID();
   const taskId = randomUUID();
-  const credentialHex = createHash('sha256').update(dir + ':101').digest('hex');
-  const profileId = credentialHex.slice(0,8) + '-' + credentialHex.slice(8,12) + '-4' +
-    credentialHex.slice(13,16) + '-8' + credentialHex.slice(17,20) + '-' + credentialHex.slice(20,32);
+  const credentialHex=createHash('sha256').update(dir+':'+browserSession+':101').digest('hex');
+  const profileId=credentialHex.slice(0,8)+'-'+credentialHex.slice(8,12)+'-4'+
+    credentialHex.slice(13,16)+'-8'+credentialHex.slice(17,20)+'-'+credentialHex.slice(20,32);
   const child = spawn(process.execPath, ['server.js'], {
     cwd: ROOT, env: { ...process.env, PORT: '0', HOST: '127.0.0.1',
       CHAT_ORCH_PROFILE_DIR: dir, CHAT_ORCH_PRIVATE_COORDINATION: '1' },
@@ -76,6 +76,10 @@ test('tokenless profile keeps durable FIFO worker reports, barriers and processe
   let managerBusy = true;
   let managerLoading = true;
   let managerAttestationMismatch = false;
+  let workerOpen = true;
+  let rejectBeforeSubmission = false;
+  let workerTabId = 201;
+  let workerIncarnation = initialWorkerIncarnation;
   let ackCount = 0;
   bridge.on('message', (raw) => {
     const m = JSON.parse(raw.toString());
@@ -84,49 +88,63 @@ test('tokenless profile keeps durable FIFO worker reports, barriers and processe
       receipts.delete(m.request_id);
       return;
     }
+    if (m.type === 'session_heartbeat') {
+      bridge.send(JSON.stringify({type:'session_heartbeat_ack',nonce:m.nonce,
+        proxy_session_id:'test-proxy-session'}));
+      return;
+    }
     if (m.type !== 'call') return;
     const principal = m.params?.__trustedPrincipal;
     let result;
     switch (m.method) {
       case 'inspect_tab': {
         const tabId = m.params.tab_id;
+        assert.equal(m.params.__sessionBrowserId,browserSession,'proxy routes inspection to this browser session');
         result = {tab_id:tabId,site:'chatgpt',browser_session_id:browserSession,
           incarnation_id:tabId===101?managerIncarnation:workerIncarnation,
-          is_managed_worker:tabId===201};
+          is_managed_worker:tabId===201 || tabId===workerTabId};
         break;
       }
-      case 'attest_profile_manager':
-        result = { tab_id: 101, browser_session_id: browserSession,
-          incarnation_id: managerIncarnation, connection_generation: 1 };
-        break;
       case 'manager_state':
+        assert.equal(m.params.__sessionBrowserId,browserSession,'manager state uses caller session socket');
         result = { tab_id: managerAttestationMismatch ? 999 : 101,
           state: managerLoading ? 'loading' : managerBusy ? 'busy' : 'idle',
           ready: !managerLoading && !managerBusy,
           browser_session_id: browserSession, incarnation_id: managerIncarnation };
         break;
+      case 'attest_profile_manager':
+        result = {tab_id:101,browser_session_id:browserSession,
+          incarnation_id:managerIncarnation,connection_generation:1};
+        break;
       case 'get_result':
-        result = { task_id: taskId, tab_id: 201, status: 'done',
+        assert.equal(m.params.__sessionBrowserId,browserSession,'worker receipt uses originating session');
+        result = { task_id: taskId, tab_id: workerTabId, status: 'done',
           source_incarnation_id: workerIncarnation, site: 'chatgpt',
           result: 'Verified mock report', elapsed_seconds: 1 };
         break;
       case 'list_tabs':
         result = [{tab_id:101,role:'orchestrator',site:'chatgpt'},
-          {tab_id:201,role:'worker',incarnation_id:workerIncarnation,site:'chatgpt'}];
+          ...(workerOpen ? [{tab_id:workerTabId,role:'worker',incarnation_id:workerIncarnation,site:'chatgpt'}] : [])];
         break;
       case 'spawn_worker':
-        result = {tab_id:201,incarnation_id:workerIncarnation,
+        result = {tab_id:workerTabId,incarnation_id:workerIncarnation,
           prepared:true,reused_tab:false};
         break;
       case 'start_prepared_worker':
-        result = {task_id:taskId,tab_id:201,status:'running'};
+        if (rejectBeforeSubmission) {
+          bridge.send(JSON.stringify({type:'result',id:m.id,ok:false,
+            error:'Worker composer contains a different unsent draft',
+            error_code:'COMPOSER_DRAFT_MISMATCH'}));
+          return;
+        }
+        result = {task_id:taskId,tab_id:workerTabId,status:'running'};
         break;
       case 'inspect_worker_tasks':
-        result = {tab_id:201,worker_incarnation_id:workerIncarnation,
-          tasks:[{task_id:taskId,status:'done'}]};
+        result = {tab_id:m.params.tab_id,worker_incarnation_id:workerIncarnation,
+          tasks:rejectBeforeSubmission ? [] : [{task_id:taskId,status:'done'}]};
         break;
       case 'close_reviewed_worker':
-        result = {closed:201,parent_reviewed:true};
+        result = {closed:m.params.tab_id,parent_reviewed:true};
         break;
       case 'wake_manager':
         wakes.push(m.params);
@@ -142,8 +160,10 @@ test('tokenless profile keeps durable FIFO worker reports, barriers and processe
     bridge.send(JSON.stringify({ type: 'result', id: m.id, ok: true, result }));
   });
   await new Promise((resolve, reject) => { bridge.once('open', resolve); bridge.once('error', reject); });
+  bridge.send(JSON.stringify({type:'register_session',browser_session_id:browserSession,
+    connection_generation:1,proxy_session_id:'test-proxy-session'}));
   async function call(name, args = {}) {
-    const out = await client.callTool({ name, arguments: args });
+    const out = await client.callTool({name,arguments:{browser_session_id:browserSession,...args}});
     if (out.isError) throw new Error(out.content[0].text);
     return JSON.parse(out.content[0].text);
   }
@@ -151,21 +171,40 @@ test('tokenless profile keeps durable FIFO worker reports, barriers and processe
   const beforeRegistration=await call('coordination_incarnation_conflicts',{caller_tab_id});
   assert.equal(beforeRegistration.classification,'CLEAR');
   assert.equal(beforeRegistration.unresolved_event_count,0);
-  const loadingManager = await call('coordination_register_manager',{caller_tab_id});
-  assert.equal(loadingManager.registered,true);
-  assert.equal(loadingManager.observation,'loading',
-    'Authenticated manager may register before browser network becomes idle');
+  managerAttestationMismatch = true;
+  await assert.rejects(call('coordination_register_manager',{caller_tab_id}),
+    /mismatch in tab_id/,'mismatched readiness must not register a manager');
+  managerAttestationMismatch = false;
   managerLoading = false;
+  rejectBeforeSubmission = true;
+  await assert.rejects(call('spawn_worker',{caller_tab_id,site:'chatgpt',
+    task:'Unsent draft safety check',wait_seconds:0}),
+  /not submitted; inspect its unsent draft/);
+  assert.equal((await call('coordination_inspect_worker_tasks',{caller_tab_id,tab_id:201})).tasks.length,0);
+  rejectBeforeSubmission = false;
+  // The prepared tab remains inspectable; a blind retry is still denied.
+  await assert.rejects(call('spawn_worker',{caller_tab_id,site:'chatgpt',
+    task:'Unsafe replay check',wait_seconds:0}),
+  /Existing worker phase does not permit automatic reuse/);
+  workerTabId = 202; // New tab; the prepared tab 201 remains held for review.
+  workerIncarnation = randomUUID();
   const started = await call('spawn_worker',{caller_tab_id,site:'chatgpt',
     task:'Queue ownership check',wait_seconds:0});
   assert.equal(started.parent_tab_id,caller_tab_id);
   const receiptId = randomUUID();
   const receiptPromise = new Promise((resolve) => receipts.set(receiptId, resolve));
   bridge.send(JSON.stringify({ type: 'worker_done', request_id: receiptId, task_id: taskId,
-    tab_id: 201, credential_id: profileId, worker_incarnation_id: workerIncarnation }));
+    tab_id: workerTabId, credential_id: profileId, worker_incarnation_id: workerIncarnation }));
   const receipt = await Promise.race([receiptPromise, delay(4500).then(() => { throw new Error('Worker receipt timeout'); })]);
   assert.equal(receipt.ok, true, JSON.stringify(receipt));
-  assert.equal(receipt.receipt.durably_recorded, true);
+  assert.equal(receipt.receipt.durably_recorded, true,
+    'spawn_worker enrolls its parent even before explicit queue registration');
+  managerLoading = true;
+  const loadingManager = await call('coordination_register_manager',{caller_tab_id});
+  assert.equal(loadingManager.registered,true);
+  assert.equal(loadingManager.observation,'loading',
+    'Authenticated manager may register before browser network becomes idle');
+  managerLoading = false;
   // 1 worker result + 18 status barriers exercises the 16-event FIFO cap.
   const keys=[];
   for (let i=1;i<=18;i++) {
@@ -184,8 +223,9 @@ test('tokenless profile keeps durable FIFO worker reports, barriers and processe
   assert.equal(before.events.length,19);
   assert.deepEqual(before.events.map(e=>e.entryType),
     ['CHILD_RESULT',...Array(18).fill('STATUS_REQUEST')]);
-  await assert.rejects(call('close_worker',{caller_tab_id,tab_id:201}),
+  await assert.rejects(call('close_worker',{caller_tab_id,tab_id:workerTabId}),
     /not ACKed worker result/,'worker closure needs FIFO processing first');
+  workerOpen = false; // Result remains queued after the source tab closes.
   assert.equal((await call('coordination_start_delivery',{caller_tab_id})).armed,true);
   await delay(250);
   assert.equal(wakes.length,0,'busy manager receives no batch');
@@ -229,7 +269,7 @@ test('tokenless profile keeps durable FIFO worker reports, barriers and processe
   assert.equal(ackCount,2);
   assert.ok((await call('coordination_pending',{caller_tab_id})).events
     .every(e=>e.phase==='PROCESSED'));
-  const closed=await call('close_worker',{caller_tab_id,tab_id:201});
-  assert.equal(closed.closed,201);
+  const closed=await call('close_worker',{caller_tab_id,tab_id:workerTabId});
+  assert.equal(closed.closed,workerTabId);
   assert.equal(closed.parent_reviewed,true);
 });

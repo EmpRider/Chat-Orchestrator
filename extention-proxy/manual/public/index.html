@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Extension workbench</title><link rel="stylesheet" href="/style.css">
+<header><h1>Extension workbench</h1><output id="connection" role="status">Connecting…</output></header>
+<main><nav aria-label="Operations"><h2>Proxy tools</h2><div id="tools"></div><h2>Desktop &amp; bridge</h2><div id="desktop"></div></nav>
+<section><details><summary>Connect and test a workflow</summary>
+<p>Open the extension popup in your test browser profile. Set the WebSocket URL to <code id="bridge-url"></code> and click Save and reconnect. Open a supported chat site in that profile.</p>
+<ol><li>Run Get tab list. Choose the calling chat's tab ID and browser session in subsequent forms.</li>
+<li>In queue mode, register the manager and start delivery to test ordered reports and acknowledgments.</li>
+<li>Spawn a worker with a site and task. Use its task ID for Get result and its tab ID for Read chat or Send message. Repeat for additional workers.</li>
+<li>Inspect pending events and reports. Acknowledge a delivered batch after processing its events, then close the worker. To test recovery, close a worker in the browser and use Reopen child with its original task ID.</li>
+<li>For failure tests, enter an unknown ID or take the bridge offline. Bring it online and watch for a new session handshake.</li></ol>
+<p>Each log entry expands to its full payload. Commands act on real tabs in the connected browser profile.</p></details>
+<h2 id="title">Loading tools…</h2><p id="description"></p>
+<form id="form" novalidate><div id="fields"></div><button id="run" disabled>Run operation</button></form>
+<h2>Latest result</h2><output id="outcome" role="status">Ready</output><pre id="result"></pre></section>
+<aside><div class="bar"><h2>Activity log</h2><button id="clear">Clear logs</button></div><div id="log"></div></aside></main>
+<script type="module" src="/ui.js"></script></html>

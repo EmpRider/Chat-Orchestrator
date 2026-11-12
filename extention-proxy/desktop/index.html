@@ -188,8 +188,9 @@
       </div>
       <details class="extension-admin-actions">
         <summary>Advanced browser actions</summary>
-        <p class="help">Provide a supported ChatGPT / Claude / Gemini tab ID from list_tabs for local diagnostics.</p>
+        <p class="help">Provide a supported ChatGPT / Claude / Gemini tab ID from list_tabs. For duplicate tab IDs across browsers, add its browser_session_id.</p>
         <label for="agent-admin-tab">Browser chat tab ID</label><input id="agent-admin-tab" type="number" min="1" placeholder="e.g. 101" />
+        <label for="agent-admin-session">Browser session ID (if tab IDs overlap)</label><input id="agent-admin-session" type="text" placeholder="browser_session_id from list_tabs" />
         <div class="input-row">
           <button id="agent-set-orchestrator" type="button" class="secondary">Set legacy orchestrator</button>
           <button id="agent-diagnose-tab" type="button" class="secondary">Diagnose tab</button>

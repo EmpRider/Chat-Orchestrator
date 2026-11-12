@@ -115,6 +115,7 @@ test('MCP read_chat options survive HTTP, WebSocket, background and content scri
   const apiFailures = new Set();
   const domFallback = new Set();
   try {
+    const extensionBrowserSession='aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
     const tabReceivers = new Map(cases.map((site) => [site.tabId, createContent(site, apiFailures, domFallback)]));
     const tabById = new Map(cases.map((site) => [site.tabId, { id: site.tabId, url: site.url }]));
     const chrome = {
@@ -123,12 +124,14 @@ test('MCP read_chat options survive HTTP, WebSocket, background and content scri
           enabled: true, token: EXTENSION_TOKEN, serverUrl: `ws://localhost:${PORT}/bridge`,
           orchestratorTabId: cases[0].tabId,
         }) },
-        session: { get: async () => ({ workers: [], workerOwners: {} }), set: async () => {} },
+        session: { get: async () => ({ workers: [], workerOwners: {},
+          browserSessionId:extensionBrowserSession,proxySessionId:null }), set: async () => {},
+          remove:async()=>{} },
         onChanged: { addListener() {} },
       },
       tabs: {
         get: async (tabId) => tabById.get(tabId) || null,
-        query: async () => [...tabById.values()],
+        query: async () => [...tabById.values()].map((tab)=>({...tab,status:'complete'})),
         sendMessage: async (tabId, msg) => {
           assert.ok(tabReceivers.has(tabId));
           return tabReceivers.get(tabId)(msg);
@@ -137,20 +140,28 @@ test('MCP read_chat options survive HTTP, WebSocket, background and content scri
         onUpdated: { addListener() {} },
       },
       runtime: {
+        id:'read-chat-e2e-extension',
         onInstalled: { addListener() {} }, onStartup: { addListener() {} },
         onMessage: { addListener() {} },
+        getContexts: async()=>[{contextType:'OFFSCREEN_DOCUMENT',documentUrl:'chrome-extension://read-chat-e2e/offscreen.html'}],
       },
       alarms: { onAlarm: { addListener() {} }, create() {} },
     };
     const bg = createContext({
-      chrome, WebSocket, URL, crypto, console,
-      setTimeout: (fn, ms) => { const t = setTimeout(fn, ms); t.unref(); return t; },
+      chrome, WebSocket, URL, crypto, console,extensionBrowserSession, getContexts:async()=>[],
+      setTimeout,
       clearTimeout,
-      setInterval: (fn, ms) => { const t = setInterval(fn, ms); t.unref(); return t; },
+      setInterval,
       clearInterval,
     });
+    runInContext('browserSessionId=extensionBrowserSession',
+      Object.assign(bg,{extensionBrowserSession}));
     runInContext(readExtension('background.js'), bg);
-    await sleep(1200);
+    const registrationDeadline=Date.now()+8000;
+    while(runInContext('proxySessionId',bg)!==null &&
+        runInContext('wsState',bg)!=='connected' && Date.now()<registrationDeadline) await sleep(25);
+    while(runInContext('wsState',bg)!=='connected' && Date.now()<registrationDeadline) await sleep(25);
+    assert.equal(runInContext('wsState',bg),'connected','extension must finish proxy-session handshake');
     client = new Client({ name: 'read-chat-e2e', version: '1.0.0' });
     await client.connect(new StreamableHTTPClientTransport(
       new URL(`http://localhost:${PORT}/mcp?token=${TOKEN}`),
@@ -163,8 +174,9 @@ test('MCP read_chat options survive HTTP, WebSocket, background and content scri
 
     const callRead = async (args) => {
       const reply = await client.callTool({ name: 'read_chat',
-        arguments: {caller_tab_id:args.tab_id ?? cases[0].tabId,...args} });
-      assert.equal(reply.isError, undefined, 'bridge call itself should succeed');
+        arguments: {caller_tab_id:args.tab_id ?? cases[0].tabId,
+          browser_session_id:extensionBrowserSession,...args} });
+      assert.equal(reply.isError, undefined, 'bridge call itself should succeed: '+JSON.stringify(reply.content));
       return JSON.parse(reply.content[0].text);
     };
 
@@ -213,7 +225,8 @@ test('MCP read_chat options survive HTTP, WebSocket, background and content scri
       { tab_id: cases[0].tabId, include_attachments: 'no' },
     ]) {
       const response = await client.callTool({ name: 'read_chat',
-        arguments: {caller_tab_id:invalid.tab_id ?? cases[0].tabId,...invalid} });
+        arguments: {caller_tab_id:invalid.tab_id ?? cases[0].tabId,
+          browser_session_id:extensionBrowserSession,...invalid} });
       assert.equal(response.isError, true, 'invalid MCP options must be rejected');
     }
   } finally {

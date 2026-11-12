@@ -26,7 +26,7 @@ const diagnostics = createDiagnostics({component:'proxy'});
 
 // Profile settings are independent of any proxy or browser-extension secret.
 const AGENT_SETTINGS_FILE = path.join(
-  process.env.CHAT_ORCH_PROFILE_DIR || __dirname, 'settings.json'
+  process.env.CHAT_ORCH_SETTINGS_DIR || process.env.CHAT_ORCH_PROFILE_DIR || __dirname, 'settings.json'
 );
 let agentSettings = disabledAgentSettings();
 let agentSettingsRevision = 0;
@@ -45,11 +45,6 @@ function reloadAgentSettings() {
     agentSettings = disabledAgentSettings();
   }
   agentSettingsRevision++;
-}
-function sendAgentSettings(ws) {
-  if (ws?.readyState !== 1 || !trustedExtensionSockets.has(ws)) return;
-  ws.send(JSON.stringify({type: 'settings_snapshot', schema: 1,
-    revision: agentSettingsRevision, settings: agentSettings}));
 }
 
 async function attachProfile(req, _res, next) {
@@ -95,9 +90,11 @@ const verifiedCoordinationScopes = new WeakSet();
 const profileManagerIdentities = new Map(); // caller tab -> current connection incarnation
 let tabRegistry = null;
 let profileSocketGeneration = 0;
-function profileCredentialId(tabId) {
-  // Stable non-secret identity for the app's local profile data directory.
-  const hex = crypto.createHash('sha256').update(path.dirname(AGENT_SETTINGS_FILE) + ':' + tabId).digest('hex');
+const proxySessionId = crypto.randomUUID();
+function profileCredentialId(browserSessionId, tabId) {
+  // Stable non-secret identity scoped to this app profile and browser manager tab.
+  const hex = crypto.createHash('sha256')
+    .update(path.dirname(AGENT_SETTINGS_FILE) + ':' + browserSessionId + ':' + tabId).digest('hex');
   return `${hex.slice(0,8)}-${hex.slice(8,12)}-4${hex.slice(13,16)}-8${hex.slice(17,20)}-${hex.slice(20,32)}`;
 }
 function sameProfileManager(a, b) {
@@ -106,7 +103,8 @@ function sameProfileManager(a, b) {
     a?.browserSessionId === b?.browserSessionId &&
     a?.sessionIncarnationId === b?.sessionIncarnationId &&
     a?.connectionGeneration === b?.connectionGeneration &&
-    a?.socketGeneration === b?.socketGeneration;
+    a?.socketGeneration === b?.socketGeneration &&
+    a?.socket === b?.socket;
 }
 function profilePrincipalFromExtension(a) {
   if (!a || !Number.isSafeInteger(a.tab_id) || a.tab_id <= 0 ||
@@ -114,15 +112,20 @@ function profilePrincipalFromExtension(a) {
       !PRIVATE_EVENT_ID.test(a.incarnation_id || '') ||
       !Number.isSafeInteger(a.connection_generation) || a.connection_generation < 1)
     throw new Error('Extension could not attest the configured manager tab');
-  const credentialId = profileCredentialId(a.tab_id);
+  const credentialId = profileCredentialId(a.browser_session_id,a.tab_id);
+  const socket = extensionSockets.get(a.browser_session_id);
+  if (!socket || socket.readyState !== 1 ||
+      socket.connectionGeneration !== a.connection_generation)
+    throw new Error('Attesting browser session changed during request');
   return Object.freeze({
-    mode: 'profile', principalId: credentialId, credentialId,
+    mode: 'profile', principalId:credentialId,credentialId,
     workspaceId: 'local-profile', projectId: 'local-profile',
     orchestratorId: 'local-profile', parentTaskId: 'local-profile',
     callerTabId: a.tab_id, browserSessionId: a.browser_session_id,
     sessionIncarnationId: a.incarnation_id,
     connectionGeneration: a.connection_generation,
-    socketGeneration: profileSocketGeneration,
+    socketGeneration: a.connection_generation,
+    socket,
   });
 }
 
@@ -131,24 +134,56 @@ function profilePrincipalFromExtension(a) {
 // Recheck the browser session/incarnation before acting on an asynchronous
 // worker event so stale tab IDs are not accidentally reused.
 function currentPrivatePrincipal(principal) {
-  return Boolean(principal?.mode === 'profile' && bridgeConnected() &&
-    sameProfileManager(profileManagerIdentities.get(principal.callerTabId), principal) &&
-    principal.credentialId === profileCredentialId(principal.callerTabId));
+  return Boolean(principal?.mode === 'profile' &&
+    principal.socket?.readyState === 1 &&
+    principal.socket.connectionGeneration === principal.socketGeneration &&
+    extensionSockets.get(principal.browserSessionId) === principal.socket &&
+    sameProfileManager(profileManagerIdentities.get(principal.browserSessionId + ':' + principal.callerTabId), principal) &&
+    principal.credentialId === profileCredentialId(principal.browserSessionId,principal.callerTabId));
 }
 
 async function resolveCaller(args = {}, { createRoot = false } = {}) {
   if (!tabRegistry) throw new Error('Proxy tab registry unavailable');
+  if (!args.__sessionBrowserId && args.browser_session_id) {
+    args.__sessionBrowserId=args.browser_session_id;
+  }
   const tabId = args.caller_tab_id;
   if (!Number.isSafeInteger(tabId) || tabId <= 0) {
     throw new Error('caller_tab_id required: call list_tabs first to identify the calling chat tab');
   }
-  const inspection = await callExtension('inspect_tab', { tab_id: tabId }, 10000);
-  let record = tabRegistry.get(tabId);
+  let browserSessionId=args.__sessionBrowserId || null;
+  let record=browserSessionId ? tabRegistry.get(tabId,browserSessionId) : null;
+  browserSessionId ||= record?.browserSessionId;
+  if (!browserSessionId) {
+    const matches = (await callExtension('list_tabs',{__discoveryOnly:true},10000))
+      .filter((tab)=>tab.tab_id===tabId);
+    if (matches.length !== 1) {
+      throw new Error(matches.length
+        ? 'caller_tab_id exists in multiple browser sessions; select the browser session explicitly'
+        : 'caller_tab_id not found in any connected browser session');
+    }
+    browserSessionId = matches[0].browser_session_id;
+    args.__sessionBrowserId = browserSessionId;
+  } else if (!record && !args.browser_session_id) {
+    // A read_chat tab lookup may have selected a session; never use that
+    // selection as proof that the calling tab belongs to it.
+    const matches = (await callExtension('list_tabs',{__discoveryOnly:true},10000))
+      .filter((tab)=>tab.tab_id===tabId);
+    if (matches.length !== 1 || matches[0].browser_session_id !== browserSessionId)
+      throw new Error('Caller browser session is ambiguous; pass browser_session_id from list_tabs');
+  }
+  const inspection = await callExtension('inspect_tab', {tab_id:tabId,
+    __sessionBrowserId:browserSessionId},10000);
+  browserSessionId ||= inspection.browser_session_id;
+  args.__sessionBrowserId ||= browserSessionId;
   diagnostics.debug('identity.inspected',{tabId,site:inspection.site,
     registryPresent:Boolean(record)});
   if (!record) {
     if (!createRoot) throw new Error('Unregistered caller: use spawn_worker to establish the root relationship');
     record = await tabRegistry.registerRoot(inspection);
+  }
+  if (record.browserSessionId !== browserSessionId) {
+    throw new Error('Caller tab belongs to another browser session; pass the browser_session_id reported by list_tabs');
   }
   if (record.incarnationId !== inspection.incarnation_id ||
       record.browserSessionId !== inspection.browser_session_id ||
@@ -166,7 +201,8 @@ async function resolveCaller(args = {}, { createRoot = false } = {}) {
     }
     throw new Error('Caller tab session/incarnation changed; manual registry reconciliation required');
   }
-  const observed = await callExtension('attest_profile_manager', {tab_id: tabId}, 10000);
+  const observed = await callExtension('attest_profile_manager', {
+    tab_id:tabId,__sessionBrowserId:inspection.browser_session_id}, 10000);
   if (observed.tab_id !== inspection.tab_id ||
       observed.incarnation_id !== inspection.incarnation_id ||
       observed.browser_session_id !== inspection.browser_session_id) {
@@ -175,13 +211,14 @@ async function resolveCaller(args = {}, { createRoot = false } = {}) {
   }
   diagnostics.debug('identity.attestation_verified',{tabId,site:inspection.site});
   const principal = profilePrincipalFromExtension(observed);
-  const old = profileManagerIdentities.get(tabId);
+  const managerKey=principal.browserSessionId + ':' + tabId;
+  const old = profileManagerIdentities.get(managerKey);
   if (old && !sameProfileManager(old, principal)) {
     activePrivateManagers.delete(old.credentialId);
     privateManagerObservations.delete(old.credentialId);
     armedPrivateDelivery.delete(old.credentialId);
   }
-  profileManagerIdentities.set(tabId, principal);
+  profileManagerIdentities.set(managerKey, principal);
   verifiedPrincipalContexts.add(principal);
   if (privateCoordinationEnabled && privateJournal) {
     // Re-enroll the verified tab after proxy/extension reconnect so its
@@ -194,12 +231,17 @@ async function resolveCaller(args = {}, { createRoot = false } = {}) {
 // Local Desktop confirmation only. Do not rewrite or replay FIFO events.
 const rootRepairOffers = new Map();
 const rootRepairBusy = new Set();
-async function inspectRootRepair(tabId, offer = false) {
+async function inspectRootRepair(tabId, offer = false, requestedSessionId = null) {
   if (!Number.isSafeInteger(tabId) || tabId <= 0 || !tabRegistry || !bridgeConnected())
     throw new Error('Connected Proxy and valid tab required');
-  const saved = tabRegistry.get(tabId);
-  const live = await callExtension('inspect_tab', {tab_id:tabId}, 10000);
-  const unresolved = privateJournal?.unresolvedForTab(tabId) ?? [];
+  const sessions=[...extensionSockets.keys()].filter((sessionId)=>
+    (!requestedSessionId || requestedSessionId === sessionId) &&
+    tabRegistry.get(tabId,sessionId)?.phase === 'root');
+  if (sessions.length!==1) throw new Error('Root tab ID is missing or ambiguous across browser sessions');
+  const browserSessionId=sessions[0];
+  const saved = tabRegistry.get(tabId,browserSessionId);
+  const live = await callExtension('inspect_tab', {tab_id:tabId,__sessionBrowserId:browserSessionId});
+  const unresolved = privateJournal?.unresolvedForTab(tabId,browserSessionId) ?? [];
   const reasons = [];
   if (!saved || saved.parentTabId !== null || saved.phase !== 'root')
     reasons.push('NOT_REGISTERED_ROOT');
@@ -207,37 +249,42 @@ async function inspectRootRepair(tabId, offer = false) {
   if (saved && saved.browserSessionId !== live.browser_session_id)
     reasons.push('BROWSER_SESSION_CHANGED');
   if (saved && saved.site !== live.site) reasons.push('SITE_CHANGED');
-  if (tabRegistry.hasChildren(tabId)) reasons.push('ROOT_HAS_DESCENDANTS');
+  if (tabRegistry.hasChildren(tabId,browserSessionId)) reasons.push('ROOT_HAS_DESCENDANTS');
   if (privateCoordinationEnabled && !privateJournal) reasons.push('JOURNAL_UNAVAILABLE');
   if (unresolved.length) reasons.push('UNRESOLVED_FIFO');
   const changed = Boolean(saved && saved.incarnationId !== live.incarnation_id);
   const eligible = reasons.length === 0 && changed;
-  const response = {tab_id:tabId,site:live.site,can_reconcile:eligible,
-    incarnation_changed:changed,reasons,has_descendants:tabRegistry.hasChildren(tabId),
+  const repairKey=browserSessionId+':'+tabId;
+  const response = {tab_id:tabId,browser_session_id:browserSessionId,site:live.site,can_reconcile:eligible,
+    incarnation_changed:changed,reasons,has_descendants:tabRegistry.hasChildren(tabId,browserSessionId),
     unresolved_by_phase:unresolved.reduce((counts,item)=>{
       counts[item.phase]=(counts[item.phase]||0)+1;return counts;
     },{})};
-  rootRepairOffers.delete(tabId);
+  rootRepairOffers.delete(repairKey);
   if (!offer || !eligible) return response;
   const nonce = crypto.randomUUID();
-  rootRepairOffers.set(tabId,{nonce,expires:Date.now()+60000,
+  rootRepairOffers.set(repairKey,{nonce,expires:Date.now()+60000,
     oldIncarnation:saved.incarnationId,newIncarnation:live.incarnation_id,
     browserSessionId:live.browser_session_id,site:live.site});
   return {...response,confirmation_nonce:nonce};
 }
-async function reconcileRootFromDesktop(tabId, nonce) {
-  if (!PRIVATE_EVENT_ID.test(nonce || '') || rootRepairBusy.has(tabId))
+async function reconcileRootFromDesktop(tabId, nonce, browserSessionId) {
+  const repairKey=browserSessionId+':'+tabId;
+  if (!PRIVATE_EVENT_ID.test(nonce || '') || rootRepairBusy.has(repairKey))
     throw new Error('Invalid or concurrent root recovery');
-  const offer=rootRepairOffers.get(tabId);
-  rootRepairOffers.delete(tabId);
+  const offer=rootRepairOffers.get(repairKey);
+  rootRepairOffers.delete(repairKey);
   if (!offer || offer.nonce !== nonce || Date.now()>offer.expires)
     throw new Error('Expired or invalid recovery confirmation');
-  rootRepairBusy.add(tabId);
+  rootRepairBusy.add(repairKey);
   try {
-    const saved=tabRegistry.get(tabId);
-    const live=await callExtension('inspect_tab',{tab_id:tabId},10000);
-    const attested=await callExtension('attest_profile_manager',{tab_id:tabId},10000);
-    if (!saved || saved.incarnationId !== offer.oldIncarnation ||
+    const saved=tabRegistry.get(tabId,browserSessionId);
+    const live=await callExtension('inspect_tab',{tab_id:tabId,
+      __sessionBrowserId:saved?.browserSessionId},10000);
+    const attested=await callExtension('attest_profile_manager',{tab_id:tabId,
+      __sessionBrowserId:saved?.browserSessionId},10000);
+    if (!saved || offer.browserSessionId !== browserSessionId ||
+        saved.incarnationId !== offer.oldIncarnation ||
         saved.browserSessionId !== offer.browserSessionId || saved.site !== offer.site ||
         live.incarnation_id !== offer.newIncarnation ||
         attested.incarnation_id !== offer.newIncarnation ||
@@ -245,31 +292,32 @@ async function reconcileRootFromDesktop(tabId, nonce) {
         attested.browser_session_id !== offer.browserSessionId ||
         live.site !== offer.site || live.is_managed_worker ||
         live.tab_id !== tabId || attested.tab_id !== tabId ||
-        tabRegistry.hasChildren(tabId) ||
+        tabRegistry.hasChildren(tabId,browserSessionId) ||
         (privateCoordinationEnabled && !privateJournal) ||
-        (privateJournal?.unresolvedForTab(tabId).length ?? 0)>0)
+        (privateJournal?.unresolvedForTab(tabId,browserSessionId).length ?? 0)>0)
       throw new Error('Root changed or has unresolved events; recovery refused');
-    await tabRegistry.reconcileRoot(live,offer.oldIncarnation);
-    profileManagerIdentities.delete(tabId);
-    const key=profileCredentialId(tabId);
+    await tabRegistry.reconcileRoot(live,offer.oldIncarnation,browserSessionId);
+    profileManagerIdentities.delete(saved.browserSessionId + ':' + tabId);
+    const key=profileCredentialId(saved.browserSessionId,tabId);
     activePrivateManagers.delete(key);
     armedPrivateDelivery.delete(key);
     privateManagerObservations.delete(key);
     diagnostics.info('identity.root_reconciled',{tabId,site:live.site});
     return {tab_id:tabId,reconciled:true,no_replay:true,no_ack:true};
-  } finally { rootRepairBusy.delete(tabId); }
+  } finally { rootRepairBusy.delete(repairKey); }
 }
 
-function requireDirectChild(callerId, childId) {
-  if (!tabRegistry?.directChild(callerId, childId)) {
+function requireDirectChild(callerId, childId, sessionId) {
+  if (!tabRegistry?.directChild(callerId, childId, sessionId)) {
     throw new Error('Target tab is not a direct child of the supplied caller tab');
   }
 }
 
-async function verifyDirectChild(callerId, childId) {
-  requireDirectChild(callerId,childId);
-  const record = tabRegistry.get(childId);
-  const live = await callExtension('inspect_tab',{tab_id:childId},10000);
+async function verifyDirectChild(callerId, childId, sessionId) {
+  requireDirectChild(callerId,childId,sessionId);
+  const record = tabRegistry.get(childId,sessionId);
+  const live = await callExtension('inspect_tab',{tab_id:childId,
+    __sessionBrowserId:record.browserSessionId},10000);
   if (live.incarnation_id !== record.incarnationId ||
       live.browser_session_id !== record.browserSessionId ||
       live.site !== record.site || live.is_managed_worker !== true) {
@@ -277,13 +325,14 @@ async function verifyDirectChild(callerId, childId) {
   }
 }
 
-async function verifyLiveAncestry(tabId) {
-  let node = tabRegistry.get(tabId);
+async function verifyLiveAncestry(tabId, sessionId) {
+  let node = tabRegistry.get(tabId,sessionId);
   while (node && node.parentTabId !== null) {
-    const parent = tabRegistry.get(node.parentTabId);
+    const parent = tabRegistry.get(node.parentTabId,sessionId);
     if (!parent || parent.incarnationId !== node.parentIncarnationId)
       throw new Error('Orphaned parent tab; new delegation is held for reconciliation');
-    const observed = await callExtension('inspect_tab',{tab_id:parent.tabId},10000);
+    const observed = await callExtension('inspect_tab',{tab_id:parent.tabId,
+      __sessionBrowserId:parent.browserSessionId},10000);
     if (observed.incarnation_id !== parent.incarnationId ||
         observed.browser_session_id !== parent.browserSessionId ||
         observed.site !== parent.site)
@@ -292,7 +341,7 @@ async function verifyLiveAncestry(tabId) {
   }
 }
 
-const preparingWorkerTabs = new Set();
+const preparingWorkerTabs = new Set(); // browser session + tab ID
 // Browser tabs may defer SPA initialization until foregrounded. Serialize
 // each prepare -> focus -> confirmed-submit handoff, not the worker's reply.
 // Worker models continue generating independently after submission.
@@ -306,13 +355,15 @@ async function spawnAndBindWorker(args, principal) {
   return serializeWorkerSpawn(() => prepareAndStartWorker(args,principal));
 }
 async function prepareAndStartWorker(args, principal) {
-  await verifyLiveAncestry(principal.callerTabId);
-  const root = tabRegistry.get(tabRegistry.get(principal.callerTabId)?.rootTabId);
+  await verifyLiveAncestry(principal.callerTabId,principal.browserSessionId);
+  const callerRecord=tabRegistry.get(principal.callerTabId,principal.browserSessionId);
+  const root = tabRegistry.get(callerRecord?.rootTabId,principal.browserSessionId);
   if (!root || root.parentTabId !== null || root.browserSessionId !== principal.browserSessionId)
     throw new Error('Root browser identity is unavailable for worker grouping');
   const taskText = args.saga_task_id == null ? args.task :
     args.task + '\n\nExternal tracking reference (optional, not an execution identity): Saga task #' + args.saga_task_id;
-  const params = {...args, task:taskText,__trustedPrincipal:principal,
+  const params = {...args,task:taskText,__trustedPrincipal:principal,
+    __sessionBrowserId:principal.browserSessionId,
     __rootTabId:root.tabId,__rootIncarnationId:root.incarnationId,__defer_start:true,
     prompt_text:composeAgentPrompt(agentSettings,{
       kind:'task',operation:args.operation || 'task',task:taskText})};
@@ -321,20 +372,22 @@ async function prepareAndStartWorker(args, principal) {
       !PRIVATE_EVENT_ID.test(prepared.incarnation_id || '')) {
     throw new Error('Worker preparation returned no attested tab; reconcile before retrying');
   }
-  if (preparingWorkerTabs.has(prepared.tab_id))
+  const preparationKey=principal.browserSessionId+':'+prepared.tab_id;
+  if (preparingWorkerTabs.has(preparationKey))
     throw new Error('Worker tab already has a pending prepared task; reconcile before retrying');
-  preparingWorkerTabs.add(prepared.tab_id);
+  preparingWorkerTabs.add(preparationKey);
   try {
-    const inspection = await callExtension('inspect_tab',{tab_id:prepared.tab_id});
+    const inspection = await callExtension('inspect_tab',{tab_id:prepared.tab_id,
+      __trustedPrincipal:principal,__sessionBrowserId:principal.browserSessionId});
     if (inspection.incarnation_id !== prepared.incarnation_id)
       throw new Error('Prepared worker incarnation changed');
-    const existing = tabRegistry.get(prepared.tab_id);
+    const existing = tabRegistry.get(prepared.tab_id,principal.browserSessionId);
     if (existing) {
-      await verifyDirectChild(principal.callerTabId,prepared.tab_id);
+      await verifyDirectChild(principal.callerTabId,prepared.tab_id,principal.browserSessionId);
       if (prepared.reused_tab !== true ||
           !['started','reattached'].includes(existing.phase))
         throw new Error('Existing worker phase does not permit automatic reuse');
-      await tabRegistry.setPhase(prepared.tab_id,'prepared');
+      await tabRegistry.setPhase(prepared.tab_id,'prepared',principal.browserSessionId);
     } else {
       if (prepared.reused_tab === true)
         throw new Error('Unregistered reusable worker requires manual reconciliation');
@@ -344,20 +397,24 @@ async function prepareAndStartWorker(args, principal) {
       ...params,__defer_start:false,tab_id:prepared.tab_id,
       expected_incarnation_id:prepared.incarnation_id,reused_tab:prepared.reused_tab,
     });
-    await tabRegistry.setPhase(prepared.tab_id,'started');
+    await tabRegistry.setPhase(prepared.tab_id,'started',principal.browserSessionId);
     return {...result,parent_tab_id:principal.callerTabId,
-      root_tab_id:tabRegistry.get(prepared.tab_id).rootTabId};
+      root_tab_id:tabRegistry.get(prepared.tab_id,principal.browserSessionId).rootTabId};
   } catch (error) {
-    if (tabRegistry.directChild(principal.callerTabId,prepared.tab_id) &&
-        tabRegistry.get(prepared.tab_id)?.phase === 'prepared') {
-      await tabRegistry.setPhase(prepared.tab_id,'uncertain').catch(()=>{});
+    const definitelyNotSubmitted = error.code === 'COMPOSER_DRAFT_MISMATCH';
+    if (tabRegistry.directChild(principal.callerTabId,prepared.tab_id,principal.browserSessionId) &&
+        tabRegistry.get(prepared.tab_id,principal.browserSessionId)?.phase === 'prepared') {
+      // A confirmed readiness refusal precedes task creation and any send
+      // attempt. Keep this worker prepared for inspection; all other failures
+      // may have submitted and must remain UNCERTAIN.
+      if (!definitelyNotSubmitted)
+        await tabRegistry.setPhase(prepared.tab_id,'uncertain',principal.browserSessionId).catch(()=>{});
     }
-    // A prompt may already have been submitted even if the response vanished.
-    // Keep the prepared tab open; no blind second spawn or task replay.
     throw new Error('Prepared worker tab ' + prepared.tab_id +
-      ' outcome UNCERTAIN; inspect the tab and registry before retrying: ' + error.message);
+      (definitelyNotSubmitted ? ' not submitted; inspect its unsent draft before retrying: '
+        : ' outcome UNCERTAIN; inspect the tab and registry before retrying: ') + error.message);
   } finally {
-    preparingWorkerTabs.delete(prepared.tab_id);
+    preparingWorkerTabs.delete(preparationKey);
   }
 }
 
@@ -401,9 +458,10 @@ async function verifiedPrivateWorkerScope(principal, workerTabId) {
   if (!privateCoordinationEnabled || !verifiedPrincipalContexts.has(principal)) {
     throw new Error('Private queue requires a connected profile manager');
   }
-  const tabs = await callExtension('list_tabs', { __trustedPrincipal: principal });
+  const tabs = await callExtension('list_tabs', { __trustedPrincipal:principal,
+    __sessionBrowserId:principal.browserSessionId });
   const worker = tabs.find((tab) => tab.tab_id === workerTabId && tab.role === 'worker');
-  await verifyDirectChild(principal.callerTabId,workerTabId);
+  await verifyDirectChild(principal.callerTabId,workerTabId,principal.browserSessionId);
   if (!worker || typeof worker.incarnation_id !== 'string' ||
       !PRIVATE_EVENT_ID.test(worker.incarnation_id)) {
     throw new Error('Worker tab has no verified creation incarnation');
@@ -1120,7 +1178,7 @@ async function openPrivateEventJournal() {
       },
       append,
       diagnosticCounts: () => privateQueueDiagnosticCounts(queueState),
-      unresolvedForTab: (tabId) => queueState.fifo
+      unresolvedForTab: (tabId,_sessionId) => queueState.fifo
         .map((key) => queueState.byRef.get(key))
         .filter((item) => item.recipientTabId === tabId &&
           !['PROCESSED','SAGA_CONFIRMED'].includes(item.phase))
@@ -1148,20 +1206,59 @@ async function openPrivateEventJournal() {
 }
 
 // ------------------------------------------------------- extension WS bridge
-let bridge = null;
-const pending = new Map(); // id -> { resolve, reject, timer }
+const extensionSockets = new Map(); // browser-session ID -> live extension socket
+const pending = new Map(); // id -> { resolve, reject, timer, ws }
+let bridge = null; // most recently active socket for legacy calls
+let sessionHeartbeatTimer = null;
+const bridgeConnected = () => [...extensionSockets.values()].some((ws) => ws.readyState === 1);
 
-const bridgeConnected = () => bridge && bridge.readyState === 1;
+function extensionSocketFor(params = {}) {
+  const principal = params.__trustedPrincipal;
+  if (principal?.mode === 'profile') {
+    const ws = extensionSockets.get(principal.browserSessionId);
+    if (!ws || ws.readyState !== 1 || ws !== principal.socket ||
+        ws.connectionGeneration !== principal.socketGeneration) {
+      throw new Error('The browser session for this caller is disconnected. Reconnect the matching extension.');
+    }
+    return ws;
+  }
+  if (params.__sessionBrowserId) {
+    const selected = extensionSockets.get(params.__sessionBrowserId);
+    if (!selected || selected.readyState !== 1)
+      throw new Error('Selected browser session is disconnected or unknown');
+    return selected;
+  }
+  const sockets = [...extensionSockets.values()].filter((ws) => ws.readyState === 1);
+  if (sockets.length === 1) return sockets[0];
+  throw new Error(sockets.length
+    ? 'Multiple browser sessions are connected; provide a verified caller tab.'
+    : 'The browser extension is not connected. Open its popup and check the WebSocket URL.');
+}
 
 function callExtension(method, params = {}, timeoutMs = 120000) {
+  const liveSockets=[...extensionSockets.values()].filter((ws)=>ws.readyState===1);
+  if (method==='list_tabs' && params.__discoveryOnly===true && !params.__sessionBrowserId && liveSockets.length>1) {
+    return Promise.all(liveSockets.map((ws)=>callExtension(method,
+      {...params,__sessionBrowserId:ws.browserSessionId},timeoutMs)))
+      .then((groups)=>groups.flatMap((group,index)=>group.map((tab)=>({...tab,
+        browser_session_id:liveSockets[index].browserSessionId}))));
+  }
+  if (method==='inspect_tab' && params.__sessionBrowserId == null && liveSockets.length>1) {
+    return Promise.allSettled(liveSockets.map((ws)=>callExtension(method,
+      {...params,__sessionBrowserId:ws.browserSessionId},timeoutMs)))
+      .then((results)=>{
+        const matches=results.filter((result)=>result.status==='fulfilled' &&
+          result.value?.tab_id===params.tab_id);
+        if (matches.length===1) return matches[0].value;
+        if (matches.length>1) throw new Error('Caller tab ID exists in multiple browser sessions; choose session from list_tabs');
+        throw results.find((result)=>result.status==='rejected')?.reason ||
+          new Error('Caller tab ID was not found in any connected browser session');
+      });
+  }
   return new Promise((resolve, reject) => {
-    if (!bridgeConnected()) {
-      return reject(
-        new Error(
-          'The browser extension is not connected. Open the extension popup, check the server URL/token, and make sure the browser is running.'
-        )
-      );
-    }
+    let socket;
+    try { socket = extensionSocketFor(params); }
+    catch (error) { reject(error); return; }
     const id = crypto.randomUUID();
     const startedAt = Date.now();
     diagnostics.debug('bridge.request',{method,requestId:id,tabId:params.tab_id});
@@ -1171,9 +1268,15 @@ function callExtension(method, params = {}, timeoutMs = 120000) {
       reject(new Error(`Extension call "${method}" timed out after ${timeoutMs / 1000}s`));
     }, timeoutMs);
     pending.set(id, {
+      ws:socket,
       resolve:(result)=>{
         diagnostics.debug('bridge.response',{method,requestId:id,
           durationMs:Date.now()-startedAt,success:true});
+        if (method==='list_tabs' && Array.isArray(result)) {
+          result=result.map((tab)=>({...tab,browser_session_id:socket.browserSessionId}));
+        } else if (method==='inspect_tab' && result && typeof result==='object') {
+          result={...result,browser_session_id:socket.browserSessionId};
+        }
         resolve(result);
       },
       reject:(error)=>{
@@ -1183,120 +1286,207 @@ function callExtension(method, params = {}, timeoutMs = 120000) {
         reject(error);
       },timer,
     });
-    bridge.send(JSON.stringify({ type: 'call', id, method, params }));
+    try { socket.send(JSON.stringify({ type: 'call', id, method, params })); }
+    catch (error) {
+      clearTimeout(timer);
+      pending.delete(id);
+      reject(error);
+    }
   });
 }
 
-function failAllPending(reason) {
-  for (const [id, p] of pending) {
-    clearTimeout(p.timer);
-    p.reject(new Error(reason));
+function failSocketPending(socket, reason) {
+  for (const [id, request] of pending) {
+    if (request.ws !== socket) continue;
+    clearTimeout(request.timer);
+    request.reject(new Error(reason));
     pending.delete(id);
   }
+}
+
+function failAllPending(reason) {
+  for (const [id, request] of pending) {
+    clearTimeout(request.timer);
+    request.reject(new Error(reason));
+    pending.delete(id);
+  }
+}
+
+function bindExtensionSocket(ws, browserSessionId) {
+  const previous = extensionSockets.get(browserSessionId);
+  ws.browserSessionId = browserSessionId;
+  ws.connectionGeneration = ws.requestedConnectionGeneration;
+  ws.lastHeartbeatAt = Date.now();
+  extensionSockets.set(browserSessionId, ws);
+  bridge = ws;
+  diagnostics.info('bridge.connected',{socketGeneration:ws.connectionGeneration});
+  if (previous && previous !== ws) {
+    failSocketPending(previous,'This browser session reconnected; prior call outcome may be uncertain');
+    previous.close(4000,'same browser session reconnected');
+  }
+  ws.on('close', () => {
+    if (extensionSockets.get(browserSessionId) !== ws) return;
+    extensionSockets.delete(browserSessionId);
+    if (bridge === ws) bridge = [...extensionSockets.values()].at(-1) || null;
+    failSocketPending(ws,'Browser extension session disconnected during call');
+    for (const [managerKey, principal] of profileManagerIdentities) {
+      if (principal.socket !== ws) continue;
+      profileManagerIdentities.delete(managerKey);
+      activePrivateManagers.delete(principal.credentialId);
+      privateManagerObservations.delete(principal.credentialId);
+      armedPrivateDelivery.delete(principal.credentialId);
+    }
+    diagnostics.warn('bridge.disconnected',{socketGeneration:ws.connectionGeneration});
+  });
+}
+
+function sendExtensionSettings(ws) {
+  if (ws?.readyState !== 1 || !trustedExtensionSockets.has(ws)) return;
+  ws.send(JSON.stringify({type:'settings_snapshot',schema:1,
+    revision:agentSettingsRevision,settings:agentSettings}));
+}
+
+function sendSessionHeartbeat() {
+  const now = Date.now();
+  for (const ws of extensionSockets.values()) {
+    if (ws.readyState !== 1) continue;
+    if (now - (ws.lastHeartbeatAt || now) > 60000) {
+      diagnostics.warn('bridge.heartbeat_timeout',{socketGeneration:ws.connectionGeneration});
+      ws.terminate();
+      continue;
+    }
+    try {
+      ws.send(JSON.stringify({type:'session_heartbeat',nonce:crypto.randomUUID(),
+        proxy_session_id:proxySessionId}));
+    } catch { ws.terminate(); }
+  }
+}
+
+function resetExtensionSessionState() {
+  profileSocketGeneration++;
+  profileManagerIdentities.clear();
+  activePrivateManagers.clear();
+  privateManagerObservations.clear();
+  armedPrivateDelivery.clear();
+  rootRepairOffers.clear();
+  rootRepairBusy.clear();
+  tabRegistry = createSessionTabRegistry();
 }
 
 const wss = new WebSocketServer({ noServer: true });
 
 wss.on('connection', (ws) => {
-  if (bridge && bridge !== ws) {
-    // Do not carry pending side-effect calls across extension incarnations.
-    failAllPending('Extension connection replaced; prior call outcome UNCERTAIN');
-    try {
-      bridge.close(4000, 'replaced by a newer connection');
-    } catch {}
-  }
-  bridge = ws;
-  profileSocketGeneration++;
-  diagnostics.info('bridge.connected',{socketGeneration:profileSocketGeneration});
-  profileManagerIdentities.clear();
-  activePrivateManagers.clear();
-  privateManagerObservations.clear();
-  armedPrivateDelivery.clear();
-  console.log('[bridge] extension connected');
-  ws.send(JSON.stringify({ type: 'coordination_capabilities',
-    queue_enabled: privateCoordinationEnabled && Boolean(privateJournal) }));
-  sendAgentSettings(ws);
-
+  let handshakeComplete = false;
   ws.on('message', (raw) => {
-    if (ws !== bridge) return; // Stale transport may never ACK a new generation.
     let msg;
-    try {
-      msg = JSON.parse(raw.toString());
-    } catch {
-      return;
-    }
-    if (msg.type === 'settings_applied') {
-      if (trustedExtensionSockets.has(ws) && msg.revision === agentSettingsRevision) {
-        process.parentPort?.postMessage({type: 'agent_settings_synced', revision: msg.revision});
+    try { msg = JSON.parse(raw.toString()); } catch { return; }
+    if (msg.type === 'register_session') {
+      const sessionId = msg.browser_session_id;
+      if (!PRIVATE_EVENT_ID.test(sessionId || '') ||
+          !Number.isSafeInteger(msg.connection_generation) || msg.connection_generation < 1) {
+        ws.close(4002,'invalid browser session handshake');
+        return;
       }
+      if (handshakeComplete) return;
+      handshakeComplete = true;
+      ws.requestedConnectionGeneration=msg.connection_generation;
+      // A stale client must not reset unrelated browser profiles. The session
+      // acknowledgement lets only this extension clear its own old state.
+      bindExtensionSocket(ws,sessionId);
+      ws.send(JSON.stringify({type:'session_registered',session_id:sessionId,
+        connection_generation:msg.connection_generation,queue_enabled:privateCoordinationEnabled && Boolean(privateJournal),
+        proxy_session_id:proxySessionId}));
+      // Settings arrive only after the extension has checked whether its old
+      // proxy session needs resetting; never let an old socket overwrite it.
+      console.log('[bridge] extension session registered');
       return;
     }
-    if (msg.type === 'ping') {
-      ws.send(JSON.stringify({ type: 'pong' }));
+    if (!handshakeComplete || extensionSockets.get(ws.browserSessionId) !== ws) return;
+    if (msg.type === 'session_ready') {
+      sendExtensionSettings(ws);
       return;
     }
-    if (msg.type === 'diagnostic_event') {
-      if (typeof msg.event === 'string' && /^[a-z][a-z0-9_.-]{0,79}$/.test(msg.event) &&
-          ['debug','info','warn','error'].includes(msg.level)) {
-        diagnostics.event(msg.level,'extension.'+msg.event,msg.data);
-      }
+    if (msg.type === 'session_heartbeat_ack') {
+      ws.lastHeartbeatAt = Date.now();
       return;
     }
-    if (msg.type === 'worker_lost') {
-      if (!PRIVATE_EVENT_ID.test(msg.request_id || '')) return;
-      void acceptPrivateWorkerLoss(msg).then((receipt) => {
-        if (ws.readyState === 1 && ws === bridge) ws.send(JSON.stringify({
-          type:'worker_event_receipt',request_id:msg.request_id,ok:true,receipt,
-        }));
-      }).catch(() => {
-        if (ws.readyState === 1 && ws === bridge) ws.send(JSON.stringify({
-          type:'worker_event_receipt',request_id:msg.request_id,ok:false,
-          error:'Durable lost-child event unavailable; reconcile without blind replay',
-        }));
-      });
+    if (msg.type === 'session_heartbeat') {
+      ws.lastHeartbeatAt = Date.now();
+      ws.send(JSON.stringify({type:'session_heartbeat_ack',nonce:msg.nonce,
+        proxy_session_id:proxySessionId}));
       return;
     }
-    if (msg.type === 'worker_done') {
-      if (!PRIVATE_EVENT_ID.test(msg.request_id || '')) return;
-      void acceptPrivateWorkerCompletion(msg).then((receipt) => {
-        if (ws.readyState === 1 && ws === bridge) {
-          ws.send(JSON.stringify({ type: 'worker_event_receipt', request_id: msg.request_id,
-            ok: true, receipt }));
-        }
-      }).catch(() => {
-        if (ws.readyState === 1 && ws === bridge) {
-          ws.send(JSON.stringify({ type: 'worker_event_receipt', request_id: msg.request_id,
-            ok: false, error: 'Durable worker receipt unavailable; reconcile without replay' }));
-        }
-      });
-      return;
-    }
-    if (msg.type === 'result') {
-      const p = pending.get(msg.id);
-      if (!p) return;
-      clearTimeout(p.timer);
-      pending.delete(msg.id);
-      if (msg.ok) p.resolve(msg.result);
-      else p.reject(new Error(msg.error || 'extension error'));
-    }
+    handleExtensionMessage(ws,msg);
   });
-
-  ws.on('close', () => {
-    if (bridge === ws) {
-      bridge = null;
-      diagnostics.warn('bridge.disconnected',{socketGeneration:profileSocketGeneration});
-      console.log('[bridge] extension disconnected');
-      profileManagerIdentities.clear();
-      activePrivateManagers.clear();
-      armedPrivateDelivery.clear();
-      failAllPending('Extension disconnected while a call was in flight');
-    }
-  });
+  ws.on('error',()=>{});
+  const handshakeTimeout=setTimeout(()=>{
+    if (!handshakeComplete) ws.close(4002,'browser session handshake timed out');
+  },10000);
+  handshakeTimeout.unref?.();
+  ws.once('close',()=>clearTimeout(handshakeTimeout));
 });
+
+function handleExtensionMessage(ws,msg) {
+  if (extensionSockets.get(ws.browserSessionId) !== ws) return;
+  if (msg.type === 'settings_applied') {
+    if (trustedExtensionSockets.has(ws) && msg.revision === agentSettingsRevision) {
+      process.parentPort?.postMessage({type:'agent_settings_synced',revision:msg.revision,
+        browserSessionId:ws.browserSessionId});
+    }
+    return;
+  }
+  if (msg.type === 'ping') {
+    ws.send(JSON.stringify({type:'pong'}));
+    return;
+  }
+  if (msg.type === 'diagnostic_event') {
+    if (typeof msg.event === 'string' && /^[a-z][a-z0-9_.-]{0,79}$/.test(msg.event) &&
+        ['debug','info','warn','error'].includes(msg.level)) {
+      diagnostics.event(msg.level,'extension.'+msg.event,msg.data);
+    }
+    return;
+  }
+  if (msg.type === 'worker_lost') {
+    if (!PRIVATE_EVENT_ID.test(msg.request_id || '')) return;
+    void acceptPrivateWorkerLoss({...msg,browser_session_id:ws.browserSessionId}).then((receipt) => {
+      if (ws.readyState === 1 && extensionSockets.get(ws.browserSessionId) === ws)
+        ws.send(JSON.stringify({type:'worker_event_receipt',request_id:msg.request_id,ok:true,receipt}));
+    }).catch(() => {
+      if (ws.readyState === 1 && extensionSockets.get(ws.browserSessionId) === ws)
+        ws.send(JSON.stringify({type:'worker_event_receipt',request_id:msg.request_id,ok:false,
+          error:'Durable lost-child event unavailable; reconcile without blind replay'}));
+    });
+    return;
+  }
+  if (msg.type === 'worker_done') {
+    if (!PRIVATE_EVENT_ID.test(msg.request_id || '')) return;
+    void acceptPrivateWorkerCompletion({...msg,browser_session_id:ws.browserSessionId}).then((receipt) => {
+      if (ws.readyState === 1 && extensionSockets.get(ws.browserSessionId) === ws)
+        ws.send(JSON.stringify({type:'worker_event_receipt',request_id:msg.request_id,ok:true,receipt}));
+    }).catch(() => {
+      if (ws.readyState === 1 && extensionSockets.get(ws.browserSessionId) === ws)
+        ws.send(JSON.stringify({type:'worker_event_receipt',request_id:msg.request_id,ok:false,
+          error:'Durable worker receipt unavailable; reconcile without replay'}));
+    });
+    return;
+  }
+  if (msg.type === 'result') {
+    const request=pending.get(msg.id);
+    if (!request || request.ws !== ws) return;
+    clearTimeout(request.timer);
+    pending.delete(msg.id);
+    if (msg.ok) request.resolve(msg.result);
+    else {
+      const error = new Error(msg.error || 'extension error');
+      if (msg.error_code === 'COMPOSER_DRAFT_MISMATCH') error.code = msg.error_code;
+      request.reject(error);
+    }
+  }
+}
 
 // ------------------------------------------------- private producer/manager API
 // Manager registration is volatile and reset on extension restart or proxy restart.
-const activePrivateManagers = new Map(); // profileId -> frozen browser-session manager context
+const activePrivateManagers = new Map(); // browser-session/tab key -> manager context
 const privateManagerObservations = new Map(); // transient readiness observation
 
 function privateManagerScope(principal) {
@@ -1330,7 +1520,6 @@ function registeredPrivateManager(principal) {
 }
 
 function rememberPrivateManagerReadiness(principal, observation) {
-function rememberPrivateManagerReadiness(principal, observation) {
   if (!observation) throw new Error('Paired manager tab could not be attested: no browser observation');
   const mismatches = [];
   if (observation.tab_id !== principal.callerTabId) mismatches.push('tab_id');
@@ -1346,7 +1535,6 @@ function rememberPrivateManagerReadiness(principal, observation) {
     state: observation.state, observedAt: Date.now(),
   });
 }
-}
 
 function privateReadinessState({ revoked, registered, connected, observation, now = Date.now() }) {
   if (revoked) return 'revoked';
@@ -1360,7 +1548,8 @@ function privateReadinessState({ revoked, registered, connected, observation, no
 
 async function registerPrivateManager(principal) {
   privateManagerScope(principal);
-  const observation = await callExtension('manager_state', { __trustedPrincipal: principal });
+  const observation = await callExtension('manager_state', {
+    __trustedPrincipal:principal,__sessionBrowserId:principal.browserSessionId});
   if (!currentPrivatePrincipal(principal)) throw new Error('Configured manager tab changed during registration');
   rememberPrivateManagerReadiness(principal, observation);
   activePrivateManagers.set(principal.credentialId, principal);
@@ -1373,16 +1562,16 @@ async function registerPrivateManager(principal) {
 // Closure is controlled by the parent and internal worker task UUIDs. Saga
 // references are optional external metadata, never a gate or ownership key.
 async function closeReviewedWorker(principal, args) {
-  const worker = tabRegistry.get(args.tab_id);
+  const worker = tabRegistry.get(args.tab_id,principal.browserSessionId);
   if (!worker || worker.parentTabId !== principal.callerTabId ||
       !['started','reattached'].includes(worker.phase)) {
     throw new Error('Worker is not in a closable state; reconcile it first');
   }
-  if (tabRegistry.hasChildren(args.tab_id))
+  if (tabRegistry.hasChildren(args.tab_id,principal.browserSessionId))
     throw new Error('Worker has descendants; close or reconcile them first');
   const inspected = await callExtension('inspect_worker_tasks', {
-    __trustedPrincipal:principal,tab_id:args.tab_id,
-    worker_incarnation_id:worker.incarnationId,
+    __trustedPrincipal:principal,__sessionBrowserId:principal.browserSessionId,
+    tab_id:args.tab_id,worker_incarnation_id:worker.incarnationId,
   });
   if (inspected?.tab_id !== args.tab_id ||
       inspected.worker_incarnation_id !== worker.incarnationId ||
@@ -1410,13 +1599,13 @@ async function closeReviewedWorker(principal, args) {
       }
     }
   }
-  await verifyDirectChild(principal.callerTabId,args.tab_id);
+  await verifyDirectChild(principal.callerTabId,args.tab_id,principal.browserSessionId);
   if (privateCoordinationEnabled && privateJournal) registeredPrivateManager(principal);
   else if (!currentPrivatePrincipal(principal))
     throw new Error('Parent tab changed during close review');
   return callExtension('close_reviewed_worker',{
-    __trustedPrincipal:principal,tab_id:args.tab_id,
-    worker_incarnation_id:worker.incarnationId,parent_reviewed:true,
+    __trustedPrincipal:principal,__sessionBrowserId:principal.browserSessionId,
+    tab_id:args.tab_id,worker_incarnation_id:worker.incarnationId,parent_reviewed:true,
   });
 }
 
@@ -1462,8 +1651,11 @@ async function acceptPrivateWorkerCompletion(packet) {
   const active = activePrivateManagers.get(packet.credential_id);
   if (!active) throw new Error('Parent manager must register before child completion');
   registeredPrivateManager(active);
+  if (packet.browser_session_id !== active.browserSessionId)
+    throw new Error('Worker completion came from a different browser session');
   const task = await callExtension('get_result', {
     task_id: packet.task_id, __trustedPrincipal: active,
+    __sessionBrowserId:active.browserSessionId,
   });
   if (!['done', 'failed'].includes(task.status) || task.tab_id !== packet.tab_id ||
       task.source_incarnation_id !== packet.worker_incarnation_id) {
@@ -1511,7 +1703,10 @@ async function acceptPrivateWorkerLoss(packet) {
   const principal = activePrivateManagers.get(packet.credential_id);
   if (!principal) throw new Error('Parent manager not registered');
   const active = registeredPrivateManager(principal);
-  const task = await callExtension('get_result', {__trustedPrincipal:active,task_id:packet.task_id});
+  if (packet.browser_session_id !== active.browserSessionId)
+    throw new Error('Child-loss receipt came from a different browser session');
+  const task = await callExtension('get_result',{__trustedPrincipal:active,
+    __sessionBrowserId:active.browserSessionId,task_id:packet.task_id});
   if (task.tab_id !== packet.tab_id ||
       task.source_incarnation_id !== packet.worker_incarnation_id ||
       !['done','failed'].includes(task.status)) {
@@ -1641,7 +1836,8 @@ async function pumpOnePrivateManager(principal) {
     }
     diagnostics.info('fifo.batch_prepared',{callerTabId:principal.callerTabId,batchId,
       batchSize:events.length,queueDepth:pendingQueue.length});
-    const ready = await callExtension('manager_state', { __trustedPrincipal: principal });
+    const ready = await callExtension('manager_state', {
+      __trustedPrincipal:principal,__sessionBrowserId:principal.browserSessionId});
     rememberPrivateManagerReadiness(principal, ready);
     if (ready.ready !== true || ready.state !== 'idle') {
       diagnostics.debug('fifo.parent_not_ready',{callerTabId:principal.callerTabId,batchId,
@@ -1655,17 +1851,10 @@ async function pumpOnePrivateManager(principal) {
     if (events.some((event, i) =>
       pendingQueue[i]?.ref !== event.event_id || pendingQueue[i].phase !== 'QUEUED')) return;
 
-    const scopes = [];
-    for (const event of events) {
-      const original = firstEvents.get(event.event_id);
-      if (original.source.type === 'worker_tab' && original.payload.entryType !== 'CHILD_TAB_LOST') {
-        const verified = await verifiedPrivateWorkerScope(principal, original.source.tabId);
-        if (verified.workerIncarnationId !== original.source.incarnationId) {
-          throw new Error('Queued child source incarnation no longer matches');
-        }
-        scopes.push(verified);
-      } else scopes.push(privateRecordedScope(principal, original));
-    }
+    // Original source identity was verified at enrollment; a completed worker
+    // may close before its immutable result reaches the manager.
+    const scopes = events.map((event) =>
+      privateRecordedScope(principal, firstEvents.get(event.event_id)));
     for (let i = 0; i < events.length; i++) {
       await privateJournal.append(principal, scopes[i], 'queue.transition', {
         phase: 'LEASED', ref: events[i].event_id, leaseGeneration: 1,
@@ -1684,8 +1873,10 @@ async function pumpOnePrivateManager(principal) {
     try {
       registeredPrivateManager(principal); // No stale credential may submit a browser prompt.
       const outcome = await callExtension('wake_manager', {
-        __trustedPrincipal: principal, batch_id: batchId, events,
-        prompt_text: composeAgentPrompt(agentSettings,{kind:'queue',batchId,events}),
+        __trustedPrincipal:principal,__sessionBrowserId:principal.browserSessionId,
+        manager_tab_id:principal.callerTabId,
+        batch_id:batchId,events,
+        prompt_text:composeAgentPrompt(agentSettings,{kind:'queue',batchId,events}),
       });
       submitted = outcome?.submitted === true && outcome.uncertain !== true;
     } catch { /* Submitted status may be ambiguous; never retry. */ }
@@ -1747,7 +1938,7 @@ async function acknowledgePrivateBatch(principal, batchId, eventIds) {
     }, crypto.randomUUID());
   }
   await callExtension('manager_processed', {
-    __trustedPrincipal: active, batch_id: batchId,
+    __trustedPrincipal:active,__sessionBrowserId:active.browserSessionId,batch_id:batchId,
   }).catch(() => {}); // Journal ACK remains primary; extension state may need manual reconciliation.
   diagnostics.info('fifo.ack_processed',{callerTabId:principal.callerTabId,
     batchId,processedCount:items.length});
@@ -1774,46 +1965,54 @@ function forward(method, principal) {
       tabId:args?.tab_id});
     try {
       if (method === 'list_tabs' && args?.caller_tab_id == null) {
-        const candidates = await callExtension('list_tabs',{__discoveryOnly:true});
+        const candidates = await callExtension('list_tabs',{
+          __discoveryOnly:true,__sessionBrowserId:args?.browser_session_id});
         return textResult(candidates);
       }
+      if (args?.browser_session_id) args.__sessionBrowserId=args.browser_session_id;
       const selfRead = method === 'read_chat' &&
         (args?.tab_id == null || args.tab_id === args.caller_tab_id);
       const caller = await resolveCaller(args,{
         createRoot:method === 'spawn_worker' || selfRead,
       });
+      args.__sessionBrowserId = caller.browserSessionId;
       let result;
       if (method === 'spawn_worker') {
         result = await spawnAndBindWorker(args,caller);
       } else if (method === 'reopen_child') {
-        const root = tabRegistry.get(tabRegistry.get(caller.callerTabId)?.rootTabId);
+        const callerRecord=tabRegistry.get(caller.callerTabId,caller.browserSessionId);
+        const root=tabRegistry.get(callerRecord?.rootTabId,caller.browserSessionId);
         if (!root || root.parentTabId !== null ||
             root.browserSessionId !== caller.browserSessionId)
           throw new Error('Root browser identity unavailable for child recovery');
         result = await callExtension(method,{...args,__trustedPrincipal:caller,
+          __sessionBrowserId:caller.browserSessionId,
           __rootTabId:root.tabId,__rootIncarnationId:root.incarnationId});
         if (Number.isSafeInteger(result?.tab_id)) {
-          const inspected = await callExtension('inspect_tab',{tab_id:result.tab_id});
+          const inspected = await callExtension('inspect_tab',{tab_id:result.tab_id,
+            __trustedPrincipal:caller,__sessionBrowserId:caller.browserSessionId});
           await tabRegistry.registerChild(caller.callerTabId,inspected);
-          await tabRegistry.setPhase(result.tab_id,'reattached');
+          await tabRegistry.setPhase(result.tab_id,'reattached',caller.browserSessionId);
           result = {...result,parent_tab_id:caller.callerTabId,
-            root_tab_id:tabRegistry.get(result.tab_id).rootTabId};
+            root_tab_id:tabRegistry.get(result.tab_id,caller.browserSessionId).rootTabId};
         }
       } else {
         const target = args?.tab_id;
         if (method === 'send_to_tab' || (method === 'read_chat' && target != null)) {
-          if (target !== caller.callerTabId) await verifyDirectChild(caller.callerTabId,target);
+          if (target !== caller.callerTabId) await verifyDirectChild(caller.callerTabId,target,caller.browserSessionId);
         }
         if (method === 'send_to_tab' &&
-            !['started','reattached'].includes(tabRegistry.get(target)?.phase))
+            !['started','reattached'].includes(tabRegistry.get(target,caller.browserSessionId)?.phase))
           throw new Error('Worker is prepared or UNCERTAIN; reconcile before another message');
         if (method === 'list_tabs') {
-          const tabs = await callExtension('list_tabs',{__trustedPrincipal:caller});
+          const tabs = await callExtension('list_tabs',{__trustedPrincipal:caller,
+            __sessionBrowserId:caller.browserSessionId});
           result = tabs.filter(t=>t.tab_id === caller.callerTabId ||
-            tabRegistry.directChild(caller.callerTabId,t.tab_id))
-            .map(t=>({...t,parent_tab_id:tabRegistry.get(t.tab_id)?.parentTabId ?? null,
-              root_tab_id:tabRegistry.get(t.tab_id)?.rootTabId ?? null}));
-        } else result = await callExtension(method,{...args,__trustedPrincipal:caller});
+            tabRegistry.directChild(caller.callerTabId,t.tab_id,caller.browserSessionId))
+            .map(t=>({...t,parent_tab_id:tabRegistry.get(t.tab_id,caller.browserSessionId)?.parentTabId ?? null,
+              root_tab_id:tabRegistry.get(t.tab_id,caller.browserSessionId)?.rootTabId ?? null}));
+        } else result = await callExtension(method,{...args,__trustedPrincipal:caller,
+          __sessionBrowserId:caller.browserSessionId});
       }
       recordToolActivity(caller, method, true, startedAt);
       diagnostics.info('mcp.call_completed',{traceId,method,callerTabId:args?.caller_tab_id,
@@ -1842,6 +2041,8 @@ const waitSeconds = z
 function buildServer(principal) {
   const callerTabInput = z.number().int().positive()
     .describe('Browser tab_id of the calling chat conversation. Use list_tabs to discover IDs.');
+  const browserSessionInput=z.string().uuid().optional()
+    .describe('browser_session_id returned with list_tabs when multiple browser profiles are connected.');
   const server = new McpServer({ name: 'chat-orchestrator', version: '0.1.0' });
 
   server.registerTool(
@@ -1849,8 +2050,8 @@ function buildServer(principal) {
     {
       title: 'List chat tabs',
       description:
-        'List open Claude / ChatGPT tabs in the user\'s browser with their tab_id, site, title and role (orchestrator, worker, or other).',
-      inputSchema: {caller_tab_id:callerTabInput.optional()},
+        'List open chat tabs across connected browser profiles. Each result includes tab_id, browser_session_id, site, title and role. When multiple profiles are connected, pass browser_session_id to scope later calls.',
+      inputSchema: {caller_tab_id:callerTabInput.optional(),browser_session_id:browserSessionInput},
     },
     forward('list_tabs', principal)
   );
@@ -1863,6 +2064,7 @@ function buildServer(principal) {
         'Open or reuse a worker chat under caller_tab_id. Returns an internal task_id; use get_result for updates. The parent may inspect the result and send fixing tasks with send_to_tab until satisfied. Saga references are optional external task metadata, never worker identities or closure gates. Close only when parent-owned work is terminal and all required result receipts are processed.',
       inputSchema: {
         caller_tab_id:callerTabInput,
+        browser_session_id:browserSessionInput,
         saga_task_id:z.number().int().positive().optional()
           .describe('Optional external Saga tracking reference; not a worker identifier or closure prerequisite.'),
         site: z.enum(['chatgpt', 'claude', 'gemini']).describe('Which chat site the worker runs on.'),
@@ -1898,7 +2100,8 @@ function buildServer(principal) {
     {
       title:'Recover a lost child conversation',
       description:'Reopen a saved child conversation by its original task_id in this profile. Returns a newly attached child tab. Execution is not automatically resumed. Inspect read_chat and get_result first.',
-      inputSchema:{caller_tab_id:callerTabInput,task_id:z.string().uuid().describe('Original task_id from CHILD_TAB_LOST notification.')},
+      inputSchema:{caller_tab_id:callerTabInput,browser_session_id:browserSessionInput,
+        task_id:z.string().uuid().describe('Original task_id from CHILD_TAB_LOST notification.')},
     },
     forward('reopen_child',principal)
   );
@@ -1910,6 +2113,7 @@ function buildServer(principal) {
         'Send another message to a worker tab that is already open (continues that chat). Returns a task_id; use get_result to collect the reply.',
       inputSchema: {
         caller_tab_id:callerTabInput,
+        browser_session_id:browserSessionInput,
         tab_id: z.number().int().describe('tab_id of the worker tab (from list_tabs or spawn_worker).'),
         text: z.string().min(1).describe('Message to send.'),
         wait_seconds: waitSeconds,
@@ -1926,6 +2130,7 @@ function buildServer(principal) {
         'Get the status/result of a task started by spawn_worker or send_to_tab. If it is still running, waits up to wait_seconds (max 50). Call it again if status is still "running".',
       inputSchema: {
         caller_tab_id:callerTabInput,
+        browser_session_id:browserSessionInput,
         task_id: z.string().describe('The task_id returned earlier.'),
         wait_seconds: waitSeconds,
       },
@@ -1940,6 +2145,7 @@ function buildServer(principal) {
         'Read the conversation using the site conversation API where available, with DOM fallback. Supports ChatGPT, Claude and Gemini. Defaults to orchestrator/active tab. Reasoning is excluded by default; image and attachment names can be included.',
       inputSchema: {
         caller_tab_id:callerTabInput,
+        browser_session_id:browserSessionInput,
         tab_id: z
           .number()
           .int()
@@ -1961,6 +2167,7 @@ function buildServer(principal) {
         'Close your direct child after reviewing results and any fixing tasks. Requires terminal internal task history and processed FIFO receipts when coordination is enabled. No Saga task, note or event IDs required.',
       inputSchema: {
         caller_tab_id:callerTabInput,
+        browser_session_id:browserSessionInput,
         tab_id: z.number().int().describe('tab_id of the worker to close.'),
         // Saga IDs are external task metadata, never a closure prerequisite.
       },
@@ -1968,11 +2175,11 @@ function buildServer(principal) {
     async (args) => {
       try {
         const caller = await resolveCaller(args);
-        await verifyDirectChild(caller.callerTabId,args.tab_id);
-        if (tabRegistry.hasChildren(args.tab_id))
+        await verifyDirectChild(caller.callerTabId,args.tab_id,caller.browserSessionId);
+        if (tabRegistry.hasChildren(args.tab_id,caller.browserSessionId))
           throw new Error('Child has descendants; close or reconcile them before closing this tab');
         const result = await closeReviewedWorker(caller,args);
-        if (result?.closed === args.tab_id) await tabRegistry.remove(args.tab_id);
+        if (result?.closed === args.tab_id) await tabRegistry.remove(args.tab_id,caller.browserSessionId);
         return textResult(result);
       } catch (error) { return errorResult(error); }
     }
@@ -1983,12 +2190,13 @@ function buildServer(principal) {
     server.registerTool('coordination_inspect_worker_tasks', {
       title: 'Recover task identifiers from an owned worker',
       description: 'Read-only task IDs and statuses for a verified direct child. Never retries work.',
-      inputSchema: {caller_tab_id:callerTabInput,tab_id:z.number().int().positive()},
+      inputSchema: {caller_tab_id:callerTabInput,browser_session_id:browserSessionInput,
+        tab_id:z.number().int().positive()},
     }, async (args) => {
       try {
         const caller = await resolveCaller(args);
-        await verifyDirectChild(caller.callerTabId,args.tab_id);
-        const worker = tabRegistry.get(args.tab_id);
+        await verifyDirectChild(caller.callerTabId,args.tab_id,caller.browserSessionId);
+        const worker = tabRegistry.get(args.tab_id,caller.browserSessionId);
         return textResult(await callExtension('inspect_worker_tasks', {
           __trustedPrincipal:caller,tab_id:args.tab_id,
           worker_incarnation_id:worker.incarnationId,
@@ -1998,7 +2206,7 @@ function buildServer(principal) {
     server.registerTool('coordination_register_manager', {
       title: 'Register profile manager for private queue',
       description: 'Register the caller tab as a queue recipient without selecting a global manager. No replay on restart.',
-      inputSchema: {caller_tab_id:callerTabInput},
+      inputSchema: {caller_tab_id:callerTabInput,browser_session_id:browserSessionInput},
     }, async (args) => {
       try { return textResult(await registerPrivateManager(
         await resolveCaller(args,{createRoot:true}))); }
@@ -2009,6 +2217,7 @@ function buildServer(principal) {
       description: 'Durably enqueue STATUS_REQUEST after earlier child reports; does not send a chat prompt.',
       inputSchema: {
         caller_tab_id:callerTabInput,
+        browser_session_id:browserSessionInput,
         idempotency_key: z.string().uuid(),
         summary: z.string().max(4000),
       },
@@ -2019,7 +2228,7 @@ function buildServer(principal) {
     server.registerTool('coordination_start_delivery', {
       title: 'Arm private automatic batched manager wake',
       description: 'After explicit registration, automatically wake the paired manager once on stable idle. No recovered UNCERTAIN replay.',
-      inputSchema: {caller_tab_id:callerTabInput},
+      inputSchema: {caller_tab_id:callerTabInput,browser_session_id:browserSessionInput},
     }, async (args) => {
       try {
         const caller = await resolveCaller(args);
@@ -2032,7 +2241,7 @@ function buildServer(principal) {
     server.registerTool('coordination_pause_delivery', {
       title: 'Pause private manager wake',
       description: 'Stop new batch dispatch for this credential; already submitted batch remains unresolved.',
-      inputSchema: {caller_tab_id:callerTabInput},
+      inputSchema: {caller_tab_id:callerTabInput,browser_session_id:browserSessionInput},
     }, async (args) => {
       try {
         const caller = await resolveCaller(args);
@@ -2045,6 +2254,7 @@ function buildServer(principal) {
       description: 'Call only after handling every ordered event. This records consumer ACK, NOT independently verified Saga completion.',
       inputSchema: {
         caller_tab_id:callerTabInput,
+        browser_session_id:browserSessionInput,
         batch_id: z.string().uuid(),
         event_ids: z.array(z.string().uuid()).min(1).max(16),
       },
@@ -2058,7 +2268,8 @@ function buildServer(principal) {
     server.registerTool('coordination_get_report', {
       title: 'Read immutable profile-local child report',
       description: 'Read full report bytes from a validated journal event; no mutable worker tab dependence.',
-      inputSchema: { caller_tab_id:callerTabInput,event_id: z.string().uuid() },
+      inputSchema: {caller_tab_id:callerTabInput,browser_session_id:browserSessionInput,
+        event_id:z.string().uuid()},
     }, async (args) => {
       try { return textResult(getPrivateFullReport(await resolveCaller(args), args.event_id)); }
       catch (error) { return errorResult(error); }
@@ -2066,7 +2277,7 @@ function buildServer(principal) {
     server.registerTool('coordination_pending', {
       title: 'Read own private queue state',
       description: 'Read-only queue phases for the current profile; does not release UNCERTAIN items or perform Saga updates.',
-      inputSchema: {caller_tab_id:callerTabInput},
+      inputSchema: {caller_tab_id:callerTabInput,browser_session_id:browserSessionInput},
     }, async (args) => {
       try {
         const active = registeredPrivateManager(await resolveCaller(args));
@@ -2077,7 +2288,7 @@ function buildServer(principal) {
     server.registerTool('coordination_incarnation_conflicts', {
       title: 'Inspect unresolved historical recipient incarnations',
       description: 'Read-only inspection of unresolved prior manager generations. Never replays or acknowledges events.',
-      inputSchema: {caller_tab_id:callerTabInput},
+      inputSchema: {caller_tab_id:callerTabInput,browser_session_id:browserSessionInput},
     }, async (args) => {
       try {
         const active = await resolveCaller(args,{createRoot:true});
@@ -2087,7 +2298,8 @@ function buildServer(principal) {
     server.registerTool('coordination_get_predecessor_event', {
       title:'Inspect a historical recipient event',
       description:'Read-only verified data for an unresolved prior incarnation. Does not deliver, process or ACK it.',
-      inputSchema:{caller_tab_id:callerTabInput,event_id:z.string().uuid()},
+      inputSchema:{caller_tab_id:callerTabInput,browser_session_id:browserSessionInput,
+        event_id:z.string().uuid()},
     },async(args)=>{
       try {
         const active=await resolveCaller(args,{createRoot:true});
@@ -2099,6 +2311,7 @@ function buildServer(principal) {
       description:'Durably records an auditable boundary after operator review. Preserves every historical event as unprocessed; never replays or ACKs them. Requires a fresh snapshot digest, explicit confirmation and stable idempotency key.',
       inputSchema:{
         caller_tab_id:callerTabInput,
+        browser_session_id:browserSessionInput,
         snapshot_sha256:z.string().regex(/^[a-f0-9]{64}$/),
         confirmation:z.literal('QUARANTINE_UNPROCESSED_EVENTS'),
         reason:z.string().trim().min(10).max(512),
@@ -2135,6 +2348,7 @@ function privateDashboardSnapshot() {
   const seats = [...activePrivateManagers.values()].map((profile) => ({
     seatName: 'Profile manager', role: 'manager',
     workspaceId: profile.workspaceId, callerTabId: profile.callerTabId,
+    browserSessionId:profile.browserSessionId,
     registered: true, deliveryArmed: armedPrivateDelivery.has(profile.credentialId),
     readiness: privateReadinessState({
       revoked: false, registered: true,
@@ -2164,8 +2378,8 @@ function privateDashboardSnapshot() {
   const visiblePending = queue.filter((item) =>
     !['PROCESSED', 'SAGA_CONFIRMED'].includes(item.phase)).length;
   const hiddenPending = Math.max(0, (aggregate?.pending || 0) - visiblePending);
-  const savedHierarchy=tabRegistry?.list().map(({tabId,parentTabId,rootTabId,site,phase})=>({
-    tabId,parentTabId,rootTabId,site,phase,
+  const savedHierarchy=tabRegistry?.list().map(({tabId,parentTabId,rootTabId,site,phase,browserSessionId})=>({
+    tabId,parentTabId,rootTabId,site,phase,browserSessionId,
   })) || [];
   return {
     storageReady: privateCoordinationEnabled && Boolean(privateJournal),
@@ -2178,8 +2392,8 @@ function privateDashboardSnapshot() {
     generatedAt: new Date().toISOString(),
   };
 }
-async function publishPrivateDashboard() {
-  if (!process.parentPort || dashboardRefreshInFlight) return;
+async function refreshDashboard() {
+  if (dashboardRefreshInFlight) return;
   dashboardRefreshInFlight=true;
   try {
     if (!bridgeConnected()) {
@@ -2198,10 +2412,18 @@ async function publishPrivateDashboard() {
     // A failed browser observation is UNKNOWN, not proof that tabs closed.
     currentBrowserTabs={status:'unavailable',tabs:[],observedAt:null};
   } finally {dashboardRefreshInFlight=false;}
-  if (!process.parentPort || !httpServer.listening) return;
+}
+export async function inspectDashboard() {
+  await refreshDashboard();
+  return privateDashboardSnapshot();
+}
+async function publishPrivateDashboard() {
+  if (!process.parentPort || dashboardRefreshInFlight) return;
+  const snapshot = await inspectDashboard();
+  if (!httpServer.listening) return;
   try {
     process.parentPort.postMessage({
-      type:'coordination_snapshot',snapshot:privateDashboardSnapshot(),
+      type:'coordination_snapshot',snapshot,
     });
   } catch { /* No export of internal errors or credentials. */ }
 }
@@ -2294,6 +2516,8 @@ export async function startServer() {
       // owner even though no proxy is running.
       clearInterval(privateDispatchTimer);
       privateDispatchTimer = null;
+      clearInterval(sessionHeartbeatTimer);
+      sessionHeartbeatTimer = null;
       if (privateJournal) {
         const journal = privateJournal;
         try {
@@ -2310,11 +2534,15 @@ export async function startServer() {
     };
     const onListening = () => {
       httpServer.off('error', onError);
+      resetExtensionSessionState();
       const address = httpServer.address();
       console.log(`Chat Orchestrator MCP server listening on http://${HOST}:${address.port}`);
       console.log('  Extension bridge: ws://localhost:' + address.port + '/bridge');
       console.log('  MCP endpoint: /mcp');
       process.parentPort?.postMessage({ type: 'ready', port: address.port });
+      clearInterval(sessionHeartbeatTimer);
+      sessionHeartbeatTimer=setInterval(sendSessionHeartbeat,15000);
+      sessionHeartbeatTimer.unref?.();
       dashboardTimer = setInterval(publishPrivateDashboard, 3000);
       dashboardTimer.unref?.();
       publishPrivateDashboard();
@@ -2336,6 +2564,8 @@ async function stopServerOnce() {
   failAllPending('The local MCP server is stopping');
   clearInterval(privateDispatchTimer);
   privateDispatchTimer = null;
+  clearInterval(sessionHeartbeatTimer);
+  sessionHeartbeatTimer = null;
   clearInterval(dashboardTimer);
   dashboardTimer = null;
   currentBrowserTabs = {status:'unavailable',tabs:[],observedAt:null};
@@ -2344,7 +2574,14 @@ async function stopServerOnce() {
   privateManagerObservations.clear();
   profileManagerIdentities.clear();
   rootRepairOffers.clear();
-  for (const client of wss.clients) client.terminate();
+  for (const client of wss.clients) {
+    if (client.browserSessionId) client.close(4001,'proxy session ended');
+    else client.close(4002,'proxy stopping');
+    setTimeout(() => client.terminate(),1000).unref?.();
+  }
+  extensionSockets.clear();
+  bridge=null;
+  profileSocketGeneration++;
   let listenerError;
   let journalCloseError;
   try {
@@ -2390,21 +2627,34 @@ async function stopServerOnce() {
   if (listenerError) throw listenerError;
 }
 
+export const desktopMethods = Object.freeze({
+  set_orchestrator: 'desktop_set_orchestrator_tab',
+  diagnose: 'desktop_diagnose_tab',
+  close_legacy_workers: 'desktop_close_legacy_workers',
+});
+export function desktopAction({action, tab_id, browser_session_id, confirmation_nonce}) {
+  if (action === 'inspect_root_repair') return inspectRootRepair(tab_id,true,browser_session_id);
+  if (action === 'confirm_root_repair') return reconcileRootFromDesktop(tab_id,confirmation_nonce,browser_session_id);
+  if (!Object.hasOwn(desktopMethods,action)) throw new Error('Unknown desktop action');
+  return callExtension(desktopMethods[action], {tab_id, __sessionBrowserId:browser_session_id}, 12000);
+}
+export function refreshExtensionSettings() {
+  reloadAgentSettings();
+  for (const ws of extensionSockets.values()) sendExtensionSettings(ws);
+  return agentSettingsRevision;
+}
+// The standalone manual tester mounts its routes only in its own process.
+export { app, httpServer, wss };
+
 if (process.parentPort) {
   process.parentPort.on('message', async (event) => {
     if (event?.data?.type === 'desktop_extension_action') {
       const id = event.data.request_id;
       if (!PRIVATE_EVENT_ID.test(id || '')) return;
       const action = event.data.action;
-      const method = {set_orchestrator: 'desktop_set_orchestrator_tab',
-        diagnose: 'desktop_diagnose_tab', close_legacy_workers: 'desktop_close_legacy_workers'}[action];
-      if (!method && !['inspect_root_repair','confirm_root_repair'].includes(action)) return;
+      if (!Object.hasOwn(desktopMethods,action) && !['inspect_root_repair','confirm_root_repair'].includes(action)) return;
       try {
-        const result = action === 'inspect_root_repair'
-          ? await inspectRootRepair(event.data.tab_id,true)
-          : action === 'confirm_root_repair'
-            ? await reconcileRootFromDesktop(event.data.tab_id,event.data.confirmation_nonce)
-            : await callExtension(method, {tab_id: event.data.tab_id}, 12000);
+        const result = await desktopAction(event.data);
         process.parentPort.postMessage({type:'desktop_extension_action_result',request_id:id,ok:true,result});
       } catch (error) {
         process.parentPort.postMessage({type:'desktop_extension_action_result',request_id:id,ok:false,
@@ -2413,8 +2663,7 @@ if (process.parentPort) {
       return;
     }
     if (event?.data?.type === 'reload_agent_settings') {
-      reloadAgentSettings();
-      sendAgentSettings(bridge);
+      refreshExtensionSettings();
       process.parentPort.postMessage({ type: 'agent_settings_reloaded', revision: agentSettingsRevision });
       return;
     }

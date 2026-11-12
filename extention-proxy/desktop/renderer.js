@@ -113,7 +113,7 @@ function renderCoordinationSnapshot(snapshot) {
     }
   }
   rows(seats, snapshot.seats, (seat) =>
-    `${seat.seatName} · ${seat.readiness || 'unknown'} · ${seat.deliveryArmed ? 'armed' : seat.registered ? 'registered' : 'available'} · tab ${seat.callerTabId}`,
+    `${seat.seatName} · ${seat.readiness || 'unknown'} · ${seat.deliveryArmed ? 'armed' : seat.registered ? 'registered' : 'available'} · tab ${seat.callerTabId} · session ${seat.browserSessionId || 'unknown'}`,
     snapshot.registryError ? 'Queue state error' : 'No active seats');
   const recorded = Array.isArray(snapshot.tabHierarchy) ? snapshot.tabHierarchy : [];
   const presence = snapshot.browserTabs;
@@ -142,7 +142,7 @@ function renderCoordinationSnapshot(snapshot) {
       : entry.presence === 'not_open' ? 'not currently open'
       : entry.presence === 'site_mismatch' ? 'site changed / possible tab reuse'
       : 'presence unknown';
-    return `${relation} · ${status}`;
+    return `${relation} · session ${entry.browserSessionId || 'unknown'} · ${status}`;
   }, observed
     ? openTabs.length
       ? `${openTabs.length} chat tab(s) open, but none matches a saved registration`
@@ -290,11 +290,13 @@ $('agent-inspect-root').addEventListener('click',()=>perform(async()=>{
   rootRepairOffer=null;
   $('agent-confirm-root').disabled=true;
   const tabId=selectedAdminTab();
-  const result=await window.bridge.extensionAction('inspect_root_repair',tabId);
+  const browserSessionId=$('agent-admin-session').value.trim() || undefined;
+  const result=await window.bridge.extensionAction('inspect_root_repair',tabId,undefined,browserSessionId);
   $('agent-admin-output').hidden=false;
   $('agent-admin-output').textContent=JSON.stringify(result,null,2);
   if(result.can_reconcile && result.confirmation_nonce){
-    rootRepairOffer={tabId,nonce:result.confirmation_nonce};
+    rootRepairOffer={tabId,nonce:result.confirmation_nonce,
+      browserSessionId:result.browser_session_id};
     $('agent-confirm-root').disabled=false;
   }
 },'Root inspection complete. Unsafe recoveries remain blocked.'));
@@ -302,9 +304,12 @@ $('agent-confirm-root').addEventListener('click',()=>perform(async()=>{
   const offer=rootRepairOffer;
   rootRepairOffer=null;
   $('agent-confirm-root').disabled=true;
-  if(!offer || offer.tabId!==selectedAdminTab())throw Error('Inspect the same root again first');
+  if(!offer || offer.tabId!==selectedAdminTab() ||
+      ($('agent-admin-session').value.trim() && $('agent-admin-session').value.trim()!==offer.browserSessionId))
+    throw Error('Inspect the same root and browser session again first');
   if(!window.confirm('Re-attest this root? No FIFO events will be replayed or acknowledged.'))return;
-  const result=await window.bridge.extensionAction('confirm_root_repair',offer.tabId,offer.nonce);
+  const result=await window.bridge.extensionAction('confirm_root_repair',offer.tabId,offer.nonce,
+    offer.browserSessionId);
   $('agent-admin-output').hidden=false;
   $('agent-admin-output').textContent=JSON.stringify(result,null,2);
 },'Root recovered. Register it again using Worker Tool.'));

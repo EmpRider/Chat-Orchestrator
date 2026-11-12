@@ -46,11 +46,14 @@ try {
     const timer=setTimeout(()=>reject(new Error('Settings snapshot timed out')),8000);
     ws.on('message',(raw)=>{
       const msg=JSON.parse(String(raw));
+      if(msg.type==='session_registered') ws.send(JSON.stringify({type:'session_ready'}));
       if(msg.type==='settings_snapshot') {clearTimeout(timer);resolve(msg);}
     });
     ws.once('error',reject);
   });
   await once(ws,'open');
+  ws.send(JSON.stringify({type:'register_session',browser_session_id:'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
+    connection_generation:1}));
   const msg = await snapshot;
   assert.equal(msg.schema,1);
   assert.ok(msg.revision>0);

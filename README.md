@@ -1,5 +1,27 @@
 # Chat Orchestrator (MCP + browser extension)
 
+## Manual extension tester
+
+On Windows, stop the proxy listening on port 8787 and double-click
+[Launch tester.cmd](extention-proxy/manual/Launch%20tester.cmd). The launcher
+opens the web UI at `http://127.0.0.1:8787`. It requires Node.js and installs
+the proxy package's dependencies if needed. Choose **Q** for the complete
+catalog (default) or **S** to test with private coordination disabled.
+On other platforms, run `node manual/server.mjs` from `extention-proxy`
+after installing its dependencies, then open the same URL.
+
+In your test browser profile, set the extension popup's WebSocket URL to
+`ws://127.0.0.1:8787/bridge` and choose **Save and reconnect**. Open a
+supported chat tab, then use **Get tab list**. The expandable workflow guide
+in the tester walks through spawning, follow-ups, review, queue receipts,
+recovery, and reconnects. Each operation uses the actual proxy handlers.
+
+Every launch uses a new temporary proxy profile. Switching proxy sessions
+resets the extension's session state, so use a test browser profile. Real commands can send
+messages and close tabs in the connected browser. The activity panel keeps
+the latest 500 entries, including full message contents. Close the tester
+with Ctrl+C in its window to stop it and remove its temporary journal.
+
 ## Local 0.1.3 redesigned UI + modular-instructions candidate (November 6, 2026)
 
 This is a local development candidate, not yet a published GitHub Release. It includes
@@ -36,7 +58,8 @@ The Windows desktop app includes a compact dark interface and a system tray
 icon. **Minimize to system tray when closing** is checked by default: closing
 the window keeps the proxy and ngrok alive. Uncheck it to exit when closing,
 or use **Exit** from the tray context menu at any time. The choice persists
-across restarts. Desktop icon artwork is by [Icons8](https://icons8.com/).
+across restarts. Worker runtime state resets; worker chat tabs stay open.
+Desktop icon artwork is by [Icons8](https://icons8.com/).
 
 ```
 Orchestrator chat --MCP/HTTPS (tunnel)--> extention-proxy (server.js)

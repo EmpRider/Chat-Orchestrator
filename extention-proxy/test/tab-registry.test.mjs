@@ -30,6 +30,27 @@ test('proxy session registry starts empty and closes without persistent tab stat
   await second.closeSession();
 });
 
+test('session registry isolates reused numeric tab IDs across browser profiles',async()=>{
+  const registry=createSessionTabRegistry();
+  const a=randomUUID(),b=randomUUID();
+  const rootA=observed(101,a),rootB=observed(101,b);
+  const childA=observed(202,a,{managed:true}),childB=observed(202,b,{managed:true});
+  await registry.registerRoot(rootA);
+  await registry.registerRoot(rootB);
+  await registry.registerChild(101,childA);
+  await registry.registerChild(101,childB);
+  await registry.setPhase(202,'started',a);
+  assert.equal(registry.get(101,a).incarnationId,rootA.incarnation_id);
+  assert.equal(registry.get(101,b).incarnationId,rootB.incarnation_id);
+  assert.equal(registry.get(202,a).phase,'started');
+  assert.equal(registry.get(202,b).phase,'prepared');
+  assert.equal(registry.directChild(101,202,a),true);
+  assert.equal(registry.directChild(101,202,b),true);
+  assert.equal(registry.list(a).length,2);
+  assert.equal(registry.list(b).length,2);
+  await registry.closeSession();
+});
+
 test('session registry ignores legacy files and preserves FIFO files untouched',async(t)=>{
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'session-registry-'));
   t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));

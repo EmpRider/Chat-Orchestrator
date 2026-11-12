@@ -20,7 +20,8 @@ function harness() {
   const windows = new Map([[1,{id:1,type:'normal'}],[2,{id:2,type:'normal'}]]);
   const groups = new Map();
   const storage={browserSessionId:SESSION,managerIncarnations:{101:ROOT_A,201:ROOT_B}};
-  const events={windowCreates:0,tabCreates:0,tabFocuses:0,groupCreates:0,startupSequence:[]};
+  const events={windowCreates:0,tabCreates:0,tabFocuses:0,groupCreates:0,startupSequence:[],
+    transientFocusFailures:0};
   let nextTabId=300,nextWindowId=10,nextGroupId=1;
   const runtime={getURL:(file)=>'chrome-extension://unit-extension/'+file,
     onInstalled:{addListener(){}},onStartup:{addListener(){}},
@@ -45,6 +46,10 @@ function harness() {
         return tab;
       },
       update:async(id,{url,active})=>{const tab=tabs.get(id);if(!tab)throw Error('missing worker tab');
+        if(active===true && events.transientFocusFailures>0) {
+          events.transientFocusFailures--;
+          throw Error('Tabs cannot be edited right now (user may be dragging a tab).');
+        }
         if(url){events.startupSequence.push('navigate:'+id);tab.url=url;tab.status='complete';}
         if(active===true){for(const item of tabs.values())if(item.windowId===tab.windowId)item.active=false;
           tab.active=true;events.startupSequence.push('focus:'+id);events.tabFocuses++;}
@@ -171,6 +176,19 @@ test('initial prompts are focused and submitted one at a time; completed handoff
   assert.notEqual(resultA.task_id,resultB.task_id);
   assert.deepEqual(h.events.startupSequence.filter(s=>s.startsWith('focus:')),
     ['focus:'+firstTab.id,'focus:'+secondTab.id]);
+});
+
+test('transient Edge tab-edit lock retries focus without creating another worker',async()=>{
+  const h=harness();
+  await h.ready;
+  const tab=await h.create('https://chatgpt.com/',h.first,101);
+  h.register(tab);
+  h.events.transientFocusFailures=2;
+  await runInContext('focusWorkerForStartup',h.ctx)(tab.id);
+  assert.equal(h.events.transientFocusFailures,0);
+  assert.equal(h.tabs.get(tab.id).active,true);
+  assert.equal(h.events.tabCreates,1);
+  assert.equal(h.events.tabFocuses,1);
 });
 
 test('stale anchor is not adopted; root groups cannot hijack a recycled group ID',async()=>{

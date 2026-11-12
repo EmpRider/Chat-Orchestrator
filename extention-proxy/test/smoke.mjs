@@ -11,7 +11,6 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
-const PORT = 8799;
 const profile = fs.mkdtempSync(path.join(os.tmpdir(),'chat-orch-mcp-smoke-'));
 const browserSession = randomUUID();
 const managerIncarnation = randomUUID();
@@ -19,23 +18,50 @@ const workerIncarnation = randomUUID();
 
 const child = spawn(process.execPath, ['server.js'], {
   cwd: root,
-  env: { ...process.env, PORT: String(PORT), CHAT_ORCH_PROFILE_DIR: profile,
+  env: { ...process.env, PORT: '0', HOST: '127.0.0.1', CHAT_ORCH_PROFILE_DIR: profile,
     CHAT_ORCH_PRIVATE_COORDINATION:'0' },
-  stdio: ['ignore', 'pipe', 'inherit'],
+  stdio: ['ignore', 'pipe', 'pipe'],
 });
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let failed = false;
 
 try {
-  await sleep(1200);
+  // Use the OS-assigned port: Windows can reserve ranges that contain fixed test ports.
+  const PORT = await new Promise((resolve, reject) => {
+    let output = '';
+    const timer = setTimeout(() => finish(new Error('Proxy startup timed out: ' + output)), 10000);
+    const onStdout = (chunk) => {
+      output += chunk.toString();
+      const match = /listening on http:\/\/[^:]+:(\d+)/.exec(output);
+      if (match) finish(null, Number(match[1]));
+    };
+    const onStderr = (chunk) => { output += chunk.toString(); };
+    const onError = (err) => finish(err);
+    const onExit = (code) => finish(new Error('Proxy exited ' + code + ': ' + output));
+    function finish(err, port) {
+      clearTimeout(timer);
+      child.stdout.off('data', onStdout);
+      child.stderr.off('data', onStderr);
+      child.off('error', onError);
+      child.off('exit', onExit);
+      if (err) reject(err);
+      else resolve(port);
+    }
+    child.stdout.on('data', onStdout);
+    child.stderr.on('data', onStderr);
+    child.once('error', onError);
+    child.once('exit', onExit);
+  });
 
   // fake extension
-  const ws = new WebSocket(`ws://localhost:${PORT}/bridge`);
+  const ws = new WebSocket(`ws://127.0.0.1:${PORT}/bridge`);
   await new Promise((res, rej) => {
     ws.on('open', res);
     ws.on('error', rej);
   });
+  ws.send(JSON.stringify({type:'register_session',browser_session_id:browserSession,
+    connection_generation:1,proxy_session_id:'smoke-session'}));
   ws.on('message', (raw) => {
     const m = JSON.parse(raw.toString());
     if (m.type !== 'call') return;
@@ -62,7 +88,7 @@ try {
 
   const client = new Client({ name: 'smoke', version: '0.0.0' });
   await client.connect(
-    new StreamableHTTPClientTransport(new URL(`http://localhost:${PORT}/mcp`))
+    new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${PORT}/mcp`))
   );
 
   const tools = (await client.listTools()).tools.map((t) => t.name).sort();

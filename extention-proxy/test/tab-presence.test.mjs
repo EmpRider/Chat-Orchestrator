@@ -38,6 +38,22 @@ test('site change flags possible tab reuse; matching IDs are not attestation',()
   ]})[2].presence,'open_unverified');
 });
 
+test('overlapping tab IDs retain browser-session-specific presence',()=>{
+  const a='aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const b='bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+  const entries=[{tabId:101,browserSessionId:a,site:'chatgpt'},
+    {tabId:101,browserSessionId:b,site:'chatgpt'}];
+  const tabs=normalizeOpenChatTabs([
+    {tab_id:101,browser_session_id:a,site:'chatgpt'},
+    {tab_id:101,browser_session_id:b,site:'chatgpt'},
+  ]);
+  assert.equal(tabs.length,2);
+  assert.deepEqual(annotateTabPresence(entries,{status:'observed',tabs}).map((entry)=>entry.presence),
+    ['open_unverified','open_unverified']);
+  assert.deepEqual(annotateTabPresence(entries,{status:'observed',tabs:[tabs[0]]})
+    .map((entry)=>entry.presence),['open_unverified','not_open']);
+});
+
 test('unavailable browser observation never marks roots closed',()=>{
   for(const observation of [undefined,{status:'unavailable',tabs:[]}]){
     assert.ok(annotateTabPresence(saved,observation).every(

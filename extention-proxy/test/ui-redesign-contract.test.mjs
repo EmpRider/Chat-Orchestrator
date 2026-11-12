@@ -65,12 +65,15 @@ test('root recovery is exclusively a confirmed trusted Desktop workflow', () => 
   }
   assert.match(html,/id="agent-confirm-root"[^>]*disabled/);
   assert.match(renderer,/window\.confirm\(/);
-  assert.match(preload,/extensionAction: \(action, tabId, nonce\)/);
+  assert.match(preload,/extensionAction: \(action, tabId, nonce, browserSessionId\)/);
+  assert.match(renderer,/offer\.browserSessionId/);
   assert.match(main,/requireTrustedWindow\(event\)/);
-  assert.match(main,/confirmation_nonce:nonce/);
-  assert.match(server,/rootRepairOffers\.delete\(tabId\)/);
-  assert.match(server,/privateJournal\?\.unresolvedForTab\(tabId\)/);
-  assert.match(server,/tabRegistry\.hasChildren\(tabId\)/);
+  assert.match(main,/confirmation_nonce:nonce,browser_session_id:browserSessionId/);
+  assert.match(server,/await desktopAction\(event\.data\)/);
+  assert.match(server,/action === 'confirm_root_repair'\) return reconcileRootFromDesktop\(tab_id,confirmation_nonce,browser_session_id\)/);
+  assert.match(server,/rootRepairOffers\.delete\(repairKey\)/);
+  assert.match(server,/privateJournal\?\.unresolvedForTab\(tabId,browserSessionId\)/);
+  assert.match(server,/tabRegistry\.hasChildren\(tabId,browserSessionId\)/);
   assert.match(server,/tabRegistry\.reconcileRoot\(/);
   assert.doesNotMatch(server,/registerTool\('(?:inspect_root_repair|confirm_root_repair)'/);
 });
