@@ -17,7 +17,7 @@ const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 test('local extension WebSocket needs no token; settings flow from proxy only', { timeout: 20000 }, async (t) => {
   const dir = mkdtempSync(path.join(tmpdir(), 'chat-orch-settings-'));
   const file = path.join(dir, 'settings.json');
-  writeFileSync(file, JSON.stringify({ agentSettings: { enabled: true, promptSchema: 2,
+  writeFileSync(file, JSON.stringify({ agentSettings: { enabled: true, connectorName:'PC1', promptSchema: 2,
     promptModules: { queue: 'Private queue processing instructions' } } }));
   const server = spawn(process.execPath, ['server.js'], {
     cwd: root,
@@ -39,7 +39,20 @@ test('local extension WebSocket needs no token; settings flow from proxy only', 
   });
   ws = new WebSocket('ws://127.0.0.1:' + port + '/bridge');
   const messages = [];
-  ws.on('message', (buf) => { try { messages.push(JSON.parse(buf.toString())); } catch {} });
+  ws.on('message', (buf) => {
+    try {
+      const message=JSON.parse(buf.toString());
+      messages.push(message);
+      if(message.type==='call'&&message.method==='inspect_tab') {
+        ws.send(JSON.stringify({type:'result',id:message.id,ok:true,result:{
+          tab_id:101,incarnation_id:'22222222-2222-4222-8222-222222222222',
+          route_hash:'a'.repeat(64),
+          browser_session_id:'11111111-1111-4111-8111-111111111111',
+          parent_approved:true,is_managed_worker:false,
+        }}));
+      }
+    } catch {}
+  });
   await once(ws, 'open');
   ws.send(JSON.stringify({type:'register_session',browser_session_id:'11111111-1111-4111-8111-111111111111',
     connection_generation:1,proxy_session_id:'test-proxy-session'}));
@@ -47,7 +60,41 @@ test('local extension WebSocket needs no token; settings flow from proxy only', 
   await delay(160);
   const snapshot = messages.find((m) => m.type === 'settings_snapshot');
   assert.ok(snapshot, 'extension receives proxy-owned settings without a token');
+  assert.equal(snapshot.settings.connectorName,'PC1',
+    'profile-selected name must flow through the authenticated settings snapshot');
   assert.equal(snapshot.settings.promptModules.queue, 'Private queue processing instructions');
+  const awaitAck=async(id)=>{
+    const deadline=Date.now()+2500;
+    while(Date.now()<deadline){
+      const found=messages.find((m)=>m.type==='pairing_offer_ack'&&m.request_id===id);
+      if(found)return found;
+      await delay(10);
+    }
+    throw new Error('Pairing offer ACK timed out');
+  };
+  const offer=(request_id)=>JSON.stringify({type:'pairing_offer',request_id,
+    code:randomUUID(),tab_id:101,incarnation_id:'22222222-2222-4222-8222-222222222222',
+    route_hash:'a'.repeat(64)});
+  const oldRequest=randomUUID();
+  ws.send(offer(oldRequest));
+  const oldAck=await awaitAck(oldRequest);
+  assert.equal(oldAck.ok,false,'legacy extension cannot pair without verifying the named connector');
+  assert.match(oldAck.error,/Reload the bundled extension/);
+  assert.equal(messages.some(m=>m.type==='call'&&m.method==='inspect_tab'),false,
+    'unverified connector must be rejected before inspecting or recording the pairing');
+  // An old extension reports only a revision, not the actual connector name.
+  ws.send(JSON.stringify({type:'settings_applied',revision:snapshot.revision}));
+  await delay(50);
+  const legacyRequest=randomUUID();
+  ws.send(offer(legacyRequest));
+  assert.equal((await awaitAck(legacyRequest)).ok,false);
+  // Only the new Extension's exact-name capability ACK enables pairing.
+  ws.send(JSON.stringify({type:'settings_applied',revision:snapshot.revision,
+    connector_name:'PC1',routing_capability:'connector_name_routing_v1'}));
+  await delay(50);
+  const currentRequest=randomUUID();
+  ws.send(offer(currentRequest));
+  assert.equal((await awaitAck(currentRequest)).ok,true);
   ws.send(JSON.stringify({ type: 'settings_snapshot', schema: 1, revision: 333,
     settings: { enabled: false, promptSchema: 2, promptModules: { queue: 'Attempted overwrite' } } }));
   await delay(100);

@@ -32,7 +32,9 @@ test('tokenless profile keeps durable FIFO worker reports, barriers and processe
   });
   let bridge;
   let client;
+  let pmClient;
   t.after(async () => {
+    await pmClient?.close().catch(() => {});
     await client?.close().catch(() => {});
     bridge?.terminate();
     child.kill();
@@ -78,6 +80,12 @@ test('tokenless profile keeps durable FIFO worker reports, barriers and processe
   let managerAttestationMismatch = false;
   let workerOpen = true;
   let rejectBeforeSubmission = false;
+  let reportUnverifiedSubmission = false;
+  let reconciledVisible=false;
+  let advancePreparedTab=false;
+  let nextPreparedWorkerId=204;
+  let loseStartupAck=false;
+  let spawnPreparations=0;
   let workerTabId = 201;
   let workerIncarnation = initialWorkerIncarnation;
   let ackCount = 0;
@@ -117,8 +125,9 @@ test('tokenless profile keeps durable FIFO worker reports, barriers and processe
           browser_session_id: browserSession, incarnation_id: managerIncarnation };
         break;
       case 'attest_profile_manager':
-        result = {tab_id:101,browser_session_id:browserSession,
-          incarnation_id:managerIncarnation,connection_generation:1};
+        result = {tab_id:m.params.tab_id,browser_session_id:browserSession,
+          incarnation_id:m.params.tab_id===101?managerIncarnation:workerIncarnation,
+          connection_generation:1};
         break;
       case 'get_result':
         assert.equal(m.params.__sessionBrowserId,browserSession,'worker receipt uses originating session');
@@ -131,17 +140,52 @@ test('tokenless profile keeps durable FIFO worker reports, barriers and processe
           ...(workerOpen ? [{tab_id:workerTabId,role:'worker',incarnation_id:workerIncarnation,site:'chatgpt'}] : [])];
         break;
       case 'spawn_worker':
+        spawnPreparations++;
+        if(advancePreparedTab){
+          workerTabId=nextPreparedWorkerId;
+          workerIncarnation=randomUUID();
+          advancePreparedTab=false;
+        }
         result = {tab_id:workerTabId,incarnation_id:workerIncarnation,
           prepared:true,reused_tab:false};
         break;
       case 'start_prepared_worker':
+        if(loseStartupAck) {
+          loseStartupAck=false;
+          bridge.send(JSON.stringify({type:'result',id:m.id,ok:false,
+            error:'Lost startup transport receipt after Child submitted the prompt'}));
+          return;
+        }
         if (rejectBeforeSubmission) {
           bridge.send(JSON.stringify({type:'result',id:m.id,ok:false,
             error:'Worker composer contains a different unsent draft',
             error_code:'COMPOSER_DRAFT_MISMATCH'}));
           return;
         }
-        result = {task_id:taskId,tab_id:workerTabId,status:'running'};
+        result = {task_id:taskId,tab_id:workerTabId,status:'running',
+          submission_confirmed:!reportUnverifiedSubmission};
+        break;
+      case 'verify_worker_submission':
+        if(m.params.tab_id===203)
+          assert.equal(m.params.__trustedPrincipal.callerTabId,101,
+            'a nested PM must reconcile its original Parent-owned send with the original Parent scope');
+        result={task_id:m.params.task_id,tab_id:m.params.tab_id,status:'uncertain',
+          verified:reconciledVisible,submission_confirmed:reconciledVisible};
+        break;
+      case 'confirm_child_pairing_submission':
+        assert.equal(m.params.tab_id,203);
+        assert.equal(m.params.worker_incarnation_id,workerIncarnation);
+        assert.equal(m.params.__sessionBrowserId,browserSession);
+        assert.equal(m.params.__verifiedChildPairing,true);
+        reconciledVisible=true;
+        result={task_id:taskId,tab_id:203,status:'running',
+          verified:true,submission_confirmed:true};
+        break;
+      case 'complete_task':
+        assert.equal(principal?.callerTabId,203,
+          'the original PM tab must complete its own task with its own authenticated credential');
+        reconciledVisible=true;
+        result={task_id:taskId,tab_id:203,status:'done',submission_confirmed:true};
         break;
       case 'inspect_worker_tasks':
         result = {tab_id:m.params.tab_id,worker_incarnation_id:workerIncarnation,
@@ -307,4 +351,85 @@ test('tokenless profile keeps durable FIFO worker reports, barriers and processe
   const closed=await call('close_worker',{caller_tab_id,tab_id:workerTabId});
   assert.equal(closed.closed,workerTabId);
   assert.equal(closed.parent_reviewed,true);
+  // An extension reply that merely says RUNNING is not submission proof.
+  // The first ambiguous startup leaves the FIFO held and a later concurrent
+  // spawn must be rejected before it even creates another browser tab.
+  workerTabId=203;
+  workerIncarnation=randomUUID();
+  reportUnverifiedSubmission=true;
+  await assert.rejects(call('spawn_worker',{caller_tab_id,site:'chatgpt',
+    task:'Ambiguous send, must not advance FIFO',wait_seconds:0}),
+  /outcome UNCERTAIN/);
+  const preparationsAtHold=spawnPreparations;
+  reportUnverifiedSubmission=false;
+  await assert.rejects(call('spawn_worker',{caller_tab_id,site:'chatgpt',
+    task:'Must remain queued behind unverified send',wait_seconds:0}),
+  /Spawn FIFO is HELD/);
+  assert.equal(spawnPreparations,preparationsAtHold,
+    'blocked FIFO never creates another worker tab after uncertain submission');
+  // Real PM is itself a paired Child. A nested TL spawn comes from PM's
+  // credential, which MUST NOT be used to inspect its own original prompt:
+  // that task is owned by the Parent that spawned PM.
+  const pmPairCode=randomUUID();
+  const pmPairRequest=randomUUID();
+  const pmAck=new Promise((resolve,reject)=>{
+    const timeout=setTimeout(()=>reject(new Error('PM pairing ACK missing')),4000);
+    const onMessage=(raw)=>{
+      const packet=JSON.parse(raw.toString());
+      if(packet.type!=='pairing_offer_ack'||packet.request_id!==pmPairRequest)return;
+      clearTimeout(timeout);bridge.off('message',onMessage);
+      if(packet.ok)resolve();else reject(new Error(packet.error));
+    };
+    bridge.on('message',onMessage);
+  });
+  bridge.send(JSON.stringify({type:'pairing_offer',request_id:pmPairRequest,
+    code:pmPairCode,tab_id:203,incarnation_id:workerIncarnation,
+    route_hash:createHash('sha256')
+      .update([browserSession,203,workerIncarnation,'chatgpt'].join(':')).digest('hex')}));
+  await pmAck;
+  pmClient=new Client({name:'nested-pm-fifo-test',version:'1.0.0'});
+  await pmClient.connect(new StreamableHTTPClientTransport(
+    new URL('http://127.0.0.1:'+port+'/mcp')));
+  const pmPair=await pmClient.callTool({name:'pair_conversation',arguments:{
+    code:pmPairCode,idempotency_key:randomUUID()}});
+  assert.equal(pmPair.isError,undefined);
+  const pmCredential=JSON.parse(pmPair.content[0].text).agent_credential;
+  const callPm=async(name,args={})=>{
+    const reply=await pmClient.callTool({name,arguments:{
+      browser_session_id:browserSession,caller_tab_id:203,
+      agent_credential:pmCredential,idempotency_key:randomUUID(),...args}});
+    if(reply.isError)throw new Error(reply.content[0].text);
+    return JSON.parse(reply.content[0].text);
+  };
+  // Pairing is sufficient independent proof BEFORE PM completes. Without
+  // this, a real PM could never spawn TL/reviewers while its own task remains
+  // active under an incorrectly HELD session-wide FIFO.
+  assert.equal(reconciledVisible,true,'paired PM proves the original setup was delivered');
+  advancePreparedTab=true;
+  const resumed=await callPm('spawn_worker',{site:'chatgpt',
+    task:'PM launches TL while PM is still working',wait_seconds:0});
+  assert.equal(resumed.tab_id,204);
+  assert.equal(resumed.submission_confirmed,true);
+  assert.equal(spawnPreparations,preparationsAtHold+1);
+  // PM remains active and can continue delegating/reviewing. It is NOT
+  // required to complete its own task just to release this submission gate.
+  // If the STARTUP transport ACK vanishes entirely, the Proxy has no
+  // task_id to record in its FIFO hold. The Child may independently pair
+  // and COMPLETE before the Parent retries. A single DONE task on the
+  // original unchanged tab must remain eligible for read-only recovery.
+  workerTabId=205;
+  workerIncarnation=randomUUID();
+  loseStartupAck=true;
+  await assert.rejects(call('spawn_worker',{caller_tab_id,site:'chatgpt',
+    task:'The PM already completed despite a lost startup ACK',wait_seconds:0}),
+  /outcome UNCERTAIN/);
+  const preparationsWithLostAck=spawnPreparations;
+  nextPreparedWorkerId=206;
+  advancePreparedTab=true;
+  const recoveredAfterLostAck=await call('spawn_worker',{caller_tab_id,site:'chatgpt',
+    task:'The next reviewer starts after the completed PM is reconciled',wait_seconds:0});
+  assert.equal(recoveredAfterLostAck.tab_id,206);
+  assert.equal(recoveredAfterLostAck.submission_confirmed,true);
+  assert.equal(spawnPreparations,preparationsWithLostAck+1,
+    'recovering a DONE PM prompt never re-prepares the original worker');
 });

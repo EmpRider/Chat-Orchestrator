@@ -25,7 +25,12 @@ function readinessHarness() {
     body:{get innerText(){return bodyText;}},
   };
   const chrome={runtime:{onMessage:{addListener(fn){onMessage=fn;},removeListener(){}}}};
-  runInNewContext(content,{document,window:{},chrome,
+  const frame={};
+  // Test-only state injection; no testing hook is shipped in the extension.
+  const testSource=content.replace(/\}\)\(\);\s*$/,
+    'window.__setPendingParent=(marker)=>{pendingParentSetupMarker=marker;completionReceiptUncertain=true;};})();');
+  assert.notEqual(testSource,content);
+  runInNewContext(testSource,{document,window:frame,chrome,
     location:{hostname:'chatgpt.com'},
     Event:class {constructor(type){this.type=type;}},
     setTimeout,clearTimeout});
@@ -37,8 +42,25 @@ function readinessHarness() {
     setBodyText(value){bodyText=value;},
     setDraft(value){input.textContent=value;},
     setUserTurn(value){userTurn=value;},
+    markParentSetupUncertain(marker){frame.__setPendingParent(marker);},
   };
 }
+
+test('manually sent Parent setup is reconciled without another automatic Send or pairing',()=>{
+  const h=readinessHarness();
+  h.setDocumentComplete();
+  const code='99999999-9999-4999-8999-999999999999';
+  h.markParentSetupUncertain(code);
+  assert.equal(h.ping().state,'uncertain');
+  h.setUserTurn('An unrelated existing user message');
+  assert.equal(h.ping().state,'uncertain','an unrelated user turn must not clear uncertainty');
+  h.setUserTurn('Original setup message with pairing code '+code);
+  assert.equal(h.ping().state,'idle',
+    'the unique pairing code must appear in a user turn before clearing uncertainty');
+  assert.equal(h.ping().ready,true);
+  assert.match(content,/await sendPrompt\(text,'parent_setup'\)/,
+    'do not expose the private pairing code as a diagnostics task identifier');
+});
 
 test('ChatGPT composer state requires document completeness without network-idle tracking',()=>{
   const h=readinessHarness();

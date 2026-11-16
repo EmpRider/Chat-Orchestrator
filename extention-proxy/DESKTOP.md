@@ -47,6 +47,165 @@ Real clean-install/uninstall and live ChatGPT E2E have not been verified.
    further MCP tool calls require its `agent_credential` and unique UUID
    `idempotency_key`.
 
+### Two or more PCs using the same ChatGPT account
+
+Each machine needs its own Chat Orchestrator installation and dedicated
+ngrok URL. In ChatGPT's MCP connector settings, add PC1's connector URL
+under the display name `PC1`; add PC2's different URL under `PC2`.
+On each PC, open **Connections → One-time browser setup → ChatGPT MCP
+connector name for this PC**, enter the *exact* name used in ChatGPT for that
+computer, then click **Save connector name**.
+
+The name is persisted in this PC's profile settings and synchronized to
+its connected browser extension without a Proxy restart. Newly generated
+Parent and Child setup messages, plus Proxy-generated task/queue instructions,
+ask ChatGPT to call tools only through the matching named connector.
+The Parent/Child setup messages also name the connector directly beside
+`pair_conversation`. If the bundled extension has not confirmed its applied
+connector name and routing capability, the Proxy rejects pairing and
+the desktop shows **Outdated extension: reload in managed browser**.
+After installing a new build, reload the bundled extension from the
+managed browser's Extensions page, then confirm the displayed
+**Extension verified connector routing** status before starting a Parent.
+If that connector is missing or ambiguous, ChatGPT should ask instead of
+using the other PC. The name is only an instruction-based routing hint:
+**transport keys and per-Agent pairing credentials remain mandatory**.
+Browser-injected setup tags are chat message content, not privileged
+ChatGPT system-role messages. Old messages are not rewritten when
+the name changes; never blindly repeat an uncertain pairing.
+
+### Worker startup FIFO and verified prompt submission
+
+`spawn_worker` startup is serialized across the selected Proxy's browser
+workers: prepare tab → validate its authenticated identity → activate its
+managed tab → wait for the ChatGPT page and idle composer → insert the
+prompt → activate Send exactly once → verify **this prompt** appeared as
+a new user turn → return `submission_confirmed: true`. The next spawn
+starts only after that successful submission handoff, not after the Child
+finishes its model response; independent models can generate in parallel.
+
+Merely inserting a draft, enabling Send, receiving an Extension reply,
+or observing a model loading spinner does **not** confirm submission.
+ChatGPT may normalize editor newlines to spaces; only the exact,
+extension-inserted newline-to-space transformation is allowed, not a
+changed prompt. Inactive tabs cannot pass the final Send gate.
+Browser-message receipt loss never triggers an automatic replay.
+
+If delivery is confirmed *not attempted*, the original `spawn_worker`
+returns an error and its existing tab stays available for inspection.
+If submission is **uncertain**, the Proxy returns an error, marks that
+Child uncertain, and holds subsequent `spawn_worker` requests in that
+browser session before any new worker is prepared or focused. The hold
+retains the **original spawning Parent's tab/incarnation/credential scope**.
+On the next spawn (even from the Child PM requesting its own TL), read-only
+reconciliation checks the original, unchanged Child tab using the original
+Parent scope. Accepted independent proof is either a matching user-turn
+task UUID, a **single-use, successful Child pairing** against the same
+managed tab and incarnation, or a successful authenticated
+`complete_task` from that Child for exactly its assigned task. A previously
+completed Child can be recovered even if the lost startup transport receipt
+contained no `task_id`, but only when exactly one task is eligible in the
+original tab. None of these recovery paths re-focus or re-send the prompt.
+Pairing proves startup delivery **without** claiming that the Child's work
+is complete. A verified late submission may be reported with
+`submission_confirmed: true` but `status: uncertain`: this means the message
+was sent, while model completion still requires review. If verification
+fails, inspect the original tab before deliberately restarting the Proxy;
+never blindly reissue the prompt. Reused role seats may legitimately return
+explicit `status: queued` with `submission_confirmed: false` until Parent
+review permits that task to run. This is not a successful submission.
+
+ChatGPT can reformat sent messages: direct string equality with the entire
+composed task is not reliable submission proof. For a new managed Child the
+extension has already included its own unique `task_id` in the onboarding
+prompt. The verified user bubble must contain that task ID (not an assistant
+quote, the unsent composer, or arbitrary page text). This avoids false
+`SUBMISSION_UNVERIFIED` errors caused only by ChatGPT's rendering changes.
+
+**Modern ChatGPT DOM selectors (captured November 16, 2026):** Some current
+ChatGPT pages expose `[data-user-message-bubble="true"]` for the submitted
+User message and `[data-response-body]` for the Assistant reply. Text replies
+may be nested under `[data-dil-response]`. The earlier
+`[data-message-author-role]` and `[data-testid^="conversation-turn-"]`
+selectors can both be absent, causing spurious zero user-turn counts despite
+successful sends. The Extension now includes these concrete selectors for
+submission verification, assistant response detection, diagnostics, and the
+DOM fallback of `read_chat`, retaining older selector support. Do not
+mistake the accessible `[data-conversation-role]` headings ("You said" /
+"ChatGPT said") for the actual messages.
+
+**Collapsed user-message UI fallback:** A successful ChatGPT Send can replace
+the submitted message with a shortened preview that omits its task UUID.
+The Extension first reads `[data-user-message-copy]` (the same full-text
+projection used by `read_chat`), then looks for the exact UUID inside
+genuine user turns. If the UUID remains hidden, an additional strict
+three-signal check is allowed **only for a newly inserted, UUID-bearing
+Extension draft**: the Send button was activated once after exact draft
+validation, the number of genuine user turns increased, and the composer
+became empty. Earlier turns, assistant replies, a cleared composer alone,
+and model-generation indicators are not sufficient. A confirmed attempt
+emits `submission_confirmation_evidence` with `evidenceType`:
+`TASK_MARKER_IN_USER_TURN`, `EXACT_RENDERED_USER_TURN`, or
+`NEW_USER_TURN_AND_CLEARED_COMPOSER`. No raw task content is logged.
+Without such evidence, keep the existing uncertain/held safety behavior.
+
+This is verified through offline DOM, Extension, and MCP regression tests;
+a real logged-in Edge/ChatGPT multi-worker acceptance run is still needed.
+
+**Parent setup prompt remains in the ChatGPT composer:** Reload the **bundled
+extension** in the dedicated Edge/Chrome profile after installing updated
+application code (the development manifest version may remain unchanged).
+The content script now uses native form submission when ChatGPT's Send control
+is a submit button, otherwise one ordinary button click. It never blindly
+retries an uncertain Send. If an earlier setup prompt is still in the composer
+and no matching user message appears in the transcript, **click ChatGPT's own
+Send button once**, without creating a new Parent pairing. If the message
+already appears in the conversation, do not resend. The original pairing
+code is reused; a matching user turn clears the Parent setup uncertainty.
+Parent submission diagnostics are captured without logging the pairing code.
+This behavior has offline regression coverage, but a live logged-in ChatGPT
+acceptance test is still required.
+
+**Why not synthesize Enter?** A JavaScript-dispatched `KeyboardEvent('keydown')`
+has `isTrusted=false`; a provider may ignore it, and user-configured
+Enter-to-send behavior varies. The extension instead uses the visible Send
+control once. Recent real ChatGPT traces showed a specific blocker *before*
+Send: its contenteditable editor converted the two line breaks in a freshly
+inserted Parent setup prompt to spaces. For **Parent setup only**, the guard
+now accepts an exact newline-to-space transformation if every other
+character, the original editor element, and the enabled Send control still
+match. It does **not** accept general whitespace collapse, pre-existing
+drafts, changed characters, or this exception for worker messages.
+Look for `parent_setup_linebreak_normalization_accepted` followed by
+`send_activation` and `submission_confirmation_end` in the trace.
+
+**One-pass Parent Send diagnostics (build `parent-send-trace-20261116-v2`):**
+In the approved ChatGPT tab's DevTools Console filter to
+`[chat-orch:trace]`. Enable **Preserve log** and repeat a Parent setup
+only in a fresh, explicitly approved tab; never regenerate a pairing code
+or resend an existing setup prompt while an earlier delivery is uncertain.
+The `submission_begin` event contains the content-script build and a
+`traceId`. Use that same `traceId` to inspect:
+`composer_projection_snapshot` (before/after input and just before Send),
+`composer_state_transition` (only when the editor or text changes),
+`send_button_wait_end`, `pre_click_composer_validation_rejected`,
+`send_activation`, `send_click_begin`, and
+`submission_failure_summary`. The summary includes the exact failure
+class (e.g. `EDITOR_REPLACED_AFTER_INSERT`,
+`WHITESPACE_RENDERING_DRIFT`, or `SEND_CONTROL_NOT_READY`),
+whether a Send was actually attempted, and redacted projections of
+`value`, `innerText` and `textContent`. If the page rerenders
+multiline text, these projections expose line-break changes without
+logging the prompt. The extension service-worker console also shows
+`parent_setup.approval_received`, `parent_setup.pairing_offer_accepted`,
+`parent_setup.dispatch_begin` and `parent_setup.dispatch_result`.
+Use the build marker to distinguish freshly loaded code from a stale
+extension; older browser tabs may need a refresh after extension reload.
+The detailed per-selector events remain at Console **Verbose/Debug**
+level, while one-line milestones are visible at Info/Warning. No raw
+prompt text, pairing code, URL, token or webpage HTML is logged by this
+diagnostic path. A fresh real-browser verification is still outstanding.
+
 **Authentication choice:** The Product Owner selected **one static public
 transport key, no OAuth**. The dedicated `/mcp/agent/<transport-key>` route accepts
 the key from the URL path for ChatGPT's no-custom-header configuration;

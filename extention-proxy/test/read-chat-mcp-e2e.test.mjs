@@ -89,7 +89,17 @@ function createContent(siteInfo, apiFailures, domFallback) {
     location: { hostname: siteInfo.hostname, href: siteInfo.url },
     document: {
       title: 'Fixture tab',
-      querySelectorAll: () => domFallback.has(siteInfo.tabId) ? fakeDomNodes : [],
+      querySelectorAll: (selector) => {
+        if(!domFallback.has(siteInfo.tabId))return [];
+        // This fixture models the LEGACY li[data-message-role] DOM. Only
+        // return fake nodes for those selectors; the modern user-bubble and
+        // assistant-response selectors belong to a separate captured-HTML
+        // regression fixture and are intentionally absent here.
+        if(siteInfo.site==='chatgpt' &&
+            selector.includes('[data-user-message-bubble="true"]') &&
+            selector.includes('[data-response-body]'))return [];
+        return fakeDomNodes;
+      },
     },
     chrome: { runtime: { onMessage: {
       addListener: (callback) => { onMessage = callback; },

@@ -51,6 +51,25 @@ test('session registry isolates reused numeric tab IDs across browser profiles',
   await registry.closeSession();
 });
 
+test('only an exact uncertain Child incarnation can recover to started after verified submission',async()=>{
+  const registry=createSessionTabRegistry();
+  const session=randomUUID(),anotherSession=randomUUID();
+  const root=observed(101,session),child=observed(201,session,{managed:true});
+  await registry.registerRoot(root);
+  await registry.registerChild(101,child);
+  await registry.setPhase(201,'uncertain',session);
+  await assert.rejects(registry.setPhase(201,'started',session),/manual reconciliation/);
+  await assert.rejects(registry.confirmSubmitted(201,randomUUID(),session),/original uncertain Child/);
+  await assert.rejects(registry.confirmSubmitted(201,child.incarnation_id,anotherSession),
+    /original uncertain Child/);
+  assert.equal(registry.get(201,session).phase,'uncertain');
+  await registry.confirmSubmitted(201,child.incarnation_id,session);
+  assert.equal(registry.get(201,session).phase,'started');
+  await assert.rejects(registry.confirmSubmitted(201,child.incarnation_id,session),
+    /original uncertain Child/,'recovery is not a reusable phase bypass');
+  await registry.closeSession();
+});
+
 test('Accident recovery rebinds nested Agent ancestry without promoting grandchildren',async()=>{
   const registry=createSessionTabRegistry();
   const session=randomUUID();

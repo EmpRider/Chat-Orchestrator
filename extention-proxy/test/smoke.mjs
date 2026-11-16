@@ -102,7 +102,7 @@ try {
       tab_id:2,incarnation_id:workerIncarnation,reused_tab:false,prepared:true,
     };
     else if (m.method === 'start_prepared_worker') result = {
-      task_id:'t1',tab_id:2,status:'done',result:`echo: ${m.params.task}`,
+      task_id:'t1',tab_id:2,status:'done',submission_confirmed:true,result:`echo: ${m.params.task}`,
     };
     else result = { method: m.method, params: m.params };
     ws.send(JSON.stringify({ type: 'result', id: m.id, ok: true, result }));

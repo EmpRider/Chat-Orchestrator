@@ -1,7 +1,7 @@
 # Chat Orchestrator — Living Requirements & Decision Log
 
-**Version:** 1.70 (public MCP authentication simplified to static Bearer only, 2026-11-15)
-**Last updated:** 2026-11-15 (Asia/Colombo)
+**Version:** 1.77 (modern ChatGPT message DOM selectors from captured page, 2026-11-16)
+**Last updated:** 2026-11-16 (Asia/Colombo)
 **Status:** Discovery and implementation verification in progress; latest source edits explicitly requested by Product Owner
 **Working language for requirements questions:** Sinhala
 
@@ -1150,6 +1150,65 @@ Do not close the Child merely because its task was marked Completed.
 **Explicit scope boundaries:** No independent `FAILED`-task automatic retry/resubmission engine, extra autonomous recovery agent, forced Child tab closure, new user-confirmation framework, general-purpose error-classification taxonomy, or new analytics screen is authorized by this answer. Actual task failures may remain unresolved and should be represented truthfully through the existing status/visibility mechanisms. **Reload is a UI action, never an authorization to repeat task-side effects.** Existing D-030/D-031 uncertain-delivery safeguards, D-033–D-035 idempotency, D-049 FIFO, D-072 Parent clarification and D-068 explicit Child tab closure recovery are unchanged. In particular, actual browser tab closure invokes the existing Accident / Yes / Cancel policy, not this stuck-page refresh rule.
 
 **Technical feasibility: FEASIBLE BY REUSING ALREADY-APPROVED DESIGN; IMPLEMENTATION/E2E UNVERIFIED.** Supported Chrome/Edge extension tab APIs can request reload; the resulting ChatGPT page may or may not recover its state, and browser reload is not a universal guarantee that an interrupted generation continues. Recheck the intended tab's live binding and conversation before and after refresh, avoid concurrent reload loops, and use D-044's configurable grace/inspection schedule. Do not introduce a second timer policy here. The current code was **not** inspected and no live recovery test was performed. This is a product-scope simplification, not evidence of a code fix.
+
+### D-077 — Per-PC named ChatGPT MCP connector routing [CONFIRMED CUSTOM REQUEST; 2026-11-16]
+
+**Product Owner example and decision:** The same ChatGPT account can access two
+independently installed Chat Orchestrator MCP connectors with different ngrok
+URLs: PC1 has a ChatGPT connector named `PC1` and PC2 has one named `PC2`.
+Each desktop app must let the user save the exact connector display name of
+its own PC, and new browser-injected Parent setup instructions must
+dynamically identify which named connector to use. The goal is to avoid
+calling the wrong PC's identically named MCP tools. Do not create a second
+agent-orchestration product, centralized multi-PC registry or shared secret.
+
+**Implementation / feasibility verdict: FEASIBLE WITH A ROUTING-HINT LIMITATION.**
+Desktop Connections now saves `agentSettings.connectorName` per app profile
+and syncs it through the existing authenticated Proxy settings snapshot to
+the extension. Parent and Child pairing prompts and Proxy-generated
+task/queue instruction text identify the exact connector name and prohibit
+substituting another computer's connector. The name is a single-line
+validated display name, not a secret or authorization grant. Actual MCP
+transport authentication, local browser owner attestation, per-Agent
+credentials and idempotency still apply. Browser-injected instruction tags
+are **chat content, not privileged model system messages**. Naming a
+connector in chat cannot force platform-level tool selection: if unavailable
+or ambiguous, the AI must stop and ask, never guess. Separate ngrok URLs
+and connector creation remain user-managed in ChatGPT.
+
+**Verification:** Source and unit tests exercise independent PC1/PC2 prompt
+generation, authenticated settings sync, saved-name preservation and
+invalid-name rejection. A real two-computer ChatGPT connector selection
+and pairing E2E remains unverified. Source implementation preserves existing
+unnamed single-PC configuration; when the name is absent, generated setup
+text warns against guessing among multiple connectors.
+
+**2026-11-16 product correction and source remediation:** The Product Owner
+observed a live Parent setup message without the saved connector name,
+despite newer source including it. The observed message matches an older
+extension's prompt construction; updated source alone does not replace
+already-loaded unpacked MV3 service workers. The connector-name editor now
+belongs to **Connections → One-time browser setup**, visible even after
+initial onboarding completes. New Parent/Child pairing messages explicitly
+name the connector beside `pair_conversation`; Proxy-composed task,
+workspace, delegation, queue and typed-event instructions carry the same
+profile name. Legacy default delegation text referring to generic
+`@Worker Tool` is migrated rather than contradicting the PC-specific
+connector. When no name is configured, prompts warn against unspecified
+connector selection and new Extension pairing refuses to start.
+
+**Live extension verification contract:** A connected extension must ACK
+both the Proxy's current settings revision and the **exact configured
+connector name** plus `connector_name_routing_v1` capability. Bare legacy
+revision ACKs are not trusted as proof that a loaded browser extension
+understands named routing; Desktop displays a reload instruction instead.
+With a named connector configured, the Proxy rejects unverified pairing
+offers before registering them. Source tests exercise rejection of an
+outdated extension, acceptance after a matching ACK, absence of premature
+Parent initialization and propagation through all prompt kinds. This
+is still a routing hint, not platform-enforced ChatGPT tool selection.
+Do not claim that the actual user's browser extension was reloaded or
+that real two-PC production E2E was completed.
 
 ## Technical feasibility audit — 2026-11-14
 
@@ -2973,6 +3032,13 @@ flowchart TD
 
 | Date | Version | Change |
 |---|---|---|
+| 2026-11-16 | 1.77 | D-082 — **Observed HTML compatibility correction:** A user-supplied full ChatGPT page contains two `[data-user-message-bubble="true"]` and two `[data-response-body]` elements, with nested `[data-dil-response]` responses but zero legacy `data-message-author-role` and `conversation-turn-` nodes. Add the modern selectors to user-turn submission verification, assistant response detection, and `read_chat` DOM fallback; preserve older markup compatibility. Tests reconstruct this exact semantic hierarchy and ensure the correct ordered User/Assistant extraction without heading text. This is source-based verification, not a claim of live multi-worker E2E. |
+| 2026-11-16 | 1.76 | D-081 — **CODE OBSERVATION / correction:** Real worker messages were visibly submitted but the 12-second Extension confirmation still returned UNCERTAIN. Submission text extraction did not use the full `[data-user-message-copy]` projection already used by `read_chat`, and collapsed ChatGPT bubbles can hide task UUIDs. Verify the full user-message-copy first; for a fresh extension-owned UUID-bearing draft, permit a new user turn **plus** cleared composer after one validated Send as independent evidence. Do not treat old turns, spinner, or empty composer alone as success. Emit privacy-safe `submission_confirmation_evidence` diagnostics. Tests simulate collapsed bubbles, copy projections and a false-positive guard; live managed-browser E2E remains pending. |
+| 2026-11-16 | 1.75 | D-080 — **CODE OBSERVATION / correction, not a new Product Owner decision:** The reported PM had paired and completed work while its Parent-created task remained submission-unverified. Session-wide spawn FIFO incorrectly rechecked that Parent-owned task under the new Child caller's identity, and a lost startup ACK could leave no task ID while the completed task was excluded from inventory. Preserve original Parent scope, include an unambiguous DONE task in read-only recovery, and accept successful original-tab one-time Child pairing or authenticated same-task completion as evidence of startup delivery. Never replay a browser prompt or infer substantive task completion from pairing. Offline integration tests cover PM→TL delegation while PM remains active; real multi-tab E2E still pending. |
+| 2026-11-16 | 1.74 | D-079 — Implementation correction after observed false `spawn_worker` error: browser had submitted the Child prompt, but the exact full-text confirmation timed out and blocked later FIFO spawns. Verify the unique Child task ID inside a genuine user turn; if an ambiguous delivery is later independently verified in the same tab/incarnation, release the FIFO without replay. Keep model completion separate and unverified until supported evidence exists. |
+| 2026-11-16 | 1.73 | D-078: `spawn_worker` FIFO must wait for a confirmed Child **user-turn submission**, never merely inserted draft/worker preparation/Extension receipt. Exact per-task submission evidence and active-tab send validation gate success. Failed sends return error; ambiguous sends hold the session's subsequent spawn queue, without replay or focus theft. Newline-to-space React reflow is accepted only on extension-inserted drafts with otherwise identical characters. Model response waits remain independent. |
+| 2026-11-16 | 1.72 | D-077 correction: Move connector-name configuration to persistent One-time browser setup, explicitly scope Parent/Child `pair_conversation`, inject name into every Proxy task/queue prompt and migrate legacy delegation defaults. Verify applied name/capability in Extension ACK; block pairing and show reload guidance for old extension builds. No live two-PC E2E claim. |
+| 2026-11-16 | 1.71 | D-077: Product Owner requests separately named ChatGPT MCP connectors for PC1/PC2 and local persistence of each name for dynamic Parent/Child and task/queue routing instructions. Implemented profile-local validated name, settings sync and generated guidance; naming is not platform-enforced tool routing or authentication. Offline source verification performed; real two-PC E2E remains unverified. |
 | 2026-11-15 | 1.69 | Product Owner-requested implementation continuation. Clarified D-061 to preserve the pre-existing Settings checkbox (default ON; OFF -> explicit Exit confirmation). Source follow-up adds enrollment guard, guided onboarding, and consent-first update preparation. The original 1.67 document was a read-only observation; this row is engineering status, not a new approved business choice. ChatGPT connector OAuth compatibility, live browser/NSIS E2E and signing remain unverified. |
 | 2026-11-15 | 1.67 | Q-036 Option A source-code assessment completed read-only against D-001–D-076 in connected `D:\web-chat-automation` working tree. C-004 evidence matrix shows release blockers (public MCP/WS security, mismatched pairing, untracked packaging dependency, missing universal idempotency), task/lifecycle and UI gaps, implemented pieces, maintainability risks, and narrowly scoped remediation order. Verified 11 offline registry/tray tests and 3 syntax checks, but no live browser E2E. Added current-source feasibility note, Q-036 register entry and V-002az Mermaid; project code was not modified. |
 | 2026-11-15 | 1.66 | Q-035 user custom D-076: for apparent Child page/task errors, prefer a managed-tab reload and existing D-044 UI recheck/monitoring instead of building a separate failure-retry subsystem. Clarified that reload does not guarantee recovery or authorize prompt replay; existing D-042/D-046, manual fallback, Parent review and D-068 closed-tab recovery remain unchanged. Updated feasibility audit, Q-035 status and V-002ax Mermaid; no source edits/E2E verification. |

@@ -63,7 +63,9 @@ try {
   assert.ok(msg.revision>0);
   assert.ok(msg.settings.promptModules.core.length>10);
   assert.ok(msg.settings.promptModules.queue.length>10);
-  ws.send(JSON.stringify({type:'settings_applied',revision:msg.revision}));
+  ws.send(JSON.stringify({type:'settings_applied',revision:msg.revision,
+    connector_name:msg.settings.connectorName,
+    routing_capability:'connector_name_routing_v1'}));
   ws.close();
   let stopped=false;
   for(let i=0;i<90;i++) {

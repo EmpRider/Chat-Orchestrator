@@ -13,7 +13,8 @@ import { createDesktopTray, installWindowCloseBehavior, minimizeToTrayPreference
 import { DEFAULT_AGENT_SETTINGS, normalizeAgentSettings, replaceObsoletePromptSettings, disabledAgentSettings, composeAgentPrompt } from '../agent-settings.mjs';
 import { createDiagnostics } from '../diagnostics.mjs';
 import { findInstalledBrowser,managedBrowserLaunchArgs,managedProfilePath,
-  normalizeManagedBrowser,matchesManagedEnrollment } from './managed-browser.mjs';
+  normalizeManagedBrowser,normalizeChromiumExecutablePath,
+  matchesManagedEnrollment } from './managed-browser.mjs';
 import {checkLatestRelease,evaluateUpdateReadiness,versionParts,stillApprovedRelease} from './update-policy.mjs';
 
 // Set CHAT_ORCH_DIAGNOSTICS=1 for lifecycle messages (never credentials).
@@ -66,7 +67,9 @@ let coordinationSnapshot = null; // Owned utilityProcess emits redacted, read-on
 let stopping = false;
 let agentSettings = normalizeAgentSettings({});
 let agentSettingsSyncRevision = 0;
+let connectorRoutingSyncError = false;
 let managedBrowserSelection='none';
+let customChromiumExecutable='';
 let managedBrowserPhase='not_configured';
 let managedBrowserError='';
 let managedBrowserLaunchAttempted=false;
@@ -203,9 +206,12 @@ function state() {
     privateCoordinationRestartRequired: Boolean(child && runningPrivateCoordination !== privateCoordinationOptIn),
     coordinationSnapshot,
     agentSettingsSyncRevision,
+    connectorRoutingSyncError,
+    connectorName:agentSettings.connectorName,
     domain,
     profile: PROFILE,
     managedBrowserSelection,
+    customChromiumExecutable,
     managedBrowserVerified:matchesManagedEnrollment(managedBrowserEnrollment,
       managedBrowserSelection,liveBrowserEnrollment,extensionConnected),
     onboardingComplete,
@@ -238,6 +244,8 @@ function loadSettings() {
   try {
     const saved = JSON.parse(fs.readFileSync(settingsFile(), 'utf8'));
     managedBrowserSelection=normalizeManagedBrowser(saved.managedBrowserSelection??'none');
+    customChromiumExecutable=typeof saved.customChromiumExecutable==='string'
+      ? saved.customChromiumExecutable : '';
     managedBrowserEnrollment=saved.managedBrowserEnrollment?.browser===managedBrowserSelection &&
       /^[0-9a-f-]{36}$/i.test(saved.managedBrowserEnrollment?.profileInstallId||'')
       ? {browser:managedBrowserSelection,profileInstallId:saved.managedBrowserEnrollment.profileInstallId}
@@ -255,6 +263,7 @@ function loadSettings() {
   } catch {
     domain = '';
     managedBrowserSelection='none';
+    customChromiumExecutable='';
     managedBrowserEnrollment=null;
     onboardingComplete=false;
     pendingUpdateVersion=null;
@@ -269,7 +278,7 @@ function loadSettings() {
 function writeSettings() {
   fs.mkdirSync(dataDir(), { recursive: true });
   fs.writeFileSync(settingsFile(), JSON.stringify({ domain, minimizeToTray,
-    managedBrowserSelection,managedBrowserEnrollment,onboardingComplete,
+    managedBrowserSelection,customChromiumExecutable,managedBrowserEnrollment,onboardingComplete,
     pendingUpdateVersion,
     autoStartWindows, privateCoordinationOptIn,
     privateQueuePreferenceSchema: PRIVATE_QUEUE_PREFERENCE_SCHEMA,
@@ -278,11 +287,13 @@ function writeSettings() {
 
 function openManagedBrowser({openExtensions=false}={}) {
   if (managedBrowserSelection==='none')
-    throw new Error('Select Chrome or Edge before opening a managed browser');
-  const executable=findInstalledBrowser(managedBrowserSelection);
+    throw new Error('Select a supported Chromium-based browser first');
+  const executable=findInstalledBrowser(managedBrowserSelection,{
+    customExecutablePath:customChromiumExecutable});
   if (!executable)
-    throw new Error('Selected browser was not found in standard Windows installation paths');
-  const profileDir=managedProfilePath(dataDir(),managedBrowserSelection);
+    throw new Error('Selected Chromium browser executable was not found');
+  const profileDir=managedProfilePath(dataDir(),managedBrowserSelection,{
+    executablePath:customChromiumExecutable});
   fs.mkdirSync(profileDir,{recursive:true});
   const launched=spawn(executable,managedBrowserLaunchArgs(
     managedBrowserSelection,profileDir,{openExtensions}),{
@@ -517,6 +528,7 @@ function startProxy() {
   extensionConnected = false;
   invalidateLiveBrowserVerification();
   agentSettingsSyncRevision = 0;
+  connectorRoutingSyncError = false;
   publishState();
 
   try {
@@ -562,14 +574,24 @@ function startProxy() {
         }
       } else if (message?.type === 'agent_settings_synced') {
         agentSettingsSyncRevision = Number(message.revision) || 0;
+        connectorRoutingSyncError = false;
+      } else if (message?.type === 'agent_settings_routing_mismatch') {
+        agentSettingsSyncRevision = 0;
+        connectorRoutingSyncError = true;
       } else if (message?.type === 'agent_settings_reloaded') {
-        agentSettingsSyncRevision = Number(message.revision) || 0;
+        // A Proxy reload is not evidence that the browser extension applied
+        // the new name. Only its verified settings_applied ACK may set sync.
+        // A fast extension ACK can arrive before this reload notice.
+        if(agentSettingsSyncRevision !== Number(message.revision))
+          agentSettingsSyncRevision = 0;
       } else if (message?.type === 'extension_session_changed') {
         // A different authenticated socket may replace the same browser
         // session between two HTTP health polls. Saved approval is not live
         // proof until we inspect the new extension installation again.
         invalidateLiveBrowserVerification();
         extensionConnected=false;
+        agentSettingsSyncRevision=0;
+        connectorRoutingSyncError=false;
       } else if (message?.type === 'coordination_snapshot') {
         if (message.snapshot && typeof message.snapshot === 'object') {
           coordinationSnapshot = message.snapshot;
@@ -807,11 +829,12 @@ function requireTrustedWindow(event) {
 }
 
 function desktopExtensionAction(action, tabId, nonce, browserSessionId,decisionId=null,choice=null,
-  expectedProfileInstallId=null,expectedBrowserProduct=null) {
+  expectedProfileInstallId=null,expectedBrowserProduct=null,recoveryReason=null) {
   if (!child || phase !== 'running') return Promise.reject(new Error('Start proxy and connect extension first'));
   if (!['set_orchestrator','diagnose','close_legacy_workers','close_managed_browser','verify_managed_browser','update_readiness',
       'inspect_root_repair','confirm_root_repair','list_agent_closures','resolve_agent_closure',
-      'list_completion_monitors','set_manual_completion'].includes(action)) {
+      'list_completion_monitors','set_manual_completion','recover_queue_batch',
+      'focus_queue_manager'].includes(action)) {
     return Promise.reject(new Error('Unsupported desktop action'));
   }
   if (!['close_legacy_workers','close_managed_browser','verify_managed_browser','update_readiness',
@@ -836,20 +859,26 @@ function desktopExtensionAction(action, tabId, nonce, browserSessionId,decisionI
       (!/^[0-9a-f-]{36}$/i.test(decisionId||'')||
        !['completed','in_progress'].includes(choice)))
     return Promise.reject(new Error('Explicit manual task status choice and task ID required'));
+  if(action==='recover_queue_batch' &&
+      (!/^[0-9a-f-]{36}$/i.test(decisionId||'') ||
+       !['recheck','retry_draft','skip'].includes(choice) ||
+       (choice==='skip' && (typeof recoveryReason!=='string' ||
+         recoveryReason.trim().length<10 || recoveryReason.length>512))))
+    return Promise.reject(new Error('Queue recovery requires valid batch, action and skip reason'));
   const owned = child;
   const id = crypto.randomUUID();
   return new Promise((resolve, reject) => {
     // Full Accident restoration may create and verify several nested tabs.
     // A short UI IPC timeout would orphan a partially restored subtree.
     const deadlineMs=action==='resolve_agent_closure'&&choice==='accident'
-      ? 180000 : 15000;
+      ? 180000 : action==='recover_queue_batch' ? 65000 : 15000;
     const timer = setTimeout(() => {desktopExtensionActions.delete(id);
       reject(new Error('Extension action timed out; outcome unknown'));}, deadlineMs);
     desktopExtensionActions.set(id, {resolve,reject,timer});
     try {owned.postMessage({type:'desktop_extension_action', request_id:id, action, tab_id:tabId,
       confirmation_nonce:nonce,browser_session_id:browserSessionId,
       decision_id:decisionId,choice,expected_profile_install_id:expectedProfileInstallId,
-      expected_browser_product:expectedBrowserProduct});}
+      expected_browser_product:expectedBrowserProduct,reason:recoveryReason});}
     catch (error) {clearTimeout(timer); desktopExtensionActions.delete(id); reject(error);}
   });
 }
@@ -862,7 +891,9 @@ async function inspectCurrentManagedExtension(){
   const verified=await desktopExtensionAction('verify_managed_browser');
   if(!/^[0-9a-f-]{36}$/i.test(verified?.profile_install_id||''))
     throw new Error('Connected extension has no stable enrollment identity');
-  if(verified.browser_product!==managedBrowserSelection)
+  if(managedBrowserSelection==='chromium'
+      ? !['chrome','chromium'].includes(verified.browser_product)
+      : verified.browser_product!==managedBrowserSelection)
     throw new Error('Connected extension is not running in your selected browser');
   const bundledManifest=JSON.parse(fs.readFileSync(
     path.join(unpackedExtensionDir(),'manifest.json'),'utf8'));
@@ -925,6 +956,15 @@ function registerActions() {
     requireTrustedWindow(event);
     return desktopExtensionAction('set_manual_completion',null,null,browserSessionId,taskId,status);
   });
+  ipcMain.handle('bridge:recoverQueueBatch',(event,tabId,browserSessionId,batchId,action,reason)=>{
+    requireTrustedWindow(event);
+    return desktopExtensionAction('recover_queue_batch',tabId,null,browserSessionId,
+      batchId,action,null,null,reason);
+  });
+  ipcMain.handle('bridge:focusQueueManager',(event,tabId,browserSessionId)=>{
+    requireTrustedWindow(event);
+    return desktopExtensionAction('focus_queue_manager',tabId,null,browserSessionId);
+  });
   ipcMain.handle('bridge:copyExtensionPath',(event)=>{
     requireTrustedWindow(event);
     const extensionPath=unpackedExtensionDir();
@@ -945,17 +985,30 @@ function registerActions() {
     publishState();
     return state();
   });
-  ipcMain.handle('bridge:configureManagedBrowser',(event,value)=>{
+  ipcMain.handle('bridge:chooseChromiumExecutable',async(event)=>{
+    requireTrustedWindow(event);
+    const result=await dialog.showOpenDialog(window,{
+      title:'Choose a Chromium-based browser executable',
+      properties:['openFile'],filters:[{name:'Browser executable',extensions:['exe']}],
+    });
+    return result.canceled?null:normalizeChromiumExecutablePath(result.filePaths[0]);
+  });
+  ipcMain.handle('bridge:configureManagedBrowser',(event,value,customExecutable)=>{
     requireTrustedWindow(event);
     const selected=normalizeManagedBrowser(value);
-    if (selected!=='none' && !findInstalledBrowser(selected))
-      throw new Error('Selected browser not found. Install Chrome or Edge first');
-    if(managedBrowserSelection!==selected){
+    const nextExecutable=selected==='chromium'
+      ? normalizeChromiumExecutablePath(customExecutable) : customChromiumExecutable;
+    if (selected!=='none' && !findInstalledBrowser(selected,{
+      customExecutablePath:nextExecutable}))
+      throw new Error('Browser executable missing. Select an installed Chromium browser');
+    if(managedBrowserSelection!==selected || (selected==='chromium' &&
+        nextExecutable!==customChromiumExecutable)){
       managedBrowserEnrollment=null;
       onboardingComplete=false;
       invalidateLiveBrowserVerification();
     }
     managedBrowserSelection=selected;
+    customChromiumExecutable=nextExecutable;
     managedBrowserPhase=selected==='none'?'not_configured':'selected';
     managedBrowserLaunchAttempted=false;
     managedBrowserError='';
@@ -987,6 +1040,10 @@ function registerActions() {
     if(!managedBrowserEnrollment || managedBrowserEnrollment.browser!==managedBrowserSelection ||
         !extensionConnected)
       throw new Error('Verify the dedicated browser extension before completing setup');
+    if(!agentSettings.connectorName)
+      throw new Error('Save the exact ChatGPT MCP connector name in One-time browser setup first');
+    if(!agentSettingsSyncRevision || connectorRoutingSyncError)
+      throw new Error('Reload the managed browser extension and wait for verified connector settings sync before finishing setup');
     const selectedAtStart=managedBrowserSelection;
     const generation=browserVerificationGeneration;
     const verified=await inspectCurrentManagedExtension();
@@ -1026,6 +1083,7 @@ function registerActions() {
     agentSettings = normalizeAgentSettings(next);
     writeSettings();
     agentSettingsSyncRevision = 0;
+    connectorRoutingSyncError=false;
     if (child && phase === 'running') child.postMessage({ type: 'reload_agent_settings' });
     publishState();
     return structuredClone(agentSettings);

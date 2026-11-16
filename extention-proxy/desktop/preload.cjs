@@ -12,7 +12,13 @@ contextBridge.exposeInMainWorld('bridge', Object.freeze({
   resolveAgentClosure:(id,choice)=>ipcRenderer.invoke('bridge:resolveAgentClosure',id,choice),
   setCompletionStatus:(taskId,status,browserSessionId)=>
     ipcRenderer.invoke('bridge:setCompletionStatus',taskId,status,browserSessionId),
-  configureManagedBrowser:(browser)=>ipcRenderer.invoke('bridge:configureManagedBrowser',browser),
+  recoverQueueBatch:(tabId,browserSessionId,batchId,action,reason)=>
+    ipcRenderer.invoke('bridge:recoverQueueBatch',tabId,browserSessionId,batchId,action,reason),
+  focusQueueManager:(tabId,browserSessionId)=>
+    ipcRenderer.invoke('bridge:focusQueueManager',tabId,browserSessionId),
+  configureManagedBrowser:(browser,executablePath)=>
+    ipcRenderer.invoke('bridge:configureManagedBrowser',browser,executablePath),
+  chooseChromiumExecutable:()=>ipcRenderer.invoke('bridge:chooseChromiumExecutable'),
   verifyManagedBrowser:()=>ipcRenderer.invoke('bridge:verifyManagedBrowser'),
   finishOnboarding:()=>ipcRenderer.invoke('bridge:finishOnboarding'),
   checkUpdates:()=>ipcRenderer.invoke('bridge:checkUpdates'),

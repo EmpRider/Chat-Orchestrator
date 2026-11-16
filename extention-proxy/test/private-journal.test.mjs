@@ -142,6 +142,65 @@ test('crash replay preserves DISPATCHING and DELIVERED ambiguity with no status 
   assert.equal(explicit.byRef.get(explicit.fifo[0]).recoveryClass, 'PREEXISTING_UNCERTAIN');
 });
 
+function recoveryTransition(seq,original,phase,lease,kind,
+  reason='Operator reviewed this delivery outcome') {
+  const changed=transition(seq,original,phase,1,lease);
+  changed.payload.recovery={kind,eventRef:original.ref,batchId:lease,
+    principalId:owner.principalId,at:new Date().toISOString(),reason};
+  return changed;
+}
+
+test('skipping an uncertain batch is audited, survives journal replay and unblocks FIFO',()=>{
+  const original=queued(1,'CHILD_RESULT');
+  const later=queued(2,'STATUS_REQUEST',recipient);
+  const lease=transition(3,original,'LEASED');
+  const nonce=lease.payload.leaseNonce;
+  const dispatch=transition(4,original,'DISPATCHING',1,nonce);
+  const uncertain=transition(5,original,'UNCERTAIN',1,nonce);
+  const skipped=recoveryTransition(6,original,'SKIPPED',nonce,'manual_skip',
+    'Operator chose to bypass an unsent completion notification');
+  const nextLease=transition(7,later,'LEASED',1,randomUUID());
+  const records=[original,later,lease,dispatch,uncertain,skipped,nextLease];
+  const reduced=journal.reducePrivateQueueEvents(records);
+  assert.equal(reduced.byRef.get(reduced.fifo[0]).phase,'SKIPPED');
+  assert.equal(reduced.byRef.get(reduced.fifo[1]).phase,'LEASED');
+  assert.equal(journal.privateQueueDiagnosticCounts(reduced).pending,1);
+  const replay=journal.replayPrivateJournal(Buffer.concat(records.map(journal.privateJournalFrame)));
+  assert.equal(replay.tail,null);
+  const recovered=journal.reducePrivateQueueEvents(replay.events,true);
+  assert.equal(recovered.byRef.get(recovered.fifo[0]).phase,'SKIPPED');
+  assert.equal(replay.events[0].payload.data.summary,'fixture-1');
+  assert.throws(()=>journal.reducePrivateQueueEvents(records.slice(0,-2)
+    .concat(transition(6,original,'SKIPPED',1,nonce))),/durable evidence/);
+  const forged=recoveryTransition(6,original,'SKIPPED',randomUUID(),'manual_skip');
+  assert.throws(()=>journal.reducePrivateQueueEvents([...records.slice(0,-2),forged]),
+    /recovery evidence/);
+});
+
+test('exact-draft retry stays uncertain after a lost receipt, but verified delivery accepts ACK',()=>{
+  const original=queued(1,'CHILD_RESULT');
+  const lease=transition(2,original,'LEASED');
+  const nonce=lease.payload.leaseNonce;
+  const dispatch=transition(3,original,'DISPATCHING',1,nonce);
+  const uncertain=transition(4,original,'UNCERTAIN',1,nonce);
+  const retry=recoveryTransition(5,original,'RETRYING',nonce,'manual_retry');
+  const retryUncertain=recoveryTransition(6,original,'UNCERTAIN',nonce,'retry_unconfirmed');
+  const verified=recoveryTransition(7,original,'DELIVERED',nonce,'verified_user_turn');
+  const ack=transition(8,original,'PROCESSED',1,nonce);
+  ack.payload.ack={kind:'explicit_manager_ack',eventRef:original.ref,
+    principalId:owner.principalId,acknowledgedAt:new Date().toISOString(),batchId:nonce};
+  const state=journal.reducePrivateQueueEvents([
+    original,lease,dispatch,uncertain,retry,retryUncertain,verified,ack]);
+  assert.equal(state.byRef.get(state.fifo[0]).phase,'PROCESSED');
+  assert.equal(journal.privateQueueDiagnosticCounts(state).pending,0);
+  const incomplete=journal.reducePrivateQueueEvents([original,lease,dispatch,uncertain,retry],true);
+  assert.equal(incomplete.byRef.get(incomplete.fifo[0]).phase,'UNCERTAIN');
+  assert.equal(incomplete.byRef.get(incomplete.fifo[0]).previousPhase,'RETRYING');
+  assert.throws(()=>journal.reducePrivateQueueEvents([
+    original,lease,dispatch,uncertain,transition(5,original,'RETRYING',1,nonce)
+  ]),/durable evidence/);
+});
+
 test('desktop readiness is fresh, authenticated and fail-closed across disconnects', () => {
   const now = 50000;
   const base = { revoked: false, registered: true, connected: true, now };

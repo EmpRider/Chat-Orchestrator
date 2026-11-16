@@ -104,6 +104,28 @@ const getConfig = async () => ({
     promptSchema: 2, promptModules: {}}),
   autoCloseWorkers: false, // Parent must explicitly review and close workers.
 });
+// Trusted profile settings provide the display name. It is a routing hint,
+// not authentication and never comes from webpage or model-supplied text.
+function localConnectorGuidance(name) {
+  if(typeof name!=='string' || !/^[A-Za-z0-9][A-Za-z0-9 _.-]{0,63}$/.test(name) ||
+      name.trim()!==name) {
+    return 'If multiple Chat Orchestrator MCP connectors exist, do not guess which PC '+
+      'owns this pairing code. Ask the user to configure its exact ChatGPT connector '+
+      'name in this PC\'s Chat Orchestrator Connections settings.';
+  }
+  return 'The ChatGPT MCP connector for THIS PC is named "'+name+'". '+
+    'Use ONLY that exact named connector for every Chat Orchestrator MCP tool call. '+
+    'Never use another PC\'s connector even when tool names match. '+
+    'If that connector is missing or ambiguous, stop and ask the user; do not fall back. '+
+    'The connector name does not grant access or replace pairing credentials.';
+}
+function requireConnectorRoutingReady() {
+  if(!proxySettings || proxySettingsRevision<1 || wsState!=='connected')
+    throw new Error('Extension settings are not synchronized yet. Reconnect or reload the bundled extension.');
+  if(!proxySettings.connectorName)
+    throw new Error('Set the exact ChatGPT MCP connector name in Connections > One-time browser setup first.');
+  return localConnectorGuidance(proxySettings.connectorName);
+}
 function acceptProxySettings(msg) {
   if (msg.schema !== 1 || !Number.isSafeInteger(msg.revision) || msg.revision <= 0 ||
       msg.revision < proxySettingsRevision ||
@@ -112,6 +134,9 @@ function acceptProxySettings(msg) {
   const names=['core','task','workspace','delegation','queue','child_result','status_request','child_tab_lost','failure'];
   const monitor=c.completionMonitor;
   if(c.promptSchema!==2 || typeof c.enabled!=='boolean' ||
+       (c.connectorName!==undefined && (typeof c.connectorName!=='string' ||
+         (c.connectorName!=='' && (!/^[A-Za-z0-9][A-Za-z0-9 _.-]{0,63}$/.test(c.connectorName) ||
+           c.connectorName.trim()!==c.connectorName)))) ||
       !Number.isSafeInteger(c.maxWorkers)||c.maxWorkers<1||c.maxWorkers>10||
       !Number.isSafeInteger(c.maxTasksPerHour)||c.maxTasksPerHour<1||c.maxTasksPerHour>500||
       !Number.isSafeInteger(c.taskTimeoutMin)||c.taskTimeoutMin<1||c.taskTimeoutMin>60||
@@ -127,6 +152,7 @@ function acceptProxySettings(msg) {
       !c.promptModules||typeof c.promptModules!=='object'||
       names.some(k=>typeof c.promptModules[k]!=='string'||!c.promptModules[k].trim()||c.promptModules[k].length>8192))return false;
   proxySettings={enabled:c.enabled,maxWorkers:c.maxWorkers,maxTasksPerHour:c.maxTasksPerHour,
+    connectorName:c.connectorName??'',
     taskTimeoutMin:c.taskTimeoutMin,promptSchema:2,
     completionMonitor:{initialMinutes:monitor.initialMinutes,
       retryMinutes:[...monitor.retryMinutes],hydrationSeconds:monitor.hydrationSeconds,
@@ -669,6 +695,7 @@ function summarize(t) {
     status: t.status,
     elapsed_seconds: Math.round(((t.finishedAt || Date.now()) - t.startedAt) / 1000),
     source_incarnation_id: t.workerIncarnationId || null,
+    submission_confirmed: t.submissionConfirmed === true,
   };
   if (t.originParentUrl) out.origin_parent_url=t.originParentUrl;
   if (Number.isSafeInteger(t.recoveredTabId)) {
@@ -697,7 +724,7 @@ function summarize(t) {
     out.note='Child requested instructions from its direct Parent. The original task remains pending.';
     out.context_pending=true;
   }
-  if (t.status === 'running') out.note = 'Still running. Call get_result again with wait_seconds.';
+  if (t.status === 'running') out.note = 'Still running. Finish your current response and await the orchestrator completion notification; do not repeatedly poll get_result.';
   return out;
 }
 
@@ -1164,6 +1191,14 @@ async function tabMessage(tabId, msg) {
     extensionDiagnostic('warn','tab_message.initial_failure',{tabId,requestId,method:safeCmd,
       durationMs:Date.now()-startedAt,errorType:e?.name || 'Error'});
   }
+  // These commands can send a chat message. A lost callback does NOT prove
+  // that the content script failed to submit it. Never reinject and replay.
+  if (['run_prompt','submit_manager_batch','submit_parent_initialization',
+       'retry_manager_draft'].includes(safeCmd)) {
+    extensionDiagnostic('warn','tab_message.delivery_uncertain',{tabId,requestId,method:safeCmd,
+      reason:'SIDE_EFFECTING_ACK_LOST'});
+    throw new Error('Chat submission receipt lost; inspect the existing tab before retrying');
+  }
   const tab = await chrome.tabs.get(tabId).catch(() => null);
   if (!tab) throw new Error(`Tab ${tabId} no longer exists (it was closed).`);
   if (!siteOfUrl(tab.url)) throw new Error(`Tab ${tabId} is not a supported chat page.`);
@@ -1450,17 +1485,22 @@ async function startTask(tabId, site, text, waitSecs, cfg, autoClose = false, ow
     if(owner!=='legacy' && site==='chatgpt' &&
         !Object.values(tasks).some((task)=>task.tabId===tabId &&
           task.workerIncarnationId===workerIncarnations[tabId])) {
+      const connectorGuidance=requireConnectorRoutingReady();
       const code=await issueManagedChildPairing(tabId);
       const onboarding='<managed_child_setup>\n'
         +'You are an already-owned Child Agent, not a new Parent. '
-        +'Before other Chat Orchestrator MCP calls, call pair_conversation with code '
+        +connectorGuidance+' '
+        +'Before other Chat Orchestrator MCP calls, call pair_conversation from connector "'+
+        proxySettings.connectorName+'" with code '
         +code+' and a fresh idempotency_key UUID. '
         +'Use its returned agent_credential for later Orchestrator tool calls. '
         +'Use a fresh UUID idempotency_key for each independent tool call; reuse a key only for exact retries. '
         +'Never expose the credential or one-time pairing code in your final answer. '
         +'After finishing your own work, call complete_task with assigned task_id '
         +taskId+' and a fresh UUID idempotency_key. '
-        +'Unfinished delegated descendants must be reviewed before your task is complete. '
+        +'If you delegate to children or grandchildren, submit the intended tasks, then end your current response without polling their status; the orchestrator will notify you of completion. '
+        +'You may call complete_task when your own work is ready even if descendants are still running: the task stays waiting_for_children until all required descendant results are reviewed. '
+        +'Review results when notified, then yield again if other descendants remain. '
         +'If MCP tools cannot be accessed, report the limitation instead of inventing success.\n'
         +'</managed_child_setup>\n\n';
       dispatchText=onboarding+text;
@@ -1499,6 +1539,9 @@ async function startTask(tabId, site, text, waitSecs, cfg, autoClose = false, ow
       // The content script now acknowledges only after it confirms that
       // the user message was submitted; response collection continues async.
       extensionDiagnostic('info','worker.content_dispatch_begin',{tabId,taskId,site});
+      const dispatchTab=await chrome.tabs.get(tabId);
+      if(!dispatchTab?.active || !ownedWorker(tabId,owner))
+        throw new Error('Worker lost active tab focus before prompt submission; no dispatch attempted');
       ack = await tabMessage(tabId, {cmd:'run_prompt',taskId,receiptNonce,
         text:dispatchText,timeoutMs:cfg.taskTimeoutMin * 60000});
       extensionDiagnostic('info','worker.content_dispatch_ack',{tabId,taskId,
@@ -1519,10 +1562,20 @@ async function startTask(tabId, site, text, waitSecs, cfg, autoClose = false, ow
     console.info('[chat-orch:background]', {step:'worker_submission_receipt',taskId,tabId,
       ok:ack?.ok === true,uncertain:ack?.uncertain === true,
       notSubmitted:ack?.notSubmitted === true});
-    if (!ack?.ok && task.status === 'running') {
-      finishTask(taskId,ack?.uncertain
-        ? {status:'uncertain',error:ack.error || 'Submission outcome uncertain'}
-        : {status:'failed',error:ack?.error || 'Tab refused the task'});
+    if(ack?.ok===true && ack?.submitted===true) {
+      task.submissionConfirmed=true;
+      await saveState();
+    } else if(task.submissionConfirmed===true) {
+      // The Child may have already used its unique pairing offer while
+      // ChatGPT's rendered user-turn selector was still inconclusive.
+      // Verified pairing is stronger delivery evidence than that selector;
+      // it does NOT imply that the model's task is complete.
+      extensionDiagnostic('info','worker.submission_already_confirmed',{
+        tabId,taskId,proofType:task.submissionEvidence || 'USER_TURN'});
+    } else if (task.status === 'running') {
+      finishTask(taskId,ack?.uncertain || ack?.notSubmitted!==true
+        ? {status:'uncertain',error:ack?.error || 'Submission outcome uncertain'}
+        : {status:'failed',error:ack?.error || 'Tab refused the task before submission'});
     }
     return taskId;
   });
@@ -2285,6 +2338,70 @@ async function handleCall(method, p = {}) {
         browser_session_id: browserSessionId,
         incarnation_id: workerIncarnations[manager] || managerIncarnations[manager] };
     }
+    case 'focus_manager_tab': {
+      if(p.__trustedPrincipal?.mode!=='profile')throw new Error('Paired manager required');
+      const tabId=await callerManagerTab(p,await getConfig());
+      const tab=await chrome.tabs.get(tabId);
+      await chrome.tabs.update(tabId,{active:true});
+      if(Number.isSafeInteger(tab.windowId))
+        await chrome.windows.update(tab.windowId,{focused:true});
+      return {focused:true,tab_id:tabId};
+    }
+    case 'inspect_manager_batch':
+    case 'retry_manager_batch':
+    case 'clear_skipped_manager_batch': {
+      if(p.__trustedPrincipal?.mode!=='profile')throw new Error('Paired manager required');
+      if(!/^[0-9a-f-]{36}$/i.test(p.batch_id||'') ||
+         typeof p.prompt_text!=='string' || p.prompt_text.length>60000 ||
+         !p.prompt_text.includes(p.batch_id))
+        throw new Error('Invalid batch recovery request');
+      const tabId=await callerManagerTab(p,await getConfig());
+      const tab=await chrome.tabs.get(tabId);
+      if(siteOfUrl(tab?.url)!=='chatgpt')
+        throw new Error('Recovery is restricted to the authenticated ChatGPT manager tab');
+      const origin=p.origin_parent_url==null?null:safeConversationRoute(p.origin_parent_url);
+      if(p.origin_parent_url!=null && origin!==p.origin_parent_url)
+        throw new Error('Invalid original conversation route');
+      if(origin && safeConversationRoute(tab.url)!==origin)
+        return {ok:false,verified:false,reason:'OPEN_ORIGINAL_PARENT_CONVERSATION'};
+      const retry=method==='retry_manager_batch';
+      const clear=method==='clear_skipped_manager_batch';
+      if(retry){
+        await chrome.tabs.update(tabId,{active:true});
+        if(Number.isSafeInteger(tab.windowId))
+          await chrome.windows.update(tab.windowId,{focused:true});
+      }
+      const result=await tabMessage(tabId,{cmd:retry?'retry_manager_draft':
+        clear?'clear_manager_batch_draft':'inspect_manager_batch',
+        batchId:p.batch_id,text:p.prompt_text});
+      if(retry && result?.submitted===true){
+        const prior=managerWakes[p.batch_id];
+        if(prior && prior.owner===owner && prior.managerTabId===tabId){
+          prior.status='submitted';await saveState();
+        }
+      }
+      return result;
+    }
+    case 'resolve_manager_recovery': {
+      if(p.__trustedPrincipal?.mode!=='profile')throw new Error('Paired manager required');
+      if(!/^[0-9a-f-]{36}$/i.test(p.batch_id||'') ||
+         !['submitted','processed'].includes(p.status))
+        throw new Error('Invalid manager recovery');
+      const tabId=await callerManagerTab(p,await getConfig());
+      const prior=managerWakes[p.batch_id];
+      if(prior && (prior.owner!==owner || prior.managerTabId!==tabId))
+        throw new Error('Manager recovery cannot change an unrelated owner or tab');
+      if(p.status==='submitted'){
+        const proof=await tabMessage(tabId,{
+          cmd:'confirm_manager_batch_sent',batchId:p.batch_id});
+        if(proof?.verified!==true)
+          throw new Error('Sent message was not verified in the managed Parent user turn');
+      }
+      managerWakes[p.batch_id]={owner,managerTabId:tabId,
+        status:p.status,recordedAt:prior?.recordedAt||Date.now()};
+      await saveState();
+      return {recorded:true};
+    }
     case 'wake_manager': {
       if (p.__trustedPrincipal?.mode !== 'profile') throw new Error('Configured profile manager required');
       const cfg = await guard();
@@ -2638,8 +2755,19 @@ async function handleCall(method, p = {}) {
         ? candidates.find((item)=>item.id===p.task_id)
         : current.length===1 ? current[0] : null;
       if (!task) throw new Error('No unambiguous assigned task; supply your actual task_id');
+      // The authenticated Child has invoked complete_task from its ORIGINAL
+      // paired tab, for its own current task and incarnation. That is stronger
+      // proof that the setup prompt reached the Child than a fragile ChatGPT
+      // user-turn DOM selector. Do not infer submission from UI completion.
+      if(!task.submissionConfirmed) {
+        task.submissionConfirmed=true;
+        task.submissionEvidence='AUTHENTICATED_CHILD_COMPLETION';
+        extensionDiagnostic('info','worker.submission_confirmed_by_child_completion',{
+          tabId:agentTabId,taskId:task.id});
+      }
       if (task.status==='done') {
-        task.completionEvidence=task.completionEvidence || 'UI_INFERRED';
+        task.completionEvidence='EXPLICIT_MCP';
+        await saveState();
         return {...summarize(task),already_completed:true,notification_replayed:false};
       }
       if (task.status==='waiting_for_children') {
@@ -2682,6 +2810,68 @@ async function handleCall(method, p = {}) {
       await releaseReadyParentTasks();
       void dispatchQueuedIndependent(p.tab_id);
       return {task_id:task.id,tab_id:p.tab_id,reviewed:true};
+    }
+    case 'confirm_child_pairing_submission': {
+      // Internal Proxy call after a one-time Child pairing code was
+      // consumed against this exact live tab/route/incarnation. Ordinary
+      // ChatGPT MCP methods cannot invoke this Extension-only operation.
+      if(p.__verifiedChildPairing!==true ||
+          p.__sessionBrowserId!==browserSessionId ||
+          !workers.includes(p.tab_id) ||
+          workerIncarnations[p.tab_id]!==p.worker_incarnation_id ||
+          !String(workerOwners[p.tab_id] || '').startsWith('credential:'))
+        throw new Error('Only the original verified Child pairing may confirm submission');
+      const candidates=Object.values(tasks).filter((task)=>
+        task.tabId===p.tab_id && task.owner===workerOwners[p.tab_id] &&
+        task.workerIncarnationId===p.worker_incarnation_id &&
+        ['running','uncertain'].includes(task.status));
+      if(candidates.length!==1)return {verified:false,submission_confirmed:false};
+      const task=candidates[0];
+      if(!task.submissionConfirmed) {
+        task.submissionConfirmed=true;
+        task.submissionEvidence='AUTHENTICATED_CHILD_PAIRING';
+        if(task.status==='uncertain' &&
+            /^(Prompt submission outcome uncertain|Prompt submission receipt lost|.*no new user turn)/i.test(task.error || '')) {
+          task.status='running';
+          delete task.error;
+          delete task.finishedAt;
+        }
+        await saveState();
+        extensionDiagnostic('info','worker.submission_confirmed_by_child_pairing',{
+          tabId:p.tab_id,taskId:task.id});
+      }
+      return {...summarize(task),verified:true};
+    }
+    case 'verify_worker_submission': {
+      // Proxy-internal, read-only verification of a task's exact user turn.
+      // A transport timeout or failed content ACK cannot cause a replay.
+      if(p.__trustedPrincipal?.mode!=='profile' ||
+          !ownedWorker(p.tab_id,owner) ||
+          workerIncarnations[p.tab_id]!==p.worker_incarnation_id)
+        throw new Error('Worker submission verification requires the original owned Child incarnation');
+      const task=tasks[p.task_id];
+      if(!task || task.tabId!==p.tab_id || task.owner!==owner ||
+          task.workerIncarnationId!==p.worker_incarnation_id)
+        throw new Error('Submission verification task identity mismatch');
+      if(!task.submissionConfirmed) {
+        // An authenticated Child may have completed AFTER spawn_worker
+        // returned UNCERTAIN and BEFORE this Proxy next checks the hold.
+        // This also reconciles tasks completed on an earlier Extension build.
+        const explicitChildCompleted=task.completionEvidence==='EXPLICIT_MCP' &&
+          ['done','waiting_for_children'].includes(task.status);
+        const proof=explicitChildCompleted?{ok:true,verified:true}:
+          await tabMessage(p.tab_id,{cmd:'verify_sent_turn',taskId:task.id});
+        if(proof?.ok===true && proof.verified===true) {
+          task.submissionConfirmed=true;
+          task.submissionEvidence=explicitChildCompleted
+            ? 'AUTHENTICATED_CHILD_COMPLETION':'VERIFIED_USER_TURN';
+          await saveState();
+          extensionDiagnostic('info','worker.submission_reconciled',{
+            tabId:p.tab_id,taskId:task.id,
+            proofType:explicitChildCompleted?'EXPLICIT_CHILD_COMPLETION':'USER_TURN'});
+        }
+      }
+      return {...summarize(task),verified:task.submissionConfirmed===true};
     }
     case 'inspect_worker_tasks': {
       // Internal proxy operation: task IDs and statuses are the tool's own
@@ -2806,7 +2996,7 @@ async function connectOnce() {
     wsState = 'registering';
     connectionGeneration++;
     extensionDiagnostic('info','bridge.connected',{connected:true});
-    extensionDiagnostic('info','extension.build_loaded',{build:'worker-diagnostics-20261111-v1'});
+    extensionDiagnostic('info','extension.build_loaded',{build:'parent-send-trace-20261116-v2'});
     proxySettings = null;
     proxySettingsRevision = 0;
     privateQueueMode = 'unknown';
@@ -2892,7 +3082,11 @@ async function connectOnce() {
         wsState = 'invalid proxy settings';
       }
       else if (ws?.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({type: 'settings_applied', revision: msg.revision}));
+        // A legacy extension only ACKs the revision, so the server cannot
+        // know whether this PC's named connector was actually applied.
+        ws.send(JSON.stringify({type:'settings_applied',revision:msg.revision,
+          connector_name:proxySettings.connectorName,
+          routing_capability:'connector_name_routing_v1'}));
       }
       return;
     }
@@ -3258,8 +3452,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       case 'worker_diagnostic': {
         const diagnostic=msg.diagnostic;
+        // Parent initialization uses the same content-script submit path as
+        // Child work. The previous worker-only gate silently dropped every
+        // Parent submit diagnostic. Preserve strict tab/role authorization.
+        const trustedTabId=sender.tab?.id;
+        const workerSource=workers.includes(trustedTabId);
+        const parentSource=approvedParents[trustedTabId] &&
+          approvedParents[trustedTabId]===managerIncarnations[trustedTabId];
         if (sender.id!==chrome.runtime.id || sender.frameId!==0 ||
-            !Number.isSafeInteger(sender.tab?.id) || !workers.includes(sender.tab.id) ||
+            !Number.isSafeInteger(trustedTabId) || (!workerSource && !parentSource) ||
             !diagnostic || typeof diagnostic!=='object' ||
             diagnostic.site!==siteOfUrl(sender.tab.url) || typeof diagnostic.step!=='string' ||
             !/^[a-z][a-z0-9_]{0,63}$/.test(diagnostic.step)) {
@@ -3329,6 +3530,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           'replyOk','responseAccepted','duplicate','submitted','reason','expectedClass',
           'actualClass','expectedCollapsedLength','actualCollapsedLength','collapsedEqual',
           'collapsedFirstDifference','whitespace','allMatchesDisabled']);
+        for(const key of ['method','formPresent','errorCode','draftStillPresent',
+          'userMarkerVisible','traceId','build','snapshot','editorId',
+          'originalEditorId','currentEditorId','failureClass','present',
+          'chosen','value','innerText','textContent','structure','formTag',
+          'childElementCount','paragraphCount','brCount','spaceCount',
+          'tabCount','buttonPresent','buttonEnabled','originalNewlines',
+          'currentNewlines','exactNewlinesToSpaces','evidenceType',
+          'matchedNewTurn','newUserTurnCount','matchedMarker','matchedUserTurn',
+          'draftCleared','copyProjectionPresent'])allowed.add(key);
         const clean=(value,depth=0)=>{
           if(value===null||typeof value==='boolean')return value;
           if(typeof value==='number')return Number.isFinite(value)?value:null;
@@ -3343,7 +3553,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           return output;
         };
         const safe=clean(diagnostic);
-        console.info('[chat-orch:content]',JSON.stringify({...safe,tabId:sender.tab.id}));
+        const milestones=new Set(['submission_begin','page_settled','draft_insert_done',
+          'composer_state_transition','composer_projection_snapshot','send_button_wait_end',
+          'pre_click_composer_validation_rejected','pre_click_button_rejected','send_activation',
+          'send_click_begin','send_click_returned','submission_confirmation_end',
+          'submission_confirmation_evidence',
+          'submission_failure_summary','parent_setup_submission_uncertain',
+          'parent_setup_user_turn_reconciled',
+          'parent_setup_linebreak_normalization_accepted','error']);
+        console[milestones.has(diagnostic.step)?'info':'debug'](
+          '[chat-orch:trace]',JSON.stringify({...safe,tabId:sender.tab.id}));
         sendResponse({ok:true});
         break;
       }
@@ -3484,6 +3703,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       case 'create_pairing_offer': {
         if (ws?.readyState !== WebSocket.OPEN || wsState !== 'connected')
           throw new Error('Connect the local Proxy before pairing');
+        // Fail before marking this tab approved or minting a one-time code.
+        const connectorGuidance=requireConnectorRoutingReady();
         // The in-page Yes comes from its own tab; the extension popup has no
         // sender.tab and continues to use the currently selected browser tab.
         const [active] = sender.id===chrome.runtime.id &&
@@ -3491,6 +3712,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           ? [sender.tab] : await chrome.tabs.query({active:true,currentWindow:true});
         if (!active?.id || siteOfUrl(active.url) !== 'chatgpt')
           throw new Error('Select a ChatGPT tab first');
+        extensionDiagnostic('info','parent_setup.approval_received',{
+          tabId:active.id,site:'chatgpt',phase:'approval'});
         const live = await inspectChatTab(active.id);
         const route=normalizedClosedTabUrl(active.url);
         if(route)workerUrls[active.id]=route;
@@ -3523,6 +3746,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           code,tab_id:live.tab_id,incarnation_id:live.incarnation_id,
           route_hash:live.route_hash}));
         await acknowledgment;
+        extensionDiagnostic('info','parent_setup.pairing_offer_accepted',{
+          tabId:active.id,phase:'offered'});
         if (live.is_managed_worker) {
           sendResponse({ok:true,code,tab_id:active.id,role:'child'});
           break;
@@ -3530,12 +3755,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const setup=parentInitializations[active.id];
         setup.status='DISPATCHING';
         await saveState();
+        extensionDiagnostic('info','parent_setup.dispatch_begin',{
+          tabId:active.id,phase:'dispatching'});
         const prompt='<chat_orchestrator_parent_setup>\n'
           +'This is the user-approved Parent Agent conversation. '
-          +'Call the pair_conversation MCP tool once using pairing code '+code+
+          +connectorGuidance+' '
+          +'Call the pair_conversation MCP tool from connector "'+
+          proxySettings.connectorName+'" once using pairing code '+code+
           ' and a new UUID idempotency_key. Keep the returned agent_credential '
           +'private and supply it in later Chat Orchestrator tool calls; use '
           +'a fresh UUID idempotency_key for each new operation. '
+          +'After delegating child tasks, end your current response and stay idle instead of repeatedly polling get_result or task status. The orchestrator delivers completion notifications; review results when notified and yield again if other children are still running. '
           +'This message alone does not authenticate a Parent.\n'
           +'</chat_orchestrator_parent_setup>';
         let sent;
@@ -3545,13 +3775,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               current.route_hash!==live.route_hash)
             throw new Error('Parent tab changed after user approval');
           await confirmTabIdle(active.id);
+          extensionDiagnostic('info','parent_setup.idle_verified',{
+            tabId:active.id,phase:'idle_verified'});
           sent=await tabMessage(active.id,{
             cmd:'submit_parent_initialization',text:prompt,marker:code});
-        } catch {
+        } catch(error) {
+          extensionDiagnostic('warn','parent_setup.dispatch_error',{
+            tabId:active.id,phase:'dispatching',
+            errorType:error?.name||'Error'});
           sent={ok:false,uncertain:true};
         }
         setup.status=sent?.ok===true && sent.submitted===true
           ? 'SENT':'UNCERTAIN';
+        extensionDiagnostic(setup.status==='SENT'?'info':'warn','parent_setup.dispatch_result',{
+          tabId:active.id,phase:'completed',status:setup.status,
+          replyOk:sent?.ok===true,uncertain:sent?.uncertain===true});
         await saveState();
         sendResponse({ok:true,code,tab_id:active.id,role:'parent',
           initialization_status:setup.status,paired:false});

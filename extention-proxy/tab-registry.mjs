@@ -241,6 +241,22 @@ export function createTabRegistry(file, {sessionOnly = false} = {}) {
     return updated;
   }
 
+  function confirmSubmitted(tabId,expectedIncarnationId,sessionId) {
+    // The normal uncertain phase is terminal. Its ONLY exception is a
+    // separately verified user-turn proof for the same live Child identity.
+    // Do not widen setPhase() into arbitrary uncertain -> started transitions.
+    const table=tableFor(sessionId);
+    const record=table.get(tabId);
+    if(!record || record.parentTabId===null ||
+        record.incarnationId!==expectedIncarnationId ||
+        record.browserSessionId!==sessionId ||
+        record.phase!=='uncertain')
+      throw new Error('Verified submission recovery requires the original uncertain Child');
+    const updated=Object.freeze({...record,phase:'started'});
+    table.set(tabId,updated);
+    return updated;
+  }
+
   function mutate(action, sessionId) {
     const operation = serial.then(async () => {
       if (closed) throw new Error('Tab registry session is closed');
@@ -264,6 +280,8 @@ export function createTabRegistry(file, {sessionOnly = false} = {}) {
     hasChildren,
     detachSubtree:(tabId,sessionId)=>mutate(()=>detachSubtree(tabId,sessionId),sessionId),
     setPhase:(tabId,phase,sessionId)=>mutate(()=>setPhase(tabId,phase,sessionId),sessionId),
+    confirmSubmitted:(tabId,expectedIncarnationId,sessionId)=>
+      mutate(()=>confirmSubmitted(tabId,expectedIncarnationId,sessionId),sessionId),
     registerRoot:(inspection)=>mutate(()=>registerRoot(inspection),inspection.browser_session_id),
     reconcileRoot:(inspection,expectedIncarnationId)=>mutate(()=>
       reconcileRoot(inspection,expectedIncarnationId),inspection.browser_session_id),

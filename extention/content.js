@@ -28,11 +28,14 @@
       send: ['button[data-testid="send-button"]', 'button[aria-label="Send prompt"]'],
       stop: ['button[data-testid="stop-button"]', 'button[aria-label="Stop streaming"]', 'button[aria-label*="stop" i]'],
       assistant: [
+        '[data-response-body]',
         '[data-message-author-role="assistant"]',
         'article[data-turn="assistant"]',
         '[data-testid^="conversation-turn-"] .markdown',
       ],
-      user: ['[data-message-author-role="user"]', 'article[data-turn="user"]', 'li[data-message-role="user"]'],
+      user: ['[data-user-message-bubble="true"]',
+        '[data-message-author-role="user"]', 'article[data-turn="user"]',
+        'li[data-message-role="user"]'],
       streamingAttr: null,
     },
     claude: {
@@ -57,11 +60,26 @@
     },
   };
   const A = CONFIGS[site];
+  const CONTENT_BUILD='worker-submit-modern-turns-20261116-v5';
+  // These milestones remain readable even when the full low-level trace is
+  // noisy. Detailed steps are still available in the Console at Debug level.
+  const TRACE_MILESTONES=new Set(['submission_begin','page_settled','draft_insert_done',
+    'composer_state_transition','composer_projection_snapshot',
+    'send_button_wait_end','pre_click_composer_validation_rejected',
+    'pre_click_button_rejected','send_activation','send_click_begin',
+    'send_click_returned','submission_confirmation_end','submission_failure_summary',
+    'submission_confirmation_evidence',
+    'parent_setup_submission_uncertain','parent_setup_user_turn_reconciled',
+    'parent_setup_linebreak_normalization_accepted']);
+  let traceSequence=0;
+  let activeTraceId=null;
   const logStep = (taskId, step, data = {}) => {
     // Only send the deliberately redacted diagnostics built below. Never send
     // text, prompts, URLs, DOM HTML, arbitrary exception messages or transcripts.
-    const event = {site,taskId,step,at:Date.now(),...data};
-    console[step === 'error' ? 'warn' : 'info']('[chat-orch:content]',event);
+    const event = {site,taskId,step,at:Date.now(),traceId:activeTraceId,...data};
+    if(TRACE_MILESTONES.has(step) || step==='error')
+      console[step==='error'?'warn':'info']('[chat-orch:trace]',JSON.stringify(event));
+    else console.debug?.('[chat-orch:detail]',event);
     try {
       void chrome.runtime.sendMessage({type:'worker_diagnostic',diagnostic:event})
         ?.catch?.(()=>{});
@@ -86,6 +104,17 @@
       collapsedEqual:actualCollapsed===expectedCollapsed,
       collapsedFirstDifference:actualCollapsed===expectedCollapsed?null:
         firstDifference(actualCollapsed,expectedCollapsed)};
+  }
+  // ChatGPT's contenteditable can replace inserted line breaks with spaces
+  // during React's input reaction (for BOTH Parent and Child prompts).
+  // Accept ONLY the exact LF -> ASCII-space transformation of a draft that
+  // this extension just inserted. Arbitrary whitespace or text drift fails.
+  function parentSetupDraftMatches(el,expected,insertedByUs,taskId) {
+    const actual=composerText(el);
+    if(actual===expected)return true;
+    return site==='chatgpt' && insertedByUs &&
+      el?.tagName==='DIV' && expected.includes('\n') &&
+      actual===expected.replace(/\n/g,' ');
   }
 
   function textShape(value) {
@@ -255,16 +284,94 @@
   }
 
   const verifiedAssistantNodes = () => site === 'chatgpt'
-    ? all(['[data-message-author-role="assistant"]', 'article[data-turn="assistant"]',
+    ? all(['[data-response-body]','[data-message-author-role="assistant"]',
+        'article[data-turn="assistant"]',
         'li[data-message-role="assistant"]']) : assistantNodes();
   const assistantNodes = () => all(A.assistant);
   const userNodes = () => all(A.user);
+  // ChatGPT can put a user-message affordance on the turn wrapper instead
+  // of a data-message-author-role=user element. Restrict the fallback to
+  // actual user turns; page-wide text and assistant responses are not proof.
+  function submissionUserNodes() {
+    const nodes=userNodes();
+    if(site!=='chatgpt')return nodes;
+    for(const turn of document.querySelectorAll('[data-testid^="conversation-turn-"]')) {
+      if(turn.getAttribute?.('data-message-author-role')==='user' ||
+          turn.querySelector?.('[data-message-author-role="user"],[data-user-message-copy]'))
+        nodes.push(turn);
+    }
+    return [...new Set(nodes)];
+  }
+  // Use the same message-copy projection as readChat(). ChatGPT frequently
+  // renders a shortened bubble while its data-user-message-copy child keeps
+  // the full submitted text. innerText of the outer turn is not dependable.
+  function submittedUserText(node) {
+    if(!node)return '';
+    const copy=node.querySelector?.('[data-user-message-copy]') ||
+      node.querySelector?.('[data-user-message-bubble="true"]');
+    return String(copy?.textContent || copy?.innerText ||
+      node.textContent || node.innerText || '');
+  }
+  const userTurnHasMarker=(marker)=>submissionUserNodes().some((node)=>
+    submittedUserText(node).includes(marker));
+  const submissionMarkerFor=(expected,taskId)=>
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(taskId||'') &&
+    expected.includes(taskId) ? taskId : null;
   const isGenerating = () =>
     !!q(A.stop) || (A.streamingAttr ? !!document.querySelector(A.streamingAttr) : false);
+  // New ChatGPT tabs start at / and receive a fresh, server-assigned /c/UUID
+  // route after an accepted first prompt. Only the shape of the route is
+  // observed: never log the URL or conversation identifier.
+  const chatgptConversationRoute = () => {
+    if(site!=='chatgpt')return null;
+    const match=String(location.pathname || '')
+      .match(/(?:^|\/)c\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:\/|$)/i);
+    return match?.[1] || null;
+  };
 
   const normalizePrompt = (text) => String(text ?? '').replace(/\r\n?/g,'\n').replace(/\u00a0/g,' ').trim();
   const composerText = (el) => !el ? '' : normalizePrompt(
     el.value !== undefined ? el.value : el.innerText ?? el.textContent);
+  const editorIdentities=new WeakMap();
+  let editorSerial=0;
+  function editorIdentity(el) {
+    if(!el)return null;
+    if(!editorIdentities.has(el))editorIdentities.set(el,++editorSerial);
+    return editorIdentities.get(el);
+  }
+  // Only lengths, Unicode code-point classes, editor identities and DOM shape
+  // are recorded. Never record draft text, pairing codes, URLs or DOM HTML.
+  function projectionShape(raw,expected) {
+    if(typeof raw!=='string')return {present:false};
+    const value=normalizePrompt(raw);
+    return {present:true,length:value.length,
+      newlineCount:(value.match(/\n/g)||[]).length,
+      spaceCount:(value.match(/ /g)||[]).length,
+      tabCount:(value.match(/\t/g)||[]).length,
+      exactMatch:value===expected,
+      whitespaceMatch:whitespaceDiagnostics(value,expected).collapsedEqual,
+      firstDifference:value===expected?null:firstDifference(value,expected)};
+  }
+  function composerTraceSnapshot(el,expected) {
+    if(!el)return {present:false};
+    const value=el.value,inner=el.innerText,content=el.textContent;
+    const chosen=composerText(el);
+    const form=el.closest?.('form');
+    const structure={
+      childElementCount:el.childElementCount ?? null,
+      paragraphCount:el.querySelectorAll?.('p')?.length ?? null,
+      brCount:el.querySelectorAll?.('br')?.length ?? null,
+    };
+    return {present:true,editorId:editorIdentity(el),tag:el.tagName,
+      connected:el.isConnected ?? null,active:document.activeElement===el,
+      contentEditable:el.getAttribute?.('contenteditable') || null,
+      formPresent:Boolean(form),formTag:form?.tagName||null,
+      chosen:projectionShape(chosen,expected),
+      value:projectionShape(value,expected),
+      innerText:projectionShape(inner,expected),
+      textContent:projectionShape(content,expected),
+      structure};
+  }
   const buttonEnabled = (b) => !!b && !b.disabled &&
     b.getAttribute('aria-disabled') !== 'true' &&
     b.getAttribute('data-disabled') !== 'true' &&
@@ -346,6 +453,25 @@
     const global=select(document,'document');
     logStep(taskId,'send_button_lookup_end',{scope:'document',selected:Boolean(global.button)});
     return global.button;
+  }
+
+  // ChatGPT's native form-submit path is more reliable than an isolated-world
+  // button.click() for a Send control whose HTML type is "submit". Use one
+  // submission method only: never retry by clicking after requestSubmit(),
+  // since the first attempt may already have created a chat turn.
+  function activateSendOnce(button,composer,taskId) {
+    const form=button?.form || composer?.closest?.('form') || null;
+    const type=String(button?.type || button?.getAttribute?.('type') || '').toLowerCase();
+    if(site==='chatgpt' && form && type==='submit' &&
+        typeof form.requestSubmit==='function' &&
+        (!button.form || button.form===form)) {
+      logStep(taskId,'send_activation',{method:'form_request_submit',formPresent:true});
+      form.requestSubmit(button);
+      return 'form_request_submit';
+    }
+    logStep(taskId,'send_activation',{method:'button_click',formPresent:Boolean(form)});
+    button.click();
+    return 'button_click';
   }
 
   function lastAssistantText() {
@@ -493,14 +619,18 @@
       exact:composerText(el)===normalizePrompt(text)});
   }
 
-  // Use the provider's enabled DOM Send button, as in the original extension.
-  // Perform only one click; if delivery cannot be confirmed, do not retry.
+  // Submit only once through the provider's enabled Send control. Prefer
+  // native form submission for a real submit button, otherwise click. Never
+  // retry a side effect automatically if delivery cannot be confirmed.
   async function sendPrompt(text, taskId) {
     let submitAttempted = false;
     let insertedByUs = false;
     let stage = 'composer_wait';
+    let input=null; // Retained across try/catch for post-failure editor diagnostics.
+    const thisTraceId=Date.now().toString(36)+'-'+(++traceSequence).toString(36);
+    activeTraceId=thisTraceId;
     logStep(taskId, 'submission_begin', {textLength:String(text ?? '').length,
-      documentReady:pageReadyForSubmission()});
+      documentReady:pageReadyForSubmission(),build:CONTENT_BUILD});
     logStep(taskId, 'composer_wait', {documentReady:pageReadyForSubmission(),
       composers:composerDiagnostics(text,taskId)});
     try {
@@ -551,10 +681,12 @@
     }
     // A provider can replace the editor while the document settles. Never
     // type into an orphaned composer captured before that wait.
-    const input = q(A.input);
+    input = q(A.input);
     logStep(taskId,'composer_reacquired_after_settle',{found:Boolean(input),
       sameAsBefore:input===ready,connected:input?.isConnected ?? null,
       pageReady:pageReadyForSubmission(),composer:composerDiagnostics(text,taskId)});
+    logStep(taskId,'composer_projection_snapshot',{phase:'before_draft',
+      snapshot:composerTraceSnapshot(input,normalizePrompt(text))});
     if (!input || !pageReadyForSubmission()) {
       logStep(taskId,'composer_reacquire_rejected',{found:Boolean(input),pageReady:pageReadyForSubmission()});
       throw new Error('Chat composer changed during page settling; no prompt sent');
@@ -575,7 +707,16 @@
       error.code = 'COMPOSER_DRAFT_MISMATCH';
       throw error;
     }
-    const userBefore = userNodes().length;
+    const userNodesBefore=submissionUserNodes();
+    const userBefore = userNodesBefore.length;
+    const oldUserNodes=new Set(userNodesBefore);
+    const submissionMarker=submissionMarkerFor(expected,taskId);
+    const markerVisibleBefore=Boolean(submissionMarker && userTurnHasMarker(submissionMarker));
+    if(markerVisibleBefore) {
+      const error=new Error('This task is already visible in a sent user turn; refusing duplicate submission');
+      error.code='SUBMISSION_UNCERTAIN';
+      throw error;
+    }
     if (previousDraft === expected && previousDraft) {
       logStep(taskId,'draft_check_accepted',{reason:'EXACT_EXISTING_TASK_DRAFT',draftLength:previousDraft.length});
     }
@@ -586,13 +727,17 @@
       logStep(taskId,'draft_insert_begin',{composer:composerDiagnostics(text,taskId)});
       setInputText(input,text,taskId);
       logStep(taskId,'draft_insert_done',{composer:composerDiagnostics(text,taskId),sendButtons:sendButtonDiagnostics(input)});
+      logStep(taskId,'composer_projection_snapshot',{phase:'immediately_after_insert',
+        snapshot:composerTraceSnapshot(input,expected)});
     }
     logStep(taskId,'send_button_preparation_wait_begin',{delayMs:250});
     await sleep(250);
     logStep(taskId,'send_button_preparation_wait_end',{composer:composerDiagnostics(text,taskId)});
+    logStep(taskId,'composer_projection_snapshot',{phase:'after_input_reaction',
+      snapshot:composerTraceSnapshot(q(A.input),expected)});
     stage = 'send_button_wait';
     const sendWaitStarted=Date.now();
-    let sendPolls=0,lastSendSignature='';
+    let sendPolls=0,lastSendSignature='',lastEditorSignature='';
     logStep(taskId,'send_button_wait_begin',{timeoutMs:6500,pollIntervalMs:200});
     const button = await waitFor(() => {
       sendPolls++;
@@ -605,6 +750,19 @@
         draftLength:composerText(currentInput).length,draftMatches:composerText(currentInput)===expected});
       const found=pageReadyForSubmission() && !accountChanged
         ? findSendButton(currentInput,taskId) : null;
+      const currentSnapshot=composerTraceSnapshot(currentInput,expected);
+      const editorSignature=JSON.stringify({editorId:currentSnapshot.editorId,
+        tag:currentSnapshot.tag,connected:currentSnapshot.connected,
+        chosen:currentSnapshot.chosen,
+        buttonPresent:Boolean(found),buttonEnabled:buttonEnabled(found)});
+      if(editorSignature!==lastEditorSignature) {
+        logStep(taskId,'composer_state_transition',{phase:'send_wait',
+          poll:sendPolls,elapsedMs:Date.now()-sendWaitStarted,
+          originalEditorId:editorIdentity(input),currentEditorId:editorIdentity(currentInput),
+          snapshot:currentSnapshot,buttonPresent:Boolean(found),
+          buttonEnabled:buttonEnabled(found)});
+        lastEditorSignature=editorSignature;
+      }
       const signature=JSON.stringify({ready:pageReadyForSubmission(),accountChanged,
         button:Boolean(found),enabled:found?buttonEnabled(found):false,
         draftLength:composerText(currentInput).length});
@@ -632,25 +790,44 @@
         ', chars=' + composerText(input).length + ', buttons=' + JSON.stringify(inspected));
     }
     const currentInput=q(A.input);
+    logStep(taskId,'composer_projection_snapshot',{phase:'pre_submit',
+      originalEditorId:editorIdentity(input),snapshot:composerTraceSnapshot(currentInput,expected)});
     logStep(taskId,'pre_click_validation',{sameComposer:currentInput===input,
       documentReady:document.readyState,accountChanged:chatgptAccountChanged(),
       matchesTask:composerText(currentInput)===expected,
       composer:composerDiagnostics(text,taskId),buttons:sendButtonDiagnostics(currentInput)});
     const finalPageReady=pageReadyForSubmission();
     const finalAccountChanged=chatgptAccountChanged();
+    const tabHidden=document.visibilityState==='hidden';
     logStep(taskId,'pre_click_page_validation',{pageReady:finalPageReady,
-      documentReady:document.readyState,accountChanged:finalAccountChanged});
-    if (!finalPageReady || finalAccountChanged) {
-      logStep(taskId,'pre_click_page_validation_rejected',{reason:!finalPageReady?'PAGE_NOT_READY':'ACCOUNT_CHANGED'});
+      documentReady:document.readyState,accountChanged:finalAccountChanged,
+      tabHidden});
+    if (!finalPageReady || finalAccountChanged || tabHidden) {
+      logStep(taskId,'pre_click_page_validation_rejected',{reason:tabHidden?'TAB_NOT_VISIBLE':
+        !finalPageReady?'PAGE_NOT_READY':'ACCOUNT_CHANGED'});
       throw new Error('Chat page changed readiness before submission; no message sent');
     }
-    if (!currentInput || currentInput!==input || composerText(currentInput)!==expected) {
+    const parentDraftMatches=parentSetupDraftMatches(currentInput,expected,insertedByUs,taskId);
+    if (!currentInput || currentInput!==input || !parentDraftMatches) {
+      const failureClass=!currentInput?'COMPOSER_MISSING':
+        currentInput!==input?'EDITOR_REPLACED_AFTER_INSERT':
+        whitespaceDiagnostics(composerText(currentInput),expected).collapsedEqual
+          ? 'WHITESPACE_RENDERING_DRIFT':'PROMPT_CONTENT_CHANGED';
       logStep(taskId,'pre_click_composer_validation_rejected',{inputPresent:Boolean(currentInput),
         sameComposer:currentInput===input,draftLength:composerText(currentInput).length,
-        expectedLength:expected.length,whitespace:whitespaceDiagnostics(composerText(currentInput),expected)});
+        expectedLength:expected.length,whitespace:whitespaceDiagnostics(composerText(currentInput),expected),
+        failureClass,originalEditorId:editorIdentity(input),
+        currentEditorId:editorIdentity(currentInput),
+        snapshot:composerTraceSnapshot(currentInput,expected)});
       const error=new Error('Chat composer changed before Send; no prompt submitted');
       error.code='COMPOSER_DRAFT_MISMATCH';
       throw error;
+    }
+    if (composerText(currentInput)!==expected) {
+      logStep(taskId,'linebreak_normalization_accepted',{
+        originalNewlines:(expected.match(/\n/g)||[]).length,
+        currentNewlines:(composerText(currentInput).match(/\n/g)||[]).length,
+        exactNewlinesToSpaces:true});
     }
     // No second network-idle gate after inserting the prompt: the page may
     // legitimately start background requests while the enabled Send control
@@ -660,7 +837,7 @@
       throw new Error('Composer submit control disappeared before click; no prompt sent');
     }
     const buttonEnabledAtClick=buttonEnabled(button);
-    const composerMatchesAtClick=composerText(input)===expected;
+    const composerMatchesAtClick=parentSetupDraftMatches(input,expected,insertedByUs,taskId);
     logStep(taskId,'pre_click_controls_validated',{buttonConnected:button.isConnected ?? null,
       buttonEnabled:buttonEnabledAtClick,composerMatches:composerMatchesAtClick,
       draftLength:composerText(input).length,expectedLength:expected.length,
@@ -670,12 +847,17 @@
       throw new Error('Composer changed or Send became disabled before click; no prompt sent');
     }
     stage = 'send_click';
+    const startedAtFreshChatRoot=site==='chatgpt' &&
+      String(location.pathname || '')==='/';
+    const initialConversationRoute=chatgptConversationRoute();
+    const generatingBeforeSend=isGenerating();
     logStep(taskId, stage, {testId:button.getAttribute('data-testid'),
-      enabled:buttonEnabled(button), userTurnsBefore:userBefore});
+      enabled:buttonEnabled(button), userTurnsBefore:userBefore,
+      startedInNewChat:startedAtFreshChatRoot,generatingBeforeSend});
     submitAttempted = true;
     logStep(taskId,'send_click_begin',{userTurnsBefore:userBefore,
       testId:button.getAttribute('data-testid'),ariaLabel:button.getAttribute('aria-label')});
-    try { button.click(); }
+    try { activateSendOnce(button,input,taskId); }
     catch(error) {
       logStep(taskId,'send_click_error',{errorType:error?.name || 'Error'});
       throw error;
@@ -689,17 +871,78 @@
       userTurnsBefore:userBefore});
     const confirmed = await waitFor(() => {
       confirmationPolls++;
-      const userTurnCount=userNodes().length;
+      const currentUserNodes=submissionUserNodes();
+      const userTurnCount=currentUserNodes.length;
       const generating=isGenerating();
       const accountChanged=chatgptAccountChanged();
-      const signature=[userTurnCount,generating,accountChanged].join(':');
+      const draftAfterClick=composerText(q(A.input));
+      const newUserNodes=currentUserNodes.filter((node)=>!oldUserNodes.has(node) &&
+        submittedUserText(node).trim().length>0);
+      const matchedMarker=Boolean(submissionMarker && !markerVisibleBefore &&
+        currentUserNodes.some((node)=>
+          submittedUserText(node).includes(submissionMarker)));
+      const matchedUserTurn=matchedMarker || (userTurnCount>userBefore &&
+        currentUserNodes.slice(userBefore).some((node)=>{
+          const rendered=normalizePrompt(submittedUserText(node));
+          return rendered===expected || whitespaceDiagnostics(rendered,expected).collapsedEqual;
+        }));
+      // On a newly prepared Child the sent-message UI can show only a
+      // collapsed preview, hiding the UUID and/or most of the prompt. If the
+      // exact draft was inserted by us, we activated its Send control ONCE,
+      // the composer is now empty AND an actual new user turn appeared,
+      // those independent DOM transitions confirm that submission happened.
+      // Do not apply this fallback to pre-existing drafts or old turns.
+      const matchedNewTurn=Boolean(site==='chatgpt' && insertedByUs &&
+        submissionMarker && userTurnCount>userBefore &&
+        newUserNodes.length>0 && draftAfterClick==='' &&
+        !accountChanged);
+      // The CURRENT ChatGPT UI can expose zero user-turn elements even after
+      // accepting a prompt (and even to read_chat). For an Extension-owned
+      // FIRST message on a fresh / chat, use independent browser evidence:
+      // the old route had no conversation ID, a NEW /c/UUID appeared after
+      // exactly one Send, the composer cleared, and generation newly started.
+      // None of those signals alone is sufficient. Existing conversations
+      // cannot use this fallback; never accept only a spinner or empty draft.
+      const conversationRouteAfterSend=chatgptConversationRoute();
+      const freshChatSendEvidence=Boolean(site==='chatgpt' && insertedByUs &&
+        submissionMarker && startedAtFreshChatRoot && userBefore===0 &&
+        !generatingBeforeSend && generating && draftAfterClick==='' && !accountChanged);
+      const matchedFirstConversationRoute=Boolean(freshChatSendEvidence &&
+        initialConversationRoute===null &&
+        conversationRouteAfterSend!==null && !generatingBeforeSend &&
+        generating && draftAfterClick==='');
+      const accepted=matchedUserTurn || matchedNewTurn ||
+        matchedFirstConversationRoute;
+      if(accepted) {
+        logStep(taskId,'submission_confirmation_evidence',{
+          evidenceType:matchedMarker?'TASK_MARKER_IN_USER_TURN'
+            : matchedUserTurn?'EXACT_RENDERED_USER_TURN'
+            : matchedNewTurn?'NEW_USER_TURN_AND_CLEARED_COMPOSER'
+            : 'NEW_CONVERSATION_ROUTE_AND_GENERATION',
+          newUserTurnCount:newUserNodes.length,
+          draftCleared:draftAfterClick==='',
+          newConversationRoute:matchedFirstConversationRoute,
+          copyProjectionPresent:currentUserNodes.some((node)=>
+            Boolean(node.querySelector?.('[data-user-message-copy]')))});
+      }
+      const signature=[userTurnCount,generating,accountChanged,matchedMarker,
+        matchedNewTurn,matchedFirstConversationRoute,draftAfterClick.length].join(':');
       if(signature!==lastConfirmationSignature){
         logStep(taskId,'submission_confirmation_poll',{poll:confirmationPolls,
           elapsedMs:Date.now()-confirmationStarted,userTurnCount,userTurnsBefore:userBefore,
-          generating,accountChanged,draftLength:composerText(q(A.input)).length});
+          generating,accountChanged,matchedUserTurn,matchedMarker,
+          matchedNewTurn,matchedFirstConversationRoute,
+          newConversationRoute:conversationRouteAfterSend!==null &&
+            conversationRouteAfterSend!==initialConversationRoute,
+          newUserTurnCount:newUserNodes.length,
+          draftCleared:draftAfterClick==='',draftLength:draftAfterClick.length,
+          copyProjectionPresent:newUserNodes.some((node)=>
+            Boolean(node.querySelector?.('[data-user-message-copy]')))});
         lastConfirmationSignature=signature;
       }
-      return userTurnCount>userBefore||generating||accountChanged;
+      // Generation alone can be stale or unrelated. Verify this prompt
+      // actually appeared as a new user turn, not just a page transition.
+      return accepted||accountChanged;
     },12000,200);
     logStep(taskId,'submission_confirmation_end',{confirmed:Boolean(confirmed),
       polls:confirmationPolls,durationMs:Date.now()-confirmationStarted,
@@ -725,11 +968,30 @@
         } catch {}
       }
       logStep(taskId, 'error', {stage, code:error?.code || 'UNCLASSIFIED',
-        reason:stage === 'send_button_wait' ? 'NO_ENABLED_SEND_BUTTON' :
+        reason:error?.code==='COMPOSER_DRAFT_MISMATCH'?'COMPOSER_DRAFT_MISMATCH' :
+          stage === 'send_button_wait' ? 'NO_ENABLED_SEND_BUTTON' :
           stage === 'submission_confirmation' ? 'NO_CONFIRMED_USER_TURN' :
           'SUBMISSION_STEP_FAILED', submitAttempted, insertedByUs,
         draftLength:composerText(q(A.input)).length, userTurns:userNodes().length,
         buttons,composer:composerDiagnostics(text,taskId),sendButtons:sendButtonDiagnostics(q(A.input))});
+      const failedEditor=q(A.input);
+      const expectedAtFailure=normalizePrompt(text);
+      const failedText=composerText(failedEditor);
+      const failureClass=!failedEditor?'COMPOSER_MISSING':
+        failedEditor!==input?'EDITOR_REPLACED_AFTER_INSERT':
+        failedText!==expectedAtFailure
+          ? (whitespaceDiagnostics(failedText,expectedAtFailure).collapsedEqual
+            ? 'WHITESPACE_RENDERING_DRIFT':'PROMPT_CONTENT_CHANGED')
+          : (stage==='send_button_wait'?'SEND_CONTROL_NOT_READY':
+            stage==='submission_confirmation'?'SUBMISSION_UNCONFIRMED':
+            error?.code||'SUBMISSION_STEP_FAILED');
+      logStep(taskId,'submission_failure_summary',{stage,
+        errorCode:error?.code||'UNCLASSIFIED',failureClass,
+        submitAttempted,insertedByUs,originalEditorId:editorIdentity(input),
+        currentEditorId:editorIdentity(failedEditor),
+        snapshot:composerTraceSnapshot(failedEditor,expectedAtFailure),
+        sendButtons:sendButtonDiagnostics(failedEditor),
+        userTurnCount:userNodes().length});
       if (error.code === 'SUBMISSION_NOT_ATTEMPTED') submitAttempted = false;
       if (!submitAttempted) {
         // Preserve pre-existing task drafts; clear only text we just inserted.
@@ -765,6 +1027,8 @@
         logStep(taskId,'submission_marked_uncertain',{stage,reason:'CLICK_ALREADY_ATTEMPTED'});
       }
       throw error;
+    } finally {
+      if(activeTraceId===thisTraceId)activeTraceId=null;
     }
   }
 
@@ -864,6 +1128,23 @@
   function readChat(lastN) {
     let msgs;
     if (site === 'chatgpt') {
+      // Modern ChatGPT DOM (verified against a captured conversation page):
+      // message bodies use separate user bubbles and assistant response
+      // bodies, while the old data-message-author-role attributes are absent.
+      // Reading these LEAVES in document order avoids duplicate accessible
+      // "You said"/"ChatGPT said" headings and DIL wrapper controls.
+      const modern=[...document.querySelectorAll(
+        '[data-user-message-bubble="true"], [data-response-body]')];
+      if(modern.length) {
+        msgs=modern.map((node)=>{
+          const user=node.matches('[data-user-message-bubble="true"]');
+          const body=user?node:
+            node.querySelector('[data-dil-response]') ||
+            node.querySelector('[data-markdown-text-style="assistant-message"]') || node;
+          return {role:user?'user':'assistant',
+            text:String(body.textContent || body.innerText || '').trim()};
+        }).filter((message)=>message.text);
+      } else {
       const roleOf = (n) => (
         n.getAttribute('data-message-role') ||
         n.getAttribute('data-message-author-role') ||
@@ -927,6 +1208,7 @@
         }
         msgs.push({ role: roleOf(n) || 'assistant', text });
       }
+      }
     } else {
       const userSel = A.user.join(',');
       const nodes = all([...A.user, ...A.assistant]);
@@ -949,7 +1231,7 @@
     const main = document.querySelector('main');
     return {
       site,
-      submissionTransport:'dom-button-click-v1',
+      submissionTransport:'native-form-submit-or-button-click-v2',
       taskDraftPolicy:'exact-match-only',
       url: location.href,
       input: count(A.input),
@@ -963,6 +1245,8 @@
       sendButton: btn
         ? {
             enabled: buttonEnabled(btn),
+            type: btn.type || btn.getAttribute('type') || null,
+            formPresent: Boolean(btn.form || input?.closest?.('form')),
             ariaLabel: btn.getAttribute('aria-label'),
             testId: btn.getAttribute('data-testid'),
           }
@@ -992,7 +1276,20 @@
   // ------------------------------------------------------------- run loop
   let busy = false;
   let completionReceiptUncertain = false;
+  let pendingParentSetupMarker = null;
+  function reconcileManualParentSetup(){
+    if(!pendingParentSetupMarker)return;
+    // A unique pairing code in an actual user turn (not the draft) proves
+    // that a human or the browser ultimately sent this one setup message.
+    // Only lift the Parent setup uncertainty; never replay a chat submit.
+    const sent=userTurnHasMarker(pendingParentSetupMarker);
+    if(!sent)return;
+    pendingParentSetupMarker=null;
+    completionReceiptUncertain=false;
+    logStep('parent_setup','parent_setup_user_turn_reconciled',{sent:true});
+  }
   function observeState(expectedText = null) {
+    reconcileManualParentSetup();
     const input = q(A.input);
     const generating = isGenerating();
     const draft = composerText(input);
@@ -1113,8 +1410,7 @@
     const batchMarker = /"batch_id":"([0-9a-f-]{36})"/i.exec(text)?.[1];
     if (!batchMarker) return { ok: false, uncertain: false, error: 'Manager batch ID missing' };
     const markerVisible = () => {
-      if (userNodes().some((node) =>
-        String(node.innerText || node.textContent || '').includes(batchMarker))) return true;
+      if (userTurnHasMarker(batchMarker)) return true;
       // UI variants may not expose a user-role selector. A visible chat marker
       // counts only after it has left the active composer.
       const inPage = String(document.body?.innerText || '').includes(batchMarker);
@@ -1144,6 +1440,85 @@
     }
   }
 
+  // Read-only, user-turn-only recovery proof. A composer draft, empty input,
+  // assistant response or page-wide text never proves manager delivery.
+  function inspectManagerBatch(marker,text) {
+    const valid=site==='chatgpt' &&
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(marker||'') &&
+      typeof text==='string' && text.includes(marker) && text.length<=60000;
+    if(!valid)return {ok:false,verified:false,reason:'INVALID_BATCH'};
+    const draft=composerText(q(A.input));
+    return {ok:true,verified:userTurnHasMarker(marker) && !chatgptAccountChanged(),
+      matchingDraft:!!draft && draft===normalizePrompt(text),
+      accountChanged:chatgptAccountChanged(),generating:isGenerating(),
+      documentReady:pageReadyForSubmission(),draftPresent:!!draft};
+  }
+
+  // Explicit, already journaled Skip: delete ONLY the original batch draft.
+  // The DOM input event also updates the framework's controlled editor.
+  function clearManagerBatchDraft(marker,text) {
+    const evidence=inspectManagerBatch(marker,text);
+    if(!evidence.ok)return {...evidence,cleared:false};
+    if(!evidence.matchingDraft) {
+      // This batch was explicitly skipped by the trusted Desktop operator.
+      // Another user's draft remains untouched and still blocks new sends.
+      if(!pendingParentSetupMarker)completionReceiptUncertain=false;
+      return {ok:true,cleared:false,matchingDraft:false,
+        verified:evidence.verified,draftPresent:evidence.draftPresent};
+    }
+    if(busy || evidence.generating || evidence.accountChanged)
+      return {ok:false,cleared:false,reason:'MANAGER_NOT_IDLE'};
+    const editor=q(A.input);
+    try {
+      editor.focus();
+      if(editor.tagName==='TEXTAREA' || editor.tagName==='INPUT')editor.select();
+      else {
+        const selection=window.getSelection();
+        const range=document.createRange();
+        range.selectNodeContents(editor);
+        selection.removeAllRanges();
+        selection.addRange(range);
+      }
+      const accepted=document.execCommand('delete');
+      const cleared=composerText(q(A.input))==='';
+      if(cleared && !pendingParentSetupMarker)completionReceiptUncertain=false;
+      logStep(marker,'manager_skipped_draft_cleanup',{accepted,cleared});
+      return {ok:cleared,cleared,verified:evidence.verified,
+        reason:cleared?'CLEARED':'DELETE_NOT_CONFIRMED'};
+    }catch(error){
+      logStep(marker,'manager_skipped_draft_cleanup_failed',{errorType:error?.name||'Error'});
+      return {ok:false,cleared:false,reason:'COMPOSER_CLEAR_FAILED'};
+    }
+  }
+
+  function confirmManagerBatchSent(marker) {
+    const verified=site==='chatgpt' &&
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(marker||'') &&
+      userTurnHasMarker(marker) && !chatgptAccountChanged();
+    if(verified && !pendingParentSetupMarker)completionReceiptUncertain=false;
+    return {ok:verified,verified};
+  }
+
+  // Explicit Desktop-only path: submit ONLY the exact existing draft, never
+  // insert an absent batch or replace another user's composer contents.
+  async function retryManagerDraft(marker,text) {
+    const evidence=inspectManagerBatch(marker,text);
+    if(!evidence.ok || evidence.verified || !evidence.matchingDraft ||
+       evidence.accountChanged || evidence.generating || !evidence.documentReady || busy)
+      return {ok:false,uncertain:true,reason:evidence.verified?'ALREADY_SENT':
+        evidence.matchingDraft?'NOT_READY':'EXACT_DRAFT_REQUIRED'};
+    busy=true;
+    try {
+      await sendPrompt(text,marker);
+      const verified=userTurnHasMarker(marker) && !chatgptAccountChanged();
+      if(verified)completionReceiptUncertain=false;
+      return {ok:verified,submitted:verified,uncertain:!verified};
+    } catch {
+      completionReceiptUncertain=true;
+      return {ok:false,submitted:false,uncertain:true,reason:'RECONCILE_AFTER_ATTEMPT'};
+    } finally {busy=false;}
+  }
+
   // One-time, user-approved Parent setup. The user-message marker proves
   // submission, not successful MCP pairing.
   async function submitParentInitialization(text, marker) {
@@ -1152,17 +1527,21 @@
       return {ok:false,uncertain:false,error:'Invalid Parent setup'};
     if (observeState().state !== 'idle')
       return {ok:false,uncertain:false,error:'Parent chat is not idle'};
-    const visibleMarker=()=>userNodes().some((node)=>
-      String(node.innerText || node.textContent || '').includes(marker));
+    const visibleMarker=()=>userTurnHasMarker(marker);
     if (visibleMarker())
       return {ok:false,uncertain:true,error:'Setup message already visible'};
     busy=true;
     try {
-      await sendPrompt(text,marker);
+      await sendPrompt(text,'parent_setup');
       if (!await waitFor(visibleMarker,12000,250))
         throw new Error('Setup message visibility unverified');
       return {ok:true,submitted:true};
-    } catch {
+    } catch(error) {
+      logStep('parent_setup','parent_setup_submission_uncertain',{
+        errorCode:error?.code || 'UNCLASSIFIED',
+        draftStillPresent:composerText(q(A.input))===normalizePrompt(text),
+        userMarkerVisible:visibleMarker()});
+      pendingParentSetupMarker=marker;
       completionReceiptUncertain=true;
       return {ok:false,uncertain:true,error:'Setup submission uncertain'};
     } finally {busy=false;}
@@ -1234,7 +1613,7 @@
           info.style.whiteSpace='pre-wrap';
           info.textContent=result.initialization_status==='SENT'
             ? 'Parent approval saved. The one-time setup message was sent; the Agent still needs to complete MCP pairing.'
-            : 'Parent approved, but setup delivery is uncertain. Inspect this chat before retrying. Pairing code: '+result.code;
+            : 'Parent approved, but automatic Send was not confirmed. Inspect this conversation first. If the setup prompt is STILL in the composer, click ChatGPT\'s own Send button ONCE. Do not create another Parent pairing. Pairing code: '+result.code;
         }catch(error){
           info.textContent=String(error?.message||'Parent pairing unavailable');
           yes.disabled=false;no.disabled=false;
@@ -1308,6 +1687,19 @@
         sendResponse({ok:true,...state});
         break;
       }
+      case 'verify_sent_turn': {
+        // Read-only reconciliation. The task UUID is in the extension's
+        // managed Child setup text. Never count the composer or an assistant.
+        const marker=msg.taskId;
+        const valid=site==='chatgpt' &&
+          /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(marker||'');
+        const verified=Boolean(valid && userTurnHasMarker(marker) &&
+          !composerText(q(A.input)).includes(marker));
+        logStep(marker,'submission_reconciliation_observed',{verified,
+          userTurnCount:submissionUserNodes().length});
+        sendResponse({ok:true,verified});
+        break;
+      }
       case 'run_prompt': {
         logStep(msg.taskId,'task_received',{textLength:String(msg.text ?? '').length,
           receiptNonceValid:/^[0-9a-f-]{36}$/i.test(msg.receiptNonce || ''),timeoutMs:msg.timeoutMs});
@@ -1341,6 +1733,24 @@
       case 'submit_manager_batch': {
         submitManagerBatch(msg.text).then(sendResponse).catch(() => {
           sendResponse({ ok: false, uncertain: true, error: 'Manager submission failed' });
+        });
+        return true;
+      }
+      case 'inspect_manager_batch': {
+        sendResponse(inspectManagerBatch(msg.batchId,msg.text));
+        break;
+      }
+      case 'clear_manager_batch_draft': {
+        sendResponse(clearManagerBatchDraft(msg.batchId,msg.text));
+        break;
+      }
+      case 'confirm_manager_batch_sent': {
+        sendResponse(confirmManagerBatchSent(msg.batchId));
+        break;
+      }
+      case 'retry_manager_draft': {
+        retryManagerDraft(msg.batchId,msg.text).then(sendResponse).catch(() => {
+          sendResponse({ok:false,uncertain:true,reason:'RECONCILE_AFTER_ATTEMPT'});
         });
         return true;
       }

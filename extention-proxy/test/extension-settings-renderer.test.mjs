@@ -9,8 +9,8 @@ import {composeAgentPrompt,normalizeAgentSettings} from '../agent-settings.mjs';
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
 const clone=(x)=>JSON.parse(JSON.stringify(x));
 
-test('operation module editor persists edits independently and previews without submitting',async()=>{
- const initial=normalizeAgentSettings({});
+test('operation module editor preserves PC connector name while editing settings',async()=>{
+ const initial=normalizeAgentSettings({connectorName:'PC1'});
  const items=new Map();
  const element=(id)=>{
   if(!items.has(id)){
@@ -23,14 +23,16 @@ test('operation module editor persists edits independently and previews without 
   }
   return items.get(id);
  };
- const state={phase:'stopped',ngrokPhase:'stopped',ngrokAuthConfigured:false,
+ const state={phase:'stopped',ngrokPhase:'stopped',ngrokAuthConfigured:false,connectorName:'PC1',
   ngrokError:'',error:'',extensionConnected:false,routeVerified:false,domain:'',
   publicPath:'/mcp',port:8799,profile:'qa',localWebSocketUrl:'ws://127.0.0.1:8799/bridge'};
  let persisted,previewed;
+ let savedSettings=clone(initial);
  const window={addEventListener(){},bridge:{
   status:async()=>state,onState(){},
-  getAgentSettings:async()=>clone(initial),getDefaultAgentSettings:async()=>clone(initial),
-  saveAgentSettings:async(value)=>{persisted=clone(value);return clone(value);},
+  getAgentSettings:async()=>clone(savedSettings),getDefaultAgentSettings:async()=>clone(initial),
+  saveAgentSettings:async(value)=>{persisted=clone(value);savedSettings=clone(value);
+    state.connectorName=value.connectorName;return clone(value);},
   previewPrompt:async(value)=>{previewed=clone(value);return composeAgentPrompt(
    {...initial,promptModules:value.promptModules},value);},
  }};
@@ -42,6 +44,7 @@ test('operation module editor persists edits independently and previews without 
  element('extension-settings-panel').dispatch('toggle');
  await new Promise(resolve=>setImmediate(resolve));
  assert.equal(element('agent-prompt-text').value,initial.promptModules.core);
+ assert.equal(element('connector-name').value,'PC1');
  element('agent-prompt-text').value='Updated core instruction';
  element('agent-prompt-module').value='queue';
  element('agent-prompt-module').dispatch('change');
@@ -60,6 +63,15 @@ test('operation module editor persists edits independently and previews without 
  assert.equal(persisted.promptModules.queue,'Custom queue guidance');
  assert.equal(persisted.promptModules.delegation,initial.promptModules.delegation);
  assert.equal(persisted.maxTasksPerHour,33);
+ assert.equal(persisted.connectorName,'PC1');
+ element('connector-name').value='PC2';
+ element('connector-name').dispatch('input');
+ element('save-connector-name').dispatch('click');
+ await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(persisted.connectorName,'PC2');
+ assert.equal(persisted.maxTasksPerHour,33,'renaming a PC must not reset worker settings');
+ assert.equal(persisted.promptModules.queue,'Custom queue guidance');
+ assert.equal(element('connector-name').value,'PC2');
  const html=readFileSync(path.join(root,'..','extention','popup.html'),'utf8');
  assert.match(html,/id="serverUrl"/);
  assert.doesNotMatch(html,/id="token"/);

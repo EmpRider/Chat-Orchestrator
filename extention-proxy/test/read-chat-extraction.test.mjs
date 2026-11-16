@@ -122,6 +122,36 @@ test('ZIP-backed li user and assistant turns are extracted with explicit roles a
   });
 });
 
+test('captured modern ChatGPT DOM: user bubbles and DIL assistant bodies preserve all turns',()=>{
+  // Minimal semantic structure from the supplied Greeting exchange page.html:
+  // the old data-message-author-role/conversation-turn attributes are absent.
+  const readChat=loadReadChat('chatgpt.com',[
+    element('div',{'data-talvt-turn-state':'complete'},[
+      element('h4',{'data-conversation-role':'user'},[],'You said:'),
+      element('div',{'data-chatgpt-search-unit-key':'fallback-turn-0:0:user'},[
+        element('div',{'data-user-message-bubble':'true'},[],'hi')]),
+      element('h4',{'data-conversation-role':'assistant'},[],'ChatGPT said:'),
+      element('div',{'data-response-body':'assistant-id-1'},[
+        element('div',{'data-dil-response':''},[],'ආයුබෝවන්! 👋😊')]),
+    ]),
+    element('div',{'data-talvt-turn-state':'complete'},[
+      element('h4',{'data-conversation-role':'user'},[],'You said:'),
+      element('div',{'data-user-message-bubble':'true'},[],'how are you'),
+      element('h4',{'data-conversation-role':'assistant'},[],'ChatGPT said:'),
+      element('div',{'data-response-body':'assistant-id-2'},[
+        element('div',{'data-dil-response':''},[],
+          "I'm doing great, thanks for asking! 😊")]),
+    ]),
+  ]);
+  assert.deepEqual(readChat(),{
+    ok:true,site:'chatgpt',title:'Fixture',message_count:4,
+    transcript:'User: hi\n\nAssistant: ආයුබෝවන්! 👋😊\n\n'+
+      "User: how are you\n\nAssistant: I'm doing great, thanks for asking! 😊",
+  });
+  assert.equal(readChat(2).transcript,
+    "User: how are you\n\nAssistant: I'm doing great, thanks for asking! 😊");
+});
+
 test('synthetic selector semantics are explicit and unsupported selectors throw', () => {
   const child = element('span', { class: 'markdown', 'data-user-message-copy': '' }, [], 'U1');
   const parent = element('li', { 'data-message-role': 'user', 'data-testid': 'conversation-turn-1' }, [child]);

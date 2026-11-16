@@ -3,6 +3,7 @@ let currentState;
 let domainDirty = false;
 let proxyPortDirty = false;
 let browserSelectionDirty = false;
+let connectorNameDirty = false;
 let showSavedTabHistory = false;
 let lastCoordinationSnapshot = null;
 
@@ -23,7 +24,10 @@ function render(state) {
   $('proxy-port').disabled = portLocked;
   $('save-proxy-port').disabled = portLocked;
   if (!proxyPortDirty) $('proxy-port').value = String(state.port ?? 8787);
+  if (!connectorNameDirty) $('connector-name').value = state.connectorName ?? '';
   if (!browserSelectionDirty) $('managed-browser').value = state.managedBrowserSelection || 'none';
+  if (!browserSelectionDirty) $('chromium-executable').value = state.customChromiumExecutable || '';
+  $('chromium-executable-row').hidden=$('managed-browser').value!=='chromium';
   $('managed-browser-status').textContent = state.managedBrowserError ||
     (state.managedBrowserSelection==='none' ? 'Select your installed browser to create a dedicated profile.'
       : `Managed ${state.managedBrowserSelection} profile: ${state.managedBrowserPhase || 'selected'} · Extension: ${state.extensionConnected?'connected':'not yet connected'} · Identity: ${state.managedBrowserVerified?'live verified':state.onboardingComplete?'reverification required':'not yet verified'}`);
@@ -32,7 +36,8 @@ function render(state) {
   $('onboarding-panel').hidden=state.onboardingComplete===true;
   $('verify-managed-browser').disabled=!selected || !state.extensionConnected;
   $('repair-managed-browser').disabled=!selected || !state.extensionConnected;
-  $('finish-onboarding').disabled=!state.managedBrowserVerified || !state.extensionConnected;
+  $('finish-onboarding').disabled=!state.managedBrowserVerified || !state.extensionConnected ||
+    !state.connectorName || !state.agentSettingsSyncRevision || state.connectorRoutingSyncError===true;
   $('onboarding-status').textContent=state.onboardingComplete
     ? state.managedBrowserVerified
       ? 'Setup completed. The currently connected extension matches your saved browser enrollment.'
@@ -40,7 +45,18 @@ function render(state) {
     : !selected ? 'Step 1: choose and open a supported browser.'
     : !state.extensionConnected ? 'Step 2: install the extension in the dedicated browser and connect it to the Proxy.'
     : !state.managedBrowserVerified ? 'Step 3: confirm the connected extension is in the dedicated browser, then Verify.'
-    : 'Step 4: click Finish setup. Your verified browser enrollment is saved.';
+    : !state.connectorName ? 'Step 4: save the exact ChatGPT MCP connector name under One-time browser setup.'
+    : !state.agentSettingsSyncRevision ? 'Step 5: reload the extension and verify the new connector-name settings sync.'
+    : 'Step 6: click Finish setup. Your browser and named connector are verified.';
+  $('connector-sync-status').textContent=!state.connectorName
+    ? 'Connector name not set. Pairing is disabled until you save the exact ChatGPT connector name.'
+    : !state.extensionConnected
+      ? 'Connector: '+state.connectorName+' · Extension disconnected; waiting for verified settings sync.'
+      : state.connectorRoutingSyncError
+        ? 'Connector: '+state.connectorName+' · Outdated extension detected. Reload the bundled extension in the managed browser, then reconnect.'
+        : state.agentSettingsSyncRevision
+          ? 'Connector: '+state.connectorName+' · Extension verified connector routing, revision '+state.agentSettingsSyncRevision+'.'
+          : 'Connector: '+state.connectorName+' · Waiting for extension routing verification. Reload extension if this persists.';
   $('unpacked-extension-path').textContent = state.unpackedExtensionPath || 'Unavailable';
   $('auto-start-windows').checked = state.autoStartWindows === true;
   $('profile-description').textContent = `Profile: ${state.profile || 'default'} · Port ${state.port ?? 8787}. Stop proxy and Ngrok to change. Launch another with --profile=name.`;
@@ -52,7 +68,9 @@ function render(state) {
     : state.coordinationState === 'private_ready' ? 'Private storage ready'
     : state.coordinationState === 'active' ? 'Queue active' : 'Queue unknown';
   $('extension-detail').textContent = `WebSocket · ${queue}`;
-  $('extension-settings-sync').textContent = state.extensionConnected && state.agentSettingsSyncRevision
+  $('extension-settings-sync').textContent = state.connectorRoutingSyncError && state.extensionConnected
+    ? 'Outdated extension: reload in managed browser'
+    : state.extensionConnected && state.agentSettingsSyncRevision
     ? `Extension applied revision ${state.agentSettingsSyncRevision}`
     : state.extensionConnected ? 'Awaiting settings acknowledgement' : 'Sync on next connection';
   $('ngrok-state').textContent = state.routeVerified ? 'Online'
@@ -181,11 +199,61 @@ function renderCoordinationSnapshot(snapshot) {
       ? `${openTabs.length} chat tab(s) open, but none matches a saved registration`
       : 'No saved registrations currently open'
     : 'No saved tab relationships');
-  rows(queue, (snapshot.queue || []).slice(-8), (item) =>
-    `${item.type} · ${item.phase} · tab ${item.managerTabId} · ${item.eventId.slice(0, 8)}`,
-    snapshot.storageReady
-      ? hiddenPending > 0 ? `${hiddenPending} pending event(s) held for manual reconciliation` : 'No queued events'
-      : 'Queue not active');
+  queue.textContent='';
+  const visibleQueue=snapshot.queue||[];
+  if(!visibleQueue.length)queue.textContent=snapshot.storageReady
+    ? hiddenPending>0 ? `${hiddenPending} event(s) need manager re-registration before reconciliation`
+      : 'No queued events' : 'Queue not active';
+  const oldestByRecipient=new Set();
+  for(const item of visibleQueue){
+    const line=document.createElement('div');
+    line.className='coordination-row';
+    const label=document.createElement('span');
+    label.textContent=`${item.type} · ${item.phase} · tab ${item.managerTabId} · ${item.eventId.slice(0,8)}`;
+    line.append(label);
+    const recipient=`${item.browserSessionId}:${item.managerTabId}:${item.principalId}`;
+    const terminal=['PROCESSED','SAGA_CONFIRMED','SKIPPED'].includes(item.phase);
+    if(!terminal && !oldestByRecipient.has(recipient)){
+      oldestByRecipient.add(recipient);
+      if(item.batchId && ['LEASED','DISPATCHING','DELIVERED','UNCERTAIN','RETRYING'].includes(item.phase)){
+        const control=(title,callback)=>{
+          const button=document.createElement('button');
+          button.type='button';button.className='secondary';button.textContent=title;
+          button.addEventListener('click',()=>perform(callback));
+          line.append(button);
+        };
+        const operate=async(action,reason='')=>{
+          const result=await window.bridge.recoverQueueBatch(item.managerTabId,
+            item.browserSessionId,item.batchId,action,reason);
+          notify(result.draft_cleanup_required
+            ? 'Batch skipped and journal retained, but browser draft cleanup needs manual inspection. Open tab and clear ONLY the old notification draft.'
+            : result.ledger_synced===false && ['SKIPPED','DELIVERED'].includes(result.phase)
+              ? 'Journal updated, but extension ledger did not synchronize. Recheck the manager tab before continuing.'
+            : result.verified?'Sent user turn verified; awaiting agent review/ACK.'
+            : result.phase==='SKIPPED'?'Batch skipped, original events retained in journal.'
+            : result.phase==='DELIVERED'?'Batch submitted; awaiting agent review/ACK.'
+            : 'Submission not verified. Queue remains held; inspect draft or Skip.');
+        };
+        control('Open tab',async()=>{
+          await window.bridge.focusQueueManager(item.managerTabId,item.browserSessionId);
+        });
+        control('Recheck',()=>operate('recheck'));
+        if(item.phase!=='DELIVERED')
+          control('Retry exact draft',async()=>{
+            if(!window.confirm('Retry ONLY the matching unsent batch draft? An earlier Send may have succeeded. No new text will be inserted.'))return;
+            await operate('retry_draft');
+          });
+        control('Skip batch',async()=>{
+          const reason=window.prompt('Reason for skipping this whole FIFO batch (minimum 10 characters):','');
+          if(reason==null)return;
+          if(reason.trim().length<10)throw new Error('Provide at least 10 characters');
+          if(!window.confirm('Skip this batch without delivering it? Child reports remain in the journal for later review.'))return;
+          await operate('skip',reason.trim());
+        });
+      }
+    }
+    queue.append(line);
+  }
   rows(tools, (snapshot.toolCalls || []).slice(-8).reverse(), (item) =>
     `${item.method} · ${item.ok ? 'OK' : 'ERROR'} · ${item.durationMs}ms · ${item.caller}`,
     'No tool calls recorded');
@@ -231,9 +299,26 @@ async function perform(action, successMessage) {
 $('copy-url').addEventListener('click', () => perform(() => window.bridge.copyUrl(), 'Authenticated URL copied with token. Keep it private; select No authentication in ChatGPT.'));
 $('domain').addEventListener('input', () => { domainDirty = true; });
 $('proxy-port').addEventListener('input', () => { proxyPortDirty = true; });
-$('managed-browser').addEventListener('change',()=>{browserSelectionDirty=true;});
+$('connector-name').addEventListener('input', () => { connectorNameDirty = true; });
+$('save-connector-name').addEventListener('click',()=>perform(async()=>{
+  const name=$('connector-name').value.trim();
+  if(!name)throw new Error('Enter the exact connector name configured in ChatGPT, such as PC1');
+  const settings=await window.bridge.getAgentSettings();
+  await window.bridge.saveAgentSettings({...settings,connectorName:name});
+  connectorNameDirty=false;
+  render(await window.bridge.status());
+},'Connector name saved. Verify the extension routing status under One-time browser setup before pairing.'));
+$('managed-browser').addEventListener('change',()=>{
+  browserSelectionDirty=true;
+  $('chromium-executable-row').hidden=$('managed-browser').value!=='chromium';
+});
+$('choose-chromium-executable').addEventListener('click',()=>perform(async()=>{
+  const selected=await window.bridge.chooseChromiumExecutable();
+  if(selected){$('chromium-executable').value=selected;browserSelectionDirty=true;}
+}));
 $('save-managed-browser').addEventListener('click',()=>perform(async()=>{
-  const selected=await window.bridge.configureManagedBrowser($('managed-browser').value);
+  const selected=await window.bridge.configureManagedBrowser(
+    $('managed-browser').value,$('chromium-executable').value);
   browserSelectionDirty=false;
   render(selected);
   notify('Dedicated browser profile configured. Install the extension once and verify its connection.');
@@ -248,7 +333,7 @@ $('copy-profile-token').addEventListener('click',()=>perform(
   ()=>window.bridge.copyProfileToken(),
   'Profile connection key copied. Paste it into this managed browser extension popup only.'));
 const verifyManagedBrowser=()=>perform(async()=>{
-  if(!window.confirm('Is the connected extension running inside the dedicated Chrome/Edge profile opened by Chat Orchestrator? This binds that installation for browser-close actions.'))return;
+  if(!window.confirm('Is this extension running inside the dedicated Chromium-based browser profile opened by Chat Orchestrator? This binds that installation for browser-close actions.'))return;
   render(await window.bridge.verifyManagedBrowser());
 },'Connected extension installation verified for this selected browser.');
 $('verify-managed-browser').addEventListener('click',verifyManagedBrowser);
@@ -428,6 +513,7 @@ $('agent-settings-save').addEventListener('click', () => perform(async () => {
   if (!agentDraft) throw new Error('Open the panel to load profile settings first');
   flushPromptDraft();
   const candidate = {
+    connectorName: currentState?.connectorName ?? agentDraft.connectorName ?? '',
     enabled: $('agent-enabled').checked,
     maxWorkers: Number($('agent-max-workers').value),
     maxTasksPerHour: Number($('agent-max-tasks').value),

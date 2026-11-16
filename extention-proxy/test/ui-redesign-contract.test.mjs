@@ -20,11 +20,18 @@ test('redesigned navigation keeps each trusted desktop control and one page per 
   }
   for (const id of [
     'server-state', 'extension-state', 'ngrok-state', 'copy-url',
-    'connector-url', 'copy-public-mcp-token', 'domain', 'ngrok-token',
+    'connector-url', 'connector-name', 'save-connector-name', 'copy-public-mcp-token', 'domain', 'ngrok-token',
     'configure-ngrok', 'proxy-port', 'save-proxy-port', 'tray-behavior-note', 'minimize-to-tray',
     'start', 'stop', 'agent-settings-save', 'agent-prompt-module', 'agent-prompt-text',
     'queue-items', 'agent-seats', 'tool-call-log',
   ]) assert.ok(ids.includes(id), 'trusted control missing: ' + id);
+  const setupSection=html.match(/<section class="panel" aria-label="One-time browser setup">([\s\S]*?)<\/section>/)?.[1];
+  assert.ok(setupSection,'one-time browser setup must remain reachable after onboarding');
+  assert.match(setupSection,/id="connector-name"/);
+  assert.match(setupSection,/id="connector-sync-status"/);
+  const connectorCard=html.match(/<section class="panel connector-panel">([\s\S]*?)<\/section>/)?.[1]||'';
+  assert.doesNotMatch(connectorCard,/id="connector-name"/,
+    'the connector name belongs to one-time browser setup, not URL copy');
   for (const obsolete of ['pair-principal', 'principal-panel', 'principal-list', 'show-identity-recovery', 'copy-principal-url',
     'token-value', 'import-token', 'copy-token', 'copy-extension-token', 'quick-extension-token'])
     assert.ok(!ids.includes(obsolete), 'obsolete auth control remains: ' + obsolete);
@@ -60,7 +67,9 @@ test('onboarding can repair an extension after first-run completion',()=>{
   assert.match(html,/id="repair-managed-browser"/);
   assert.match(renderer,/\$\('repair-managed-browser'\)\.addEventListener/);
   assert.match(main,/async function inspectCurrentManagedExtension\(/);
-  assert.match(main,/if\(verified\.browser_product!==managedBrowserSelection\)/);
+  assert.match(main,/verified\.browser_product!==managedBrowserSelection/);
+  assert.match(main,/managedBrowserSelection==='chromium'/);
+  assert.match(main,/normalizeChromiumExecutablePath\(customExecutable\)/);
   assert.match(main,/verified\.extension_version!==bundledManifest\.version/);
   assert.match(main,/matchesManagedEnrollment\(managedBrowserEnrollment,selectedAtStart,verified\)/);
   assert.match(main,/invalidateLiveBrowserVerification\(\)/);

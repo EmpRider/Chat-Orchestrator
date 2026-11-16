@@ -462,13 +462,76 @@ const preparingWorkerTabs = new Set(); // browser session + tab ID
 // each prepare -> focus -> confirmed-submit handoff, not the worker's reply.
 // Worker models continue generating independently after submission.
 const spawnStartupSerial = {tail: Promise.resolve()};
+// An ambiguous send must not let a later spawn steal focus from the tab that
+// may still be submitting. The hold is session-scoped and never auto-retries
+// the chat side effect. Manual reconciliation is required before restarting
+// this Proxy session.
+const spawnSubmissionHolds = new Map();
+async function reconcileWorkerSubmission(principal,tabId,incarnationId,taskId=null) {
+  // Only a read-only check of the ORIGINAL owned tab may release a held
+  // startup. No focus changes, tab creation, or prompt replay.
+  const inspected=await callExtension('inspect_tab',{tab_id:tabId,
+    __sessionBrowserId:principal.browserSessionId},10000);
+  if(inspected?.incarnation_id!==incarnationId ||
+      inspected?.browser_session_id!==principal.browserSessionId ||
+      inspected?.is_managed_worker!==true)
+    return null;
+  if(!taskId) {
+    const inventory=await callExtension('inspect_worker_tasks',{
+      tab_id:tabId,worker_incarnation_id:incarnationId,
+      __trustedPrincipal:principal,__sessionBrowserId:principal.browserSessionId},10000);
+    // A Child can pair and finish its task while the original spawn_worker
+    // request is still waiting for a content ACK. If that transport reply
+    // was lost, held.taskId is null and the only task may now be DONE.
+    // Include terminal explicit completions as candidates; never guess if
+    // the unchanged tab has more than one possible task.
+    const candidates=(inventory?.tasks||[]).filter((item)=>
+      ['running','uncertain','failed','done','waiting_for_children'].includes(item.status));
+    if(candidates.length!==1)return null;
+    taskId=candidates[0].task_id;
+  }
+  const proof=await callExtension('verify_worker_submission',{
+    tab_id:tabId,task_id:taskId,worker_incarnation_id:incarnationId,
+    __trustedPrincipal:principal,__sessionBrowserId:principal.browserSessionId},10000);
+  return proof?.verified===true && proof?.submission_confirmed===true ? proof : null;
+}
 function serializeWorkerSpawn(operation) {
   const next = spawnStartupSerial.tail.then(operation);
   spawnStartupSerial.tail = next.catch(() => {});
   return next;
 }
 async function spawnAndBindWorker(args, principal) {
-  return serializeWorkerSpawn(() => prepareAndStartWorker(args,principal));
+  return serializeWorkerSpawn(async () => {
+    const held=spawnSubmissionHolds.get(principal.browserSessionId);
+    if(held) {
+      // The NEXT spawn may be invoked by the held Child (e.g. PM -> TL),
+      // but the held task still belongs to its ORIGINAL spawning Parent.
+      // Reconciliation must use that owner's live, attested credential scope,
+      // never the unrelated caller's scope or a session-wide privilege.
+      const owner=profileManagerIdentities.get(
+        principal.browserSessionId+':'+held.ownerTabId);
+      const originalOwnerValid=Boolean(owner &&
+        owner.credentialId===held.ownerCredentialId &&
+        owner.sessionIncarnationId===held.ownerIncarnationId &&
+        currentPrivatePrincipal(owner) &&
+        tabRegistry.get(held.ownerTabId,principal.browserSessionId)?.incarnationId===
+          held.ownerIncarnationId);
+      const proof=originalOwnerValid
+        ? await reconcileWorkerSubmission(owner,
+          held.tabId,held.incarnationId,held.taskId).catch(()=>null)
+        : null;
+      if(!proof) throw new Error('Spawn FIFO is HELD: worker tab '+held.tabId+
+        ' has an unverified prompt submission. Inspect that tab and reconcile its task; '+
+        'do not retry the prompt or launch another worker before resolving this session.');
+      if(tabRegistry.get(held.tabId,principal.browserSessionId)?.phase==='uncertain')
+        await tabRegistry.confirmSubmitted(held.tabId,held.incarnationId,principal.browserSessionId);
+      else
+        await tabRegistry.setPhase(held.tabId,'started',principal.browserSessionId);
+      spawnSubmissionHolds.delete(principal.browserSessionId);
+      diagnostics.info('worker.spawn_fifo_reconciled',{tabId:held.tabId,success:true});
+    }
+    return prepareAndStartWorker(args,principal);
+  });
 }
 async function prepareAndStartWorker(args, principal) {
   // D-057: retain the adapter boundary, but never create an unsupported
@@ -499,6 +562,8 @@ async function prepareAndStartWorker(args, principal) {
   if (preparingWorkerTabs.has(preparationKey))
     throw new Error('Worker tab already has a pending prepared task; reconcile before retrying');
   preparingWorkerTabs.add(preparationKey);
+  let submissionDispatchIssued=false;
+  let startupTaskId=null;
   try {
     const inspection = await callExtension('inspect_tab',{tab_id:prepared.tab_id,
       __trustedPrincipal:principal,__sessionBrowserId:principal.browserSessionId});
@@ -516,15 +581,49 @@ async function prepareAndStartWorker(args, principal) {
         throw new Error('Unregistered reusable worker requires manual reconciliation');
       await tabRegistry.registerChild(principal.callerTabId,inspection);
     }
-    const result = await callExtension('start_prepared_worker',{
+    submissionDispatchIssued=true;
+    let result = await callExtension('start_prepared_worker',{
       ...params,__defer_start:false,tab_id:prepared.tab_id,
       expected_incarnation_id:prepared.incarnation_id,reused_tab:prepared.reused_tab,
     });
+    startupTaskId=result?.task_id || null;
+    // An extension reply is not proof that ChatGPT accepted the message.
+    // New children must provide an explicit, content-script-confirmed ACK.
+    // Previously established role seats can be *queued* pending parent review;
+    // that status is truthful, not a successful submission.
+    const queuedReuse=prepared.reused_tab===true && result?.status==='queued';
+    if(!queuedReuse && result?.submission_confirmed!==true &&
+        result?.status==='uncertain' && startupTaskId) {
+      // The page may reformat user text after the click and cause a false
+      // confirmation timeout. Recheck the exact task UUID inside its user
+      // turn before treating the startup as failed.
+      const reconciled=await reconcileWorkerSubmission(principal,
+        prepared.tab_id,prepared.incarnation_id,startupTaskId).catch(()=>null);
+      if(reconciled)result={...result,...reconciled};
+    }
+    if(!queuedReuse && (result?.submission_confirmed!==true ||
+        !['running','done','waiting_for_children','uncertain'].includes(result?.status))) {
+      const definitelyNotSubmitted=result?.status==='failed' &&
+        result?.submission_confirmed===false;
+      const error=new Error(definitelyNotSubmitted
+        ? 'Child prompt was NOT submitted; inspect the existing draft'
+        : 'Child prompt submission was NOT verified; inspect the existing worker tab');
+      error.code=definitelyNotSubmitted?'SUBMISSION_NOT_ATTEMPTED':'SUBMISSION_UNCERTAIN';
+      throw error;
+    }
     await tabRegistry.setPhase(prepared.tab_id,'started',principal.browserSessionId);
     return {...result,parent_tab_id:principal.callerTabId,
       root_tab_id:tabRegistry.get(prepared.tab_id,principal.browserSessionId).rootTabId};
   } catch (error) {
-    const definitelyNotSubmitted = error.code === 'COMPOSER_DRAFT_MISMATCH';
+    const definitelyNotSubmitted = ['COMPOSER_DRAFT_MISMATCH','SUBMISSION_NOT_ATTEMPTED'].includes(error.code);
+    if(submissionDispatchIssued && !definitelyNotSubmitted) {
+      spawnSubmissionHolds.set(principal.browserSessionId,{
+        tabId:prepared.tab_id,incarnationId:prepared.incarnation_id,taskId:startupTaskId,
+        ownerTabId:principal.callerTabId,
+        ownerCredentialId:principal.credentialId,
+        ownerIncarnationId:principal.sessionIncarnationId});
+      diagnostics.warn('worker.spawn_fifo_held',{tabId:prepared.tab_id,reason:'SUBMISSION_UNVERIFIED'});
+    }
     if (tabRegistry.directChild(principal.callerTabId,prepared.tab_id,principal.browserSessionId) &&
         tabRegistry.get(prepared.tab_id,principal.browserSessionId)?.phase === 'prepared') {
       // A confirmed readiness refusal precedes task creation and any send
@@ -617,8 +716,9 @@ const PRIVATE_SCOPE_FIELDS = [
 ];
 const PRIVATE_QUEUE_PHASES = new Set([
   'QUEUED', 'LEASED', 'DISPATCHING', 'DELIVERED',
-  'PROCESSED', 'SAGA_CONFIRMED', 'UNCERTAIN',
+  'PROCESSED', 'SAGA_CONFIRMED', 'UNCERTAIN', 'RETRYING', 'SKIPPED',
 ]);
+const PRIVATE_QUEUE_TERMINAL = new Set(['PROCESSED','SAGA_CONFIRMED','SKIPPED']);
 const PRIVATE_QUEUE_ENTRY_TYPES = new Set(['CHILD_RESULT', 'STATUS_REQUEST', 'CHILD_TAB_LOST']);
 
 // This identity is derived only from a verified PrincipalContext, never owner_id
@@ -679,7 +779,7 @@ function privateRecipientPredecessors(reduced, recipient, ownerKey) {
     .filter((item) => item.ownerKey === ownerKey &&
       item.recipientTabId === recipient.tabId &&
       item.recipientKey !== currentKey &&
-      !['PROCESSED', 'SAGA_CONFIRMED'].includes(item.phase));
+      !PRIVATE_QUEUE_TERMINAL.has(item.phase));
   const snapshot = older.map((item) => [
     item.recipientKey,item.ref,item.previousPhase ?? item.phase,item.lastSeq,
   ]);
@@ -742,7 +842,7 @@ function privateQueueStep(reduced, event) {
   const key = ownerKey + '#' + ref.toLowerCase();
   const prior = reduced.byRef.get(key);
   const allowedFields = new Set([
-    'phase', 'ref', 'entryType', 'leaseGeneration', 'leaseNonce', 'data', 'ack', 'saga',
+    'phase', 'ref', 'entryType', 'leaseGeneration', 'leaseNonce', 'data', 'ack', 'saga', 'recovery',
   ]);
   if (Object.keys(payload).some((field) => !allowedFields.has(field)) ||
       (phase !== 'QUEUED' &&
@@ -786,6 +886,26 @@ function privateQueueStep(reduced, event) {
   } else if (Object.hasOwn(payload, 'ack')) {
     throw new Error('Unexpected manager ACK on non-processed transition');
   }
+  // An operator recovery never asserts that a model reviewed a message.
+  // It is an auditable, explicitly confirmed delivery/skip decision.
+  const recovery=payload.recovery;
+  const expectedRecoveryKind=phase==='RETRYING' ? 'manual_retry'
+    : phase==='SKIPPED' ? 'manual_skip'
+    : phase==='DELIVERED' && recovery ? 'verified_user_turn'
+    : phase==='UNCERTAIN' && recovery ? 'retry_unconfirmed' : null;
+  if (recovery) {
+    if (!prior || !expectedRecoveryKind ||
+        Object.keys(recovery).sort().join(',')!=='at,batchId,eventRef,kind,principalId,reason' ||
+        recovery.kind!==expectedRecoveryKind || recovery.eventRef!==ref ||
+        recovery.batchId!==prior.leaseNonce ||
+        recovery.principalId!==event.ownerScope.principalId ||
+        typeof recovery.at!=='string' || !Number.isFinite(Date.parse(recovery.at)) ||
+        typeof recovery.reason!=='string' || recovery.reason.trim().length<10 ||
+        recovery.reason.length>512)
+      throw new Error('Invalid explicit queue recovery evidence');
+  } else if (phase==='RETRYING' || phase==='SKIPPED') {
+    throw new Error('Manual queue recovery requires durable evidence');
+  }
   if (phase === 'QUEUED') {
     if (prior || ref !== event.id || Object.hasOwn(payload, 'ref') ||
         !PRIVATE_QUEUE_ENTRY_TYPES.has(payload.entryType) ||
@@ -802,14 +922,14 @@ function privateQueueStep(reduced, event) {
         item.recipientTabId === event.recipient.tabId &&
         item.recipientKey !== recipientKey &&
         !reduced.quarantinedRecipients.get(ownerKey + '#' + recipientKey)?.has(item.recipientKey) &&
-        item.phase !== 'PROCESSED' && item.phase !== 'SAGA_CONFIRMED';
+        !PRIVATE_QUEUE_TERMINAL.has(item.phase);
     });
     if (staleIncarnation) throw new Error('Private recipient incarnation requires reconciliation');
   } else {
     if (!prior || prior.recipientKey !== recipientKey || prior.sourceKey !== sourceKey) {
       throw new Error('Private queue transition references stale recipient/source incarnation');
     }
-    if (prior.recovered) {
+    if (prior.recovered && !recovery) {
       throw new Error('Recovered private lease/dispatch requires explicit reconciliation');
     }
     if (phase === 'LEASED') {
@@ -822,7 +942,7 @@ function privateQueueStep(reduced, event) {
       const earlier = reduced.fifo.slice(0, reduced.fifo.indexOf(key))
         .map((itemKey) => reduced.byRef.get(itemKey))
         .filter((item) => item.recipientKey === recipientKey &&
-          item.phase !== 'PROCESSED' && item.phase !== 'SAGA_CONFIRMED');
+          !PRIVATE_QUEUE_TERMINAL.has(item.phase));
       const sameBatch = earlier.every((item) =>
         item.phase === 'LEASED' && item.leaseNonce === payload.leaseNonce);
       if (!sameBatch || prior.phase !== 'QUEUED' ||
@@ -836,7 +956,13 @@ function privateQueueStep(reduced, event) {
       (phase === 'DELIVERED' && prior.phase === 'DISPATCHING') ||
       (phase === 'PROCESSED' && prior.phase === 'DELIVERED') ||
       (phase === 'SAGA_CONFIRMED' && prior.phase === 'PROCESSED') ||
-      (phase === 'UNCERTAIN' && (prior.phase === 'DISPATCHING' || prior.phase === 'DELIVERED'))
+      (phase === 'UNCERTAIN' && (prior.phase === 'DISPATCHING' || prior.phase === 'DELIVERED')) ||
+       (recovery?.kind==='manual_retry' && ['UNCERTAIN','DISPATCHING'].includes(prior.phase)) ||
+       (recovery?.kind==='manual_skip' &&
+         ['LEASED','DISPATCHING','DELIVERED','UNCERTAIN','RETRYING'].includes(prior.phase)) ||
+       (recovery?.kind==='verified_user_turn' &&
+         ['LEASED','DISPATCHING','DELIVERED','UNCERTAIN','RETRYING'].includes(prior.phase)) ||
+       (recovery?.kind==='retry_unconfirmed' && prior.phase==='RETRYING')
     ) || payload.leaseGeneration !== prior.leaseGeneration ||
         payload.leaseNonce !== prior.leaseNonce) {
       throw new Error('Private queue transition or lease identity mismatch');
@@ -879,7 +1005,8 @@ function reducePrivateQueueEvents(events, recovering = false) {
         reduced.byRef.set(key, Object.freeze({
           ...item, recovered: true, recoveryClass: 'STALE_LEASE_OWNER_UNVERIFIED',
         }));
-      } else if (item.phase === 'DISPATCHING' || item.phase === 'DELIVERED') {
+      } else if (item.phase === 'DISPATCHING' || item.phase === 'DELIVERED' ||
+                 item.phase === 'RETRYING') {
         reduced.byRef.set(key, Object.freeze({
           ...item, phase: 'UNCERTAIN', previousPhase: item.phase,
           recovered: true, recoveryClass: 'DISPATCH_CONSUMER_ACK_UNVERIFIED',
@@ -900,7 +1027,7 @@ function privateQueueDiagnosticCounts(reduced) {
   const phases = Object.fromEntries([...PRIVATE_QUEUE_PHASES].map((phase) => [phase, 0]));
   for (const item of reduced.byRef.values()) phases[item.phase] += 1;
   const pending = phases.QUEUED + phases.LEASED + phases.DISPATCHING +
-    phases.DELIVERED + phases.UNCERTAIN;
+    phases.DELIVERED + phases.UNCERTAIN + phases.RETRYING;
   return Object.freeze({ phases: Object.freeze(phases), pending });
 }
 
@@ -1305,7 +1432,7 @@ async function openPrivateEventJournal() {
       unresolvedForTab: (tabId,_sessionId) => queueState.fifo
         .map((key) => queueState.byRef.get(key))
         .filter((item) => item.recipientTabId === tabId &&
-          !['PROCESSED','SAGA_CONFIRMED'].includes(item.phase))
+          !PRIVATE_QUEUE_TERMINAL.has(item.phase))
         .map((item) => ({phase:item.phase,entryType:item.entryType})),
       close: () => {
         if (!closePromise) {
@@ -1634,8 +1761,18 @@ function handleExtensionMessage(ws,msg) {
   if (extensionSockets.get(ws.browserSessionId) !== ws) return;
   if (msg.type === 'settings_applied') {
     if (trustedExtensionSockets.has(ws) && msg.revision === agentSettingsRevision) {
-      process.parentPort?.postMessage({type:'agent_settings_synced',revision:msg.revision,
-        browserSessionId:ws.browserSessionId});
+      if(msg.routing_capability==='connector_name_routing_v1' &&
+          msg.connector_name===agentSettings.connectorName) {
+        ws.routingVerifiedRevision=msg.revision;
+        ws.routingVerifiedName=msg.connector_name;
+        process.parentPort?.postMessage({type:'agent_settings_synced',revision:msg.revision,
+          browserSessionId:ws.browserSessionId});
+      } else {
+        ws.routingVerifiedRevision=0;
+        ws.routingVerifiedName=null;
+        process.parentPort?.postMessage({type:'agent_settings_routing_mismatch',
+          browserSessionId:ws.browserSessionId});
+      }
     }
     return;
   }
@@ -1645,6 +1782,14 @@ function handleExtensionMessage(ws,msg) {
   }
   if (msg.type === 'pairing_offer') {
     if (!PRIVATE_EVENT_ID.test(msg.request_id || '')) return;
+    if(agentSettings.connectorName &&
+        (ws.routingVerifiedRevision!==agentSettingsRevision ||
+         ws.routingVerifiedName!==agentSettings.connectorName)) {
+      if(ws.readyState===1) ws.send(JSON.stringify({type:'pairing_offer_ack',
+        request_id:msg.request_id,ok:false,
+        error:'Connector name not verified by the connected extension. Reload the bundled extension and wait for settings sync before pairing.'}));
+      return;
+    }
     void (async () => {
       const live = await callExtension('inspect_tab', {
         tab_id:msg.tab_id,__sessionBrowserId:ws.browserSessionId},10000);
@@ -2073,6 +2218,7 @@ async function acceptPrivateWorkerLoss(packet) {
 const armedPrivateDelivery = new Set();
 const pausedPrivateDelivery = new Set();
 const privateDispatching = new Set();
+const privateRecoveryInFlight = new Set(); // Desktop operations never race a manager wake.
 let privateDispatchTimer = null;
 
 function privateRecordedScope(principal, event) {
@@ -2130,17 +2276,148 @@ function verifiedParentConversationRoute(value) {
   return parsed.origin+parsed.pathname;
 }
 
+// The only recovery entry point for a held manager batch. Never reconstruct a
+// different set of events, silently drop history, or accept browser page text as
+// proof. Caller identity is the currently paired, local-profile manager.
+async function recoverPrivateManagerBatch(principal,batchId,action,reason='') {
+  const active=registeredPrivateManager(principal);
+  if(!PRIVATE_EVENT_ID.test(batchId||'') ||
+      !['recheck','retry_draft','skip'].includes(action))
+    throw new Error('Invalid queue recovery action or batch ID');
+  if(action==='skip' && (typeof reason!=='string' || reason.trim().length<10 ||
+      reason.length>512))
+    throw new Error('Skipping requires a meaningful operator reason (10–512 characters)');
+  if(privateDispatching.has(active.credentialId) ||
+      privateRecoveryInFlight.has(active.credentialId))
+    throw new Error('Manager delivery/recovery already in progress');
+  privateRecoveryInFlight.add(active.credentialId);
+  try {
+    const scope=privateManagerScope(active);
+    const all=privateJournal.queueState(active,scope);
+    const pending=all
+      .filter(item=>!PRIVATE_QUEUE_TERMINAL.has(item.phase));
+    if(!pending.length || pending[0].leaseNonce!==batchId)
+      throw new Error('Recovery must target the oldest unresolved FIFO batch');
+    const items=pending.filter(item=>item.leaseNonce===batchId);
+    const batchItems=all.filter(item=>item.leaseNonce===batchId);
+    if(!items.length || !batchItems.length || batchItems.length>16 ||
+        pending.slice(0,items.length).some((item,i)=>item.ref!==items[i].ref) ||
+        items.some(item=>!['LEASED','DISPATCHING','DELIVERED','UNCERTAIN','RETRYING'].includes(item.phase)))
+      throw new Error('Recovery batch is incomplete or does not match the FIFO prefix');
+    const recorded=privateJournal.replay(active,scope);
+    const originals=new Map(recorded.filter(item=>item.kind==='queue.transition' &&
+      item.payload.phase==='QUEUED').map(item=>[item.id,item]));
+    // Even if a crash interrupted a multi-item recovery, the original
+    // delivered composer draft describes the COMPLETE leased batch.
+    const events=batchItems.map(item=>{
+      const original=originals.get(item.ref);
+      if(!original)throw new Error('Original durable event is missing');
+      return {event_id:original.id,type:item.entryType,
+        summary:privateQueueSummary(original),recorded_at:original.recordedAt};
+    });
+    const origins=[...new Set(batchItems.map(item=>verifiedParentConversationRoute(
+      originals.get(item.ref).payload.data?.originParentUrl)))];
+    if(origins.length!==1)throw new Error('Recovery batch has mixed destination conversations');
+    let prompt=null;
+    try {
+      prompt=composeAgentPrompt(agentSettings,{kind:'queue',batchId,events});
+    } catch(error) {
+      // Prompt module settings may change after the original lease. An
+      // operator must still be able to skip, without fabricating text.
+      if(action!=='skip')throw error;
+    }
+    const ext={__trustedPrincipal:active,__sessionBrowserId:active.browserSessionId,
+      manager_tab_id:active.callerTabId,batch_id:batchId,
+      prompt_text:prompt,origin_parent_url:origins[0]};
+    const reconcileLedger=async(status)=>{
+      try {
+        const value=await callExtension('resolve_manager_recovery',
+          {...ext,status},10000);
+        return value?.recorded===true;
+      }catch{return false;}
+    };
+    const observe=async()=> {
+      const result=await callExtension('inspect_manager_batch',ext,15000);
+      if(result?.ok!==true)throw new Error('Cannot verify original Parent conversation: '+
+        (result?.reason||'unavailable'));
+      return result;
+    };
+    const writePhase=async(phase,kind,operatorReason)=>{
+      for(const item of items) {
+        if(item.phase===phase)continue;
+        const original=originals.get(item.ref);
+        await privateJournal.append(active,privateRecordedScope(active,original),'queue.transition',{
+          phase,ref:item.ref,leaseGeneration:item.leaseGeneration,leaseNonce:batchId,
+          recovery:{kind,eventRef:item.ref,batchId,principalId:active.principalId,
+            at:new Date().toISOString(),reason:operatorReason},
+        },crypto.randomUUID());
+      }
+    };
+    if(action==='skip'){
+      await writePhase('SKIPPED','manual_skip',reason.trim());
+      // The durable skip precedes any UI cleanup. Deleting a draft must never
+      // be mistaken for an ACK, and a failed cleanup must not restore/replay it.
+      const cleanup=prompt===null?{ok:false,reason:'PROMPT_SETTINGS_CHANGED'}
+        : await callExtension('clear_skipped_manager_batch',ext,15000)
+          .catch(()=>({ok:false,reason:'BROWSER_UNAVAILABLE'}));
+      const ledgerSynced=await reconcileLedger('processed');
+      setImmediate(pumpPrivateQueue);
+      return {phase:'SKIPPED',batch_id:batchId,skipped:items.map(item=>item.ref),
+        retained_in_journal:true,automatically_delivered:false,
+        ledger_synced:ledgerSynced,draft_cleared:cleanup?.cleared===true,
+        draft_cleanup_required:cleanup?.ok!==true || (
+          cleanup?.draftPresent===true && cleanup?.cleared!==true)};
+    }
+    const observed=await observe();
+    if(observed.verified){
+      if(!items.every(item=>item.phase==='DELIVERED'))
+        await writePhase('DELIVERED','verified_user_turn',
+          'Exact batch marker verified inside a submitted user turn');
+      const ledgerSynced=await reconcileLedger('submitted');
+      return {phase:'DELIVERED',batch_id:batchId,verified:true,
+        ledger_synced:ledgerSynced,awaiting_manager_ack:true};
+    }
+    if(action==='recheck')
+      return {phase:items[0].phase,batch_id:batchId,verified:false,
+        matchingDraft:observed.matchingDraft===true,requires_manual_choice:true};
+    if(items.some(item=>item.phase==='DELIVERED'))
+      throw new Error('Previously delivered batch requires manager ACK, not a retry');
+    if(recorded.some(item=>item.kind==='queue.transition' &&
+      item.payload?.phase==='RETRYING' && item.payload.leaseNonce===batchId))
+      throw new Error('This batch already had one explicit retry. Recheck or Skip; do not resubmit a possibly sent message');
+    if(!observed.matchingDraft || observed.accountChanged ||
+        observed.generating || !observed.documentReady)
+      throw new Error('Retry refused: exact original draft is not present in an idle Parent tab');
+    await writePhase('RETRYING','manual_retry',
+      'Operator approved one attempt to submit the matching existing draft');
+    let submitted=false;
+    try {
+      const outcome=await callExtension('retry_manager_batch',ext,45000);
+      submitted=outcome?.submitted===true && outcome?.uncertain!==true;
+    } catch { /* An attempted submit can have lost its receipt; do not replay. */ }
+    await writePhase(submitted?'DELIVERED':'UNCERTAIN',
+      submitted?'verified_user_turn':'retry_unconfirmed',
+      submitted?'Batch marker verified inside a submitted user turn':
+        'Retry attempted; browser submission result remains unverified');
+    const ledgerSynced=submitted?await reconcileLedger('submitted'):false;
+    return {phase:submitted?'DELIVERED':'UNCERTAIN',batch_id:batchId,
+      submitted,ledger_synced:ledgerSynced,
+      requires_manual_choice:!submitted,awaiting_manager_ack:submitted};
+  } finally {privateRecoveryInFlight.delete(active.credentialId);}
+}
+
 async function pumpOnePrivateManager(principal) {
   if (!privateCoordinationEnabled || !privateJournal ||
       !armedPrivateDelivery.has(principal.credentialId) ||
-      privateDispatching.has(principal.credentialId)) return;
+      privateDispatching.has(principal.credentialId) ||
+      privateRecoveryInFlight.has(principal.credentialId)) return;
   privateDispatching.add(principal.credentialId);
   diagnostics.debug('fifo.pump_started',{callerTabId:principal.callerTabId});
   try {
     registeredPrivateManager(principal); // Rechecks revocation on every wake.
     const managerScope = privateManagerScope(principal);
     let pendingQueue = privateJournal.queueState(principal, managerScope)
-      .filter((item) => item.phase !== 'PROCESSED' && item.phase !== 'SAGA_CONFIRMED');
+      .filter((item) => !PRIVATE_QUEUE_TERMINAL.has(item.phase));
     if (!pendingQueue.length || pendingQueue[0].phase !== 'QUEUED') {
       diagnostics.debug('fifo.pump_held',{callerTabId:principal.callerTabId,
         queueDepth:pendingQueue.length,phase:pendingQueue[0]?.phase || 'empty'});
@@ -2207,7 +2484,7 @@ async function pumpOnePrivateManager(principal) {
     // An await above may have admitted another producer: revalidate this
     // exact oldest prefix before writing even the first lease.
     pendingQueue = privateJournal.queueState(principal, managerScope)
-      .filter((item) => item.phase !== 'PROCESSED' && item.phase !== 'SAGA_CONFIRMED');
+      .filter((item) => !PRIVATE_QUEUE_TERMINAL.has(item.phase));
     if (events.some((event, i) =>
       pendingQueue[i]?.ref !== event.event_id || pendingQueue[i].phase !== 'QUEUED')) return;
 
@@ -2267,6 +2544,8 @@ function pumpPrivateQueue() {
 }
 
 async function acknowledgePrivateBatch(principal, batchId, eventIds) {
+  if(privateRecoveryInFlight.has(principal.credentialId))
+    throw new Error('Queue recovery in progress; retry ACK after reconciliation');
   const active = registeredPrivateManager(principal);
   const managerScope = privateManagerScope(active);
   const items = privateJournal.queueState(active, managerScope)
@@ -2404,7 +2683,7 @@ const waitSeconds = z
   .max(50)
   .optional()
   .describe(
-    'Seconds to wait for the worker to finish before returning (max 50). If it is still running, you get a task_id; call get_result to keep waiting.'
+    'Optional bounded wait in seconds (max 50). If the task is still running, keep its task_id and yield your assistant response. Completion arrives by orchestrator notification; do not poll for status.'
   );
 
 function buildServer(principal) {
@@ -2481,6 +2760,27 @@ function buildServer(principal) {
         } catch {
           recovery={attached:0,held:null,reconciliation_required:true};
         }
+      } else {
+        // The one-time offer was issued only for this live owned Child tab.
+        // An authenticated Child that consumed it must have received its
+        // setup prompt, even if ChatGPT's DOM rewrites hid the user turn
+        // from the content-script's 12-second confirmation poll. Reconcile
+        // the ORIGINAL task without another browser click or prompt.
+        try {
+          const proof=await callExtension('confirm_child_pairing_submission',{
+            tab_id:live.tab_id,worker_incarnation_id:live.incarnation_id,
+            __sessionBrowserId:offer.browserSessionId,
+            __verifiedChildPairing:true},10000);
+          diagnostics.event(proof?.verified?'info':'warn',
+            'worker.pairing_submission_reconciled',{
+              tabId:live.tab_id,verified:proof?.verified===true});
+        } catch (error) {
+          // Pairing itself is already valid; retain the uncertain FIFO gate
+          // until an authenticated completion or user-turn readback proves
+          // this Child's delivery. Never replay the original prompt.
+          diagnostics.warn('worker.pairing_submission_evidence_deferred',{
+            tabId:live.tab_id,errorClass:classifyDiagnosticError(error)});
+        }
       }
       return textResult({paired:true,tab_id:bound.tabId,
         browser_session_id:bound.browserSessionId,agent_id:bound.agentId,
@@ -2505,7 +2805,7 @@ function buildServer(principal) {
     {
       title: 'Start a worker chat',
       description:
-        'Open or reuse a worker chat under caller_tab_id. Returns an internal task_id; use get_result for updates. The parent may inspect the result and send fixing tasks with send_to_tab until satisfied. Saga references are optional external task metadata, never worker identities or closure gates. Close only when parent-owned work is terminal and all required result receipts are processed.',
+        'Open or reuse a worker chat under caller_tab_id. Returns an internal task_id. After delegating all intended work, finish your assistant response and yield; child completions arrive through orchestrator notifications. Do NOT continuously poll get_result while waiting. Review each notified result and send fixing tasks with send_to_tab as needed. Saga references are optional metadata, never worker identities or closure gates. Close only when parent-owned work is terminal and all required result receipts are processed.',
       inputSchema: {
         caller_tab_id:callerTabInput,
         browser_session_id:browserSessionInput,
@@ -2566,7 +2866,7 @@ function buildServer(principal) {
     {
       title: 'Get a worker result',
       description:
-        'Get the status/result of a task started by spawn_worker or send_to_tab. If it is still running, waits up to wait_seconds (max 50). Call it again if status is still "running".',
+        'Get the status/result of a task started by spawn_worker or send_to_tab for an explicit status request or recovery. Can wait up to wait_seconds (max 50). If still running, do NOT poll repeatedly: finish the assistant response and await the orchestrator completion notification.',
       inputSchema: {
         caller_tab_id:callerTabInput,
         browser_session_id:browserSessionInput,
@@ -2850,6 +3150,8 @@ function privateDashboardSnapshot() {
           queue.push({
             eventId: event.ref, phase: event.phase, type: event.entryType,
             managerTabId: event.recipientTabId,
+            browserSessionId: principal.browserSessionId,
+            batchId: event.leaseNonce,
             principalId: principal.principalId,
             seq: event.firstSeq,
           });
@@ -2858,8 +3160,19 @@ function privateDashboardSnapshot() {
     }
   }
   const visiblePending = queue.filter((item) =>
-    !['PROCESSED', 'SAGA_CONFIRMED'].includes(item.phase)).length;
+    !PRIVATE_QUEUE_TERMINAL.has(item.phase)).length;
   const hiddenPending = Math.max(0, (aggregate?.pending || 0) - visiblePending);
+  // Keep the oldest blocked item of EVERY recipient visible, even when more
+  // than 30 later events accumulated. The UI must never lose its recovery
+  // controls simply because the FIFO grew.
+  const firstPending=new Map();
+  for(const item of queue) {
+    if(PRIVATE_QUEUE_TERMINAL.has(item.phase))continue;
+    const key=item.browserSessionId+':'+item.managerTabId+':'+item.principalId;
+    if(!firstPending.has(key))firstPending.set(key,item);
+  }
+  const selectedQueue=[...new Map([...firstPending.values(),...queue.slice(-30)]
+    .map(item=>[item.eventId,item])).values()].sort((a,b)=>a.seq-b.seq);
   const savedHierarchy=tabRegistry?.list().map(({tabId,parentTabId,rootTabId,site,phase,browserSessionId})=>({
     tabId,parentTabId,rootTabId,site,phase,browserSessionId,
   })) || [];
@@ -2870,7 +3183,7 @@ function privateDashboardSnapshot() {
     browserTabs:currentBrowserTabs,
     completionAlerts:currentCompletionAlerts,
     tabHierarchy:annotateTabPresence(savedHierarchy,currentBrowserTabs),
-    seats, phases, queue: queue.slice(-30),
+    seats, phases, queue: selectedQueue,
     toolCalls: privateToolHistory.slice(-25),
     generatedAt: new Date().toISOString(),
   };
@@ -3250,7 +3563,22 @@ export const desktopMethods = Object.freeze({
   update_readiness: 'desktop_update_readiness',
 });
 export async function desktopAction({action, tab_id, browser_session_id, confirmation_nonce,
-  decision_id,choice,expected_profile_install_id,expected_browser_product}) {
+  decision_id,choice,reason,expected_profile_install_id,expected_browser_product}) {
+  if(action==='recover_queue_batch'||action==='focus_queue_manager'){
+    if(!privateCoordinationEnabled || !privateJournal || !bridgeConnected())
+      throw new Error('Start the private queue and connect the managed browser first');
+    const manager=[...activePrivateManagers.values()].filter(principal=>
+      principal.callerTabId===tab_id && principal.browserSessionId===browser_session_id);
+    if(manager.length!==1)throw new Error('Paired manager in this browser session is unavailable');
+    const principal=registeredPrivateManager(manager[0]);
+    const observation=await callExtension('manager_state',{
+      __trustedPrincipal:principal,__sessionBrowserId:principal.browserSessionId},15000);
+    rememberPrivateManagerReadiness(principal,observation);
+    if(action==='focus_queue_manager')
+      return callExtension('focus_manager_tab',{
+        __trustedPrincipal:principal,__sessionBrowserId:principal.browserSessionId},15000);
+    return recoverPrivateManagerBatch(principal,decision_id,choice,reason);
+  }
   if (action === 'inspect_root_repair') return inspectRootRepair(tab_id,true,browser_session_id);
   if (action === 'confirm_root_repair') return reconcileRootFromDesktop(tab_id,confirmation_nonce,browser_session_id);
   if(action==='list_completion_monitors'||action==='set_manual_completion') {
@@ -3414,8 +3742,10 @@ export async function desktopAction({action, tab_id, browser_session_id, confirm
     if(action==='close_managed_browser') {
       if(!PRIVATE_EVENT_ID.test(expected_profile_install_id||'') ||
           expected_profile_install_id!==socket.profileInstallId ||
-          !['chrome','edge'].includes(expected_browser_product) ||
-          expected_browser_product!==socket.browserProduct)
+           !['chrome','edge','chromium'].includes(expected_browser_product) ||
+           (expected_browser_product==='chromium'
+             ? !['chrome','chromium'].includes(socket.browserProduct)
+             : expected_browser_product!==socket.browserProduct))
         throw new Error('Dedicated browser enrollment or browser product mismatch; refusing to close browser windows');
     }
     if(action==='verify_managed_browser') {
@@ -3450,7 +3780,8 @@ if (process.parentPort) {
       const action = event.data.action;
       if (!Object.hasOwn(desktopMethods,action) &&
           !['inspect_root_repair','confirm_root_repair','verify_managed_browser','update_readiness',
-            'list_agent_closures','resolve_agent_closure'].includes(action)) return;
+            'list_agent_closures','resolve_agent_closure','recover_queue_batch',
+            'focus_queue_manager'].includes(action)) return;
       try {
         const result = await desktopAction(event.data);
         process.parentPort.postMessage({type:'desktop_extension_action_result',request_id:id,ok:true,result});

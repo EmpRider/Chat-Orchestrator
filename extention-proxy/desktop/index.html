@@ -100,14 +100,15 @@
           <p class="help">1. Select installed Edge or Chrome below and choose Save &amp; open browser. This uses a separate persistent Chat Orchestrator profile.</p>
           <p class="help">2. In that browser profile, select Install extension, choose Load unpacked and the bundled extension folder. Enter its local connection URL and profile key.</p>
           <p class="help">3. Once the extension shows Connected, verify that it belongs to the dedicated browser you just opened. This confirmation is required before the app may close managed browser windows.</p>
+          <p class="help">4. Save the exact ChatGPT MCP connector name for this PC (for example PC1). The name must match the connector you create in ChatGPT and is included in all generated Agent instructions.</p>
           <div class="input-row">
             <button id="verify-managed-browser" type="button" class="secondary" disabled>Verify connected browser profile</button>
             <button id="finish-onboarding" type="button" class="primary" disabled>Finish setup</button>
           </div>
           <p id="onboarding-status" class="help" role="status">Choose an installed browser to begin.</p>
         </section>
-        <section class="panel" aria-label="Managed browser onboarding">
-          <div class="section-heading"><h2>Managed browser profile</h2><span class="hint">NO REMOTE DEBUGGING</span></div>
+        <section class="panel" aria-label="One-time browser setup">
+          <div class="section-heading"><h2>One-time browser setup</h2><span class="hint">MANAGED PROFILE + MCP CONNECTOR</span></div>
           <p class="help">Select your installed Windows browser. Chat Orchestrator opens a separate persistent profile, never your personal browser profile.</p>
           <label for="managed-browser">Browser</label>
           <div class="input-row">
@@ -115,6 +116,7 @@
               <option value="none">Choose browser</option>
               <option value="edge">Microsoft Edge</option>
               <option value="chrome">Google Chrome</option>
+              <option value="chromium">Other Chromium-based browser (Brave, Vivaldi, Opera, etc.)</option>
             </select>
             <button id="save-managed-browser" class="secondary" type="button">Save &amp; open browser</button>
             <button id="open-managed-extensions" class="secondary" type="button">Install extension</button>
@@ -122,10 +124,26 @@
             <button id="copy-profile-token" class="secondary" type="button">Copy profile connection key</button>
             <button id="repair-managed-browser" class="secondary" type="button">Repair / Reverify extension</button>
           </div>
+          <div id="chromium-executable-row" hidden>
+            <label for="chromium-executable">Installed Chromium-based browser executable (.exe)</label>
+            <div class="input-row">
+              <input id="chromium-executable" type="text" readonly placeholder="Choose the installed browser's .exe file" />
+              <button id="choose-chromium-executable" class="secondary" type="button">Browse executable</button>
+            </div>
+            <p class="help">Select a trusted Chromium browser executable. Its profile is isolated, and you must install and verify the extension there. Some forks may not support all required extension APIs.</p>
+          </div>
           <p class="help" id="managed-browser-status" role="status">No managed browser selected.</p>
           <p class="help">For development/testing, install the bundled extension through Extensions page → Developer mode → Load unpacked. Chrome Web Store and Edge Add-ons are the intended consumer paths after publishing; store listings have not been verified.</p>
           <p class="help">Extension folder: <code id="unpacked-extension-path">Checking installed resources…</code></p>
           <p class="help">After installation, paste the profile connection key into the extension popup and Save and reconnect. Only this authenticated profile may control browser tabs; never share the key in ChatGPT or other websites.</p>
+          <label for="connector-name">ChatGPT MCP connector name for this PC</label>
+          <div class="input-row">
+            <input id="connector-name" type="text" maxlength="64" spellcheck="false"
+              autocomplete="off" placeholder="PC1" aria-describedby="connector-name-help" />
+            <button id="save-connector-name" type="button" class="secondary">Save connector name</button>
+          </div>
+          <p class="help" id="connector-name-help">Use the <strong>exact connector name</strong> set in ChatGPT. For two PCs use different names, e.g. <code>PC1</code> and <code>PC2</code>. Update it here if the ChatGPT connector is renamed. Names select tools; they are not credentials.</p>
+          <p id="connector-sync-status" class="help" role="status">Configure a connector name, then reconnect or reload the managed browser extension to verify its routing support.</p>
         </section>
         <div class="workspace-grid connection-layout">
           <div class="column-stack"><section class="panel ngrok-panel">

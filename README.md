@@ -44,6 +44,15 @@ Authorization headers, so the same token can be supplied in the dedicated
 The original `/mcp` continues to require a Bearer header.
 No OAuth login endpoints are implemented. Real ChatGPT connector E2E remains unverified.
 
+**Multiple PCs, one ChatGPT account:** Register a separate ChatGPT MCP
+connector for each computer's distinct ngrok URL (for example `PC1` and
+`PC2`). On each Windows app's **Connections → One-time browser setup** panel,
+save the exact connector name displayed in ChatGPT. New Parent/Child setup
+and task/queue instructions then direct the AI to that named connector
+instead of similarly named tools on another PC. This is an instruction,
+not an authentication guarantee or automatic connector registration.
+See the [two-PC setup](extention-proxy/DESKTOP.md#two-or-more-pcs-using-the-same-chatgpt-account).
+
 
 An approved ChatGPT Agent calls scoped MCP tools; a local server authenticates and
 forwards them to the browser extension, which manages Child tabs and results.

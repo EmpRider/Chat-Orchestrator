@@ -9,7 +9,8 @@ import { webcrypto } from 'node:crypto';
 import {composeAgentPrompt,normalizeAgentSettings} from '../agent-settings.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
-const source = fs.readFileSync(path.join(ROOT, 'extention', 'background.js'), 'utf8');
+const source = fs.readFileSync(path.join(ROOT, 'extention', 'background.js'), 'utf8')
+  .replace(/\nconnect\(\);\s*$/, '\n'); // No background reconnect races in offline ownership tests.
 const A = '00000000-0000-4000-8000-000000000001';
 const B = '00000000-0000-4000-8000-000000000002';
 const BROWSER_SESSION = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
@@ -92,7 +93,9 @@ test('all six Worker Tool operations preserve profile-local tab and task state',
         tab.groupId = groupId;
         return groupId;
       },
-      sendMessage: async (id, msg) => msg.cmd === 'ping'
+      sendMessage: async (id, msg) => msg.cmd === 'run_prompt'
+        ? {ok:true,submitted:true}
+        : msg.cmd === 'ping'
         ? { ok: true, ready: true, state: 'idle', documentReady: true }
         : msg.cmd === 'observe_state'
         ? { ok: true, ready: true, state: 'idle' }
@@ -128,17 +131,18 @@ test('all six Worker Tool operations preserve profile-local tab and task state',
       onInstalled: { addListener() {} }, onStartup: { addListener() {} }, onMessage: { addListener() {} } },
     alarms: { onAlarm: { addListener() {} }, create() {} },
   };
-  const ctx = createContext({ chrome, crypto: webcrypto, TextEncoder, URL, console, setTimeout, clearTimeout, setInterval, clearInterval });
+  const ctx = createContext({ chrome, crypto: webcrypto, TextEncoder, URL, WebSocket:{OPEN:1}, console,
+    setTimeout, clearTimeout, setInterval, clearInterval });
   runInContext(source, ctx);
   const rawHandleCall = runInContext('handleCall', ctx);
-  const settings=normalizeAgentSettings({});
+  const settings=normalizeAgentSettings({connectorName:'PC1'});
   const handleCall=(method,args={})=>rawHandleCall(method,method==='spawn_worker'?
     {...args,prompt_text:composeAgentPrompt(settings,{kind:'task',task:args.task,operation:args.operation||'task'})}:
     method==='wake_manager'?{...args,prompt_text:composeAgentPrompt(settings,{kind:'queue',batchId:args.batch_id,events:args.events})}:args);
   const defaults = runInContext('DEFAULTS', ctx);
   assert.match(defaults.serverUrl, /\/bridge$/);
   assert.equal(runInContext('proxySettings', ctx), null, 'Extension starts fail-closed without proxy snapshot');
-  runInContext("proxySettings = { enabled: true, maxWorkers: 10, maxTasksPerHour: 100, taskTimeoutMin: 60, promptSchema: 2, promptModules: {} }", ctx);
+  runInContext("proxySettings = { enabled: true, maxWorkers: 10, maxTasksPerHour: 100, taskTimeoutMin: 60, connectorName:'PC1', promptSchema: 2, promptModules: {} }; proxySettingsRevision=1; wsState='connected';", ctx);
   // This fixture asserts authorization/queue logic, not the separate
   // WebSocket pairing-offer handshake covered by its dedicated test.
   runInContext('issueManagedChildPairing=async()=>"11111111-1111-4111-8111-111111111111"',ctx);

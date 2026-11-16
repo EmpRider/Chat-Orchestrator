@@ -142,7 +142,7 @@ test('initial prompts are focused and submitted one at a time; completed handoff
   h.register(firstTab);
   const secondTab=await h.create('https://chatgpt.com/',h.first,101);
   h.register(secondTab);
-  runInContext('waitReady=async()=>{}; confirmTabIdle=async()=>{}; issueManagedChildPairing=async()=>"11111111-1111-4111-8111-111111111111";',h.ctx);
+  runInContext('waitReady=async()=>{}; confirmTabIdle=async()=>{}; issueManagedChildPairing=async()=>"11111111-1111-4111-8111-111111111111"; proxySettings={connectorName:"PC2"}; proxySettingsRevision=1; wsState="connected";',h.ctx);
   const starts=[];
   const submissions=[];
   h.chrome.tabs.sendMessage=async(tabId,msg)=>{
@@ -151,7 +151,7 @@ test('initial prompts are focused and submitted one at a time; completed handoff
     return new Promise(resolve=>submissions.push({tabId,resolve,msg}));
   };
   const startTask=runInContext('startTask',h.ctx);
-  const cfg={taskTimeoutMin:1};
+  const cfg={taskTimeoutMin:1,connectorName:'PC2'};
   const first=startTask(firstTab.id,'chatgpt','first prompt',0,cfg,false,'credential:test');
   const second=startTask(secondTab.id,'chatgpt','second prompt',0,cfg,false,'credential:test');
   const until=async(fn)=>{
@@ -161,14 +161,22 @@ test('initial prompts are focused and submitted one at a time; completed handoff
   await until(()=>starts.length===1);
   assert.equal(starts[0],firstTab.id);
   assert.match(submissions[0].msg.text,/managed_child_setup/);
+  assert.match(submissions[0].msg.text,/named "PC2"/,
+    'Child pairing must use its own PC connector, not an arbitrary identical tool');
+  assert.doesNotMatch(submissions[0].msg.text,/named "PC1"/);
   assert.match(submissions[0].msg.text,/call pair_conversation/);
+  assert.match(submissions[0].msg.text,/pair_conversation from connector "PC2"/);
   assert.match(submissions[0].msg.text,/call complete_task/);
+  assert.match(submissions[0].msg.text,/end your current response without polling their status/);
+  assert.match(submissions[0].msg.text,/waiting_for_children/);
   assert.equal(h.tabs.get(firstTab.id).active,true);
   assert.equal(h.tabs.get(secondTab.id).active,false,
     'later worker must not steal focus before earlier submission is confirmed');
   submissions[0].resolve({ok:true,submitted:true});
   const resultA=await first;
   assert.equal(resultA.status,'running','response is not required for next startup');
+  assert.equal(resultA.submission_confirmed,true,
+    'successful startup requires an explicit verified user-turn receipt');
   await until(()=>starts.length===2);
   assert.equal(starts[1],secondTab.id);
   assert.equal(h.tabs.get(secondTab.id).active,true);
@@ -176,9 +184,46 @@ test('initial prompts are focused and submitted one at a time; completed handoff
   submissions[1].resolve({ok:true,submitted:true});
   const resultB=await second;
   assert.equal(resultB.status,'running');
+  assert.equal(resultB.submission_confirmed,true);
   assert.notEqual(resultA.task_id,resultB.task_id);
   assert.deepEqual(h.events.startupSequence.filter(s=>s.startsWith('focus:')),
     ['focus:'+firstTab.id,'focus:'+secondTab.id]);
+});
+
+test('a lost run_prompt callback never replays the potentially submitted prompt',async()=>{
+  const h=harness();await h.ready;
+  const tab=await h.create('https://chatgpt.com/',h.first,101);
+  h.register(tab);
+  let sends=0;
+  h.chrome.tabs.sendMessage=async()=>{sends++;throw new Error('Message port closed after dispatch');};
+  const tabMessage=runInContext('tabMessage',h.ctx);
+  await assert.rejects(tabMessage(tab.id,{cmd:'run_prompt',taskId:'test',
+    text:'Only one attempt',receiptNonce:'11111111-1111-4111-8111-111111111111'}),
+  /receipt lost/);
+  assert.equal(sends,1,'side-effecting commands must never be automatically replayed');
+});
+
+test('uncertain and definitely-unsent Child receipts are never reported as submitted',async()=>{
+  const h=harness();await h.ready;
+  const firstTab=await h.create('https://chatgpt.com/',h.first,101);
+  h.register(firstTab);
+  const secondTab=await h.create('https://chatgpt.com/',h.first,101);
+  h.register(secondTab);
+  runInContext('waitReady=async()=>{};confirmTabIdle=async()=>{};proxySettings={connectorName:"PC1"};proxySettingsRevision=1;wsState="connected";issueManagedChildPairing=async()=>"11111111-1111-4111-8111-111111111111";',h.ctx);
+  const outcomes=[{ok:false,uncertain:true,error:'Click receipt not verified'},
+    {ok:false,notSubmitted:true,error:'Send control unavailable'}];
+  h.chrome.tabs.sendMessage=async(_tabId,msg)=>{
+    assert.equal(msg.cmd,'run_prompt');
+    return outcomes.shift();
+  };
+  const startTask=runInContext('startTask',h.ctx);
+  const cfg={taskTimeoutMin:1,connectorName:'PC1'};
+  const first=await startTask(firstTab.id,'chatgpt','First prompt',0,cfg,false,'credential:test');
+  assert.equal(first.status,'uncertain');
+  assert.equal(first.submission_confirmed,false);
+  const second=await startTask(secondTab.id,'chatgpt','Second prompt',0,cfg,false,'credential:test');
+  assert.equal(second.status,'failed');
+  assert.equal(second.submission_confirmed,false);
 });
 
 test('transient Edge tab-edit lock retries focus without creating another worker',async()=>{

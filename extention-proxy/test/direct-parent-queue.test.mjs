@@ -65,7 +65,7 @@ test('D-072/D-073 direct Child clarification and message survive busy Parent; si
       case 'recover_owned_children':result=[];break;
       case 'spawn_worker':result={tab_id:201,incarnation_id:childInc,
         prepared:true,reused_tab:false};break;
-      case 'start_prepared_worker':result={task_id:taskId,tab_id:201,status:'running'};break;
+      case 'start_prepared_worker':result={task_id:taskId,tab_id:201,status:'running',submission_confirmed:true};break;
       case 'hold_child_for_context':result={tab_id:201,task_id:taskId,
         status:'WAITING_FOR_PARENT_CONTEXT',origin_parent_url:route};break;
       case 'manager_state':result={tab_id:m.params.__trustedPrincipal.callerTabId,
