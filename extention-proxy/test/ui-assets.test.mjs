@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const read = (p) => readFileSync(path.join(root, 'desktop', p));
 
-test('dark UI has visible icon assets, setting checkbox and accessible controls', () => {
+test('dark UI has visible icon assets, safe tray guidance and accessible controls', () => {
   const html = read('index.html').toString('utf8');
   const css = read('style.css').toString('utf8');
   const matches = [...html.matchAll(/(?:src)="(assets\/[^"]+)"/g)].map((x) => x[1]);
@@ -33,8 +33,10 @@ test('dark UI has visible icon assets, setting checkbox and accessible controls'
   assert.match(css, /grid-template-columns:\s*repeat\(3/);
   assert.match(css, /\.coordination-control\s*\{[^}]*display:\s*flex;[^}]*column-gap:\s*10px;/,
     'Private queue action/status must not visually run together');
+  assert.match(html, /id="tray-behavior-note"/);
   assert.match(html, /id="minimize-to-tray" type="checkbox" checked/);
   assert.match(html, /Minimize to system tray when closing/);
+  assert.match(html, /When disabled, X opens the Exit confirmation/);
   for (const name of ['proxy-port-label', 'proxy-port', 'save-proxy-port', 'profile-description',
     'extension-local-url', 'domain', 'ngrok-token', 'configure-ngrok', 'connector-url', 'copy-url', 'start', 'stop']) {
     assert.ok(html.includes(`id="${name}"`), `existing control ${name} must remain`);

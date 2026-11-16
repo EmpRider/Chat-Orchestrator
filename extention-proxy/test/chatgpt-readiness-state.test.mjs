@@ -205,6 +205,7 @@ test('ChatGPT account-change warning after click is never reported as a complete
     onMessage:{addListener(fn){onMessage=fn;},removeListener(){}},
     async sendMessage(report){
       if(report?.type==='worker_diagnostic')return {ok:true};
+      if(report?.type==='managed_agent_status_request')return {managed:false};
       if(report?.type==='browser_page_settled') return {ok:true,ready:true};
       if(report?.type==='composer_send_click') throw new Error('Unexpected debugger Send request');
       resolveCompletion(report);return {ok:true};

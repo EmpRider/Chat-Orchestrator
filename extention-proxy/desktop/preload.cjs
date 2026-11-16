@@ -8,6 +8,21 @@ contextBridge.exposeInMainWorld('bridge', Object.freeze({
   getDefaultAgentSettings: () => ipcRenderer.invoke('bridge:getDefaultAgentSettings'),
   saveAgentSettings: (settings) => ipcRenderer.invoke('bridge:saveAgentSettings', settings),
   status: () => ipcRenderer.invoke('bridge:status'),
+  listAgentClosures:()=>ipcRenderer.invoke('bridge:listAgentClosures'),
+  resolveAgentClosure:(id,choice)=>ipcRenderer.invoke('bridge:resolveAgentClosure',id,choice),
+  setCompletionStatus:(taskId,status,browserSessionId)=>
+    ipcRenderer.invoke('bridge:setCompletionStatus',taskId,status,browserSessionId),
+  configureManagedBrowser:(browser)=>ipcRenderer.invoke('bridge:configureManagedBrowser',browser),
+  verifyManagedBrowser:()=>ipcRenderer.invoke('bridge:verifyManagedBrowser'),
+  finishOnboarding:()=>ipcRenderer.invoke('bridge:finishOnboarding'),
+  checkUpdates:()=>ipcRenderer.invoke('bridge:checkUpdates'),
+  requestUpdate:()=>ipcRenderer.invoke('bridge:requestUpdate'),
+  cancelUpdate:()=>ipcRenderer.invoke('bridge:cancelUpdate'),
+  openManagedBrowserExtensions:()=>ipcRenderer.invoke('bridge:openManagedBrowserExtensions'),
+  copyExtensionPath:()=>ipcRenderer.invoke('bridge:copyExtensionPath'),
+  copyProfileToken:()=>ipcRenderer.invoke('bridge:copyProfileToken'),
+  copyPublicMcpToken:()=>ipcRenderer.invoke('bridge:copyPublicMcpToken'),
+  setAutoStartWindows:(enabled)=>ipcRenderer.invoke('bridge:setAutoStartWindows',enabled),
   configurePort: (port) => ipcRenderer.invoke('bridge:configurePort', port),
   setMinimizeToTray: (enabled) => ipcRenderer.invoke('bridge:setMinimizeToTray', enabled),
   configurePrivateCoordination: (enabled) => ipcRenderer.invoke('bridge:configurePrivateCoordination', enabled),
@@ -19,5 +34,10 @@ contextBridge.exposeInMainWorld('bridge', Object.freeze({
     const listener = (_event, state) => callback(state);
     ipcRenderer.on('bridge:state', listener);
     return () => ipcRenderer.removeListener('bridge:state', listener);
+  },
+  onOpenConnectionSetup: (callback) => {
+    const listener = () => callback();
+    ipcRenderer.on('bridge:openConnectionSetup',listener);
+    return () => ipcRenderer.removeListener('bridge:openConnectionSetup',listener);
   },
 }));

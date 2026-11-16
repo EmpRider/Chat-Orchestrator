@@ -36,6 +36,10 @@
         </div>
         <span id="overall" class="pill muted">Checking services</span>
       </header>
+      <section id="update-notice" class="panel" aria-label="Application update available" hidden>
+        <strong id="update-notice-text">A newer release is available.</strong>
+        <button type="button" class="secondary" data-open-view="settings">Review update</button>
+      </section>
       <section id="view-overview" class="app-view" aria-labelledby="page-title">
         <div class="welcome">
           <div class="welcome-copy">
@@ -91,6 +95,38 @@
           <h2>Connect your tools</h2>
           <p>Configure the Ngrok tunnel, then use the local WebSocket URL in the extension and the MCP URL in your chat agent.</p>
         </div>
+        <section class="panel" id="onboarding-panel" aria-label="First-run setup guide">
+          <div class="section-heading"><h2>First-run setup</h2><span class="hint">ONE TIME PER SELECTED BROWSER</span></div>
+          <p class="help">1. Select installed Edge or Chrome below and choose Save &amp; open browser. This uses a separate persistent Chat Orchestrator profile.</p>
+          <p class="help">2. In that browser profile, select Install extension, choose Load unpacked and the bundled extension folder. Enter its local connection URL and profile key.</p>
+          <p class="help">3. Once the extension shows Connected, verify that it belongs to the dedicated browser you just opened. This confirmation is required before the app may close managed browser windows.</p>
+          <div class="input-row">
+            <button id="verify-managed-browser" type="button" class="secondary" disabled>Verify connected browser profile</button>
+            <button id="finish-onboarding" type="button" class="primary" disabled>Finish setup</button>
+          </div>
+          <p id="onboarding-status" class="help" role="status">Choose an installed browser to begin.</p>
+        </section>
+        <section class="panel" aria-label="Managed browser onboarding">
+          <div class="section-heading"><h2>Managed browser profile</h2><span class="hint">NO REMOTE DEBUGGING</span></div>
+          <p class="help">Select your installed Windows browser. Chat Orchestrator opens a separate persistent profile, never your personal browser profile.</p>
+          <label for="managed-browser">Browser</label>
+          <div class="input-row">
+            <select id="managed-browser">
+              <option value="none">Choose browser</option>
+              <option value="edge">Microsoft Edge</option>
+              <option value="chrome">Google Chrome</option>
+            </select>
+            <button id="save-managed-browser" class="secondary" type="button">Save &amp; open browser</button>
+            <button id="open-managed-extensions" class="secondary" type="button">Install extension</button>
+            <button id="copy-extension-path" class="secondary" type="button">Copy extension folder</button>
+            <button id="copy-profile-token" class="secondary" type="button">Copy profile connection key</button>
+            <button id="repair-managed-browser" class="secondary" type="button">Repair / Reverify extension</button>
+          </div>
+          <p class="help" id="managed-browser-status" role="status">No managed browser selected.</p>
+          <p class="help">For development/testing, install the bundled extension through Extensions page → Developer mode → Load unpacked. Chrome Web Store and Edge Add-ons are the intended consumer paths after publishing; store listings have not been verified.</p>
+          <p class="help">Extension folder: <code id="unpacked-extension-path">Checking installed resources…</code></p>
+          <p class="help">After installation, paste the profile connection key into the extension popup and Save and reconnect. Only this authenticated profile may control browser tabs; never share the key in ChatGPT or other websites.</p>
+        </section>
         <div class="workspace-grid connection-layout">
           <div class="column-stack"><section class="panel ngrok-panel">
           <div class="section-heading">
@@ -118,9 +154,11 @@
           </div>
           <div class="input-row">
             <code id="connector-url">Enter your domain above</code>
-            <button id="copy-url" class="icon-button" type="button" aria-label="Copy connector URL" title="Copy connector URL"><img src="assets/copy.png" alt="" /></button>
+            <button id="copy-url" class="icon-button" type="button" aria-label="Copy authenticated connector URL" title="Copy authenticated connector URL"><img src="assets/copy.png" alt="" /></button>
           </div>
-          <p class="help">Use this MCP URL to connect your chat agent. The tunnel itself is managed by Ngrok.</p>
+          <p class="help">For ChatGPT: select <strong>No authentication</strong>, then click Copy Connector URL. The copied HTTPS URL includes a private 256-bit token in the path (<code>/mcp/agent/&lt;token&gt;</code>) as in AgentBridge; the on-screen URL intentionally hides it. Treat the entire copied URL like a password—do not share it, paste it into chats, or publish it. Your tunnel provider may record requested URLs.</p>
+          <p class="help">Legacy <code>/mcp</code> still accepts the same key through an <code>Authorization: Bearer</code> header for clients that support custom headers.</p>
+          <button id="copy-public-mcp-token" type="button" class="secondary">Copy MCP transport key (Bearer clients)</button>
         </section></div>
         </div>
       </section>
@@ -138,6 +176,9 @@
         <div><h2>QUEUED EVENTS</h2><div id="queue-items" class="coordination-scroll">No active queue</div></div>
         <div><h2>REDACTED TOOLS</h2><div id="tool-call-log" class="coordination-scroll">No activity</div></div>
       </div>
+      <h3>Completion checks needing your decision</h3>
+      <p class="help">If automatic checks cannot verify a Child response, choose Completed or In Progress. Unknown responses are never silently marked successful.</p>
+      <div id="completion-alerts" class="coordination-scroll">No task currently needs a manual decision</div>
       <div class="coordination-control"><button id="configure-private-coordination" type="button" class="link-button">Prepare &amp; enable queue on next proxy start</button><span id="private-coordination-state" class="hint">Private coordination is off by default.</span></div>
       <p id="private-journal-inspection" class="help">Journal owner state unknown until inspected locally.</p>
       <p class="help">Read-only proxy snapshot. DELIVERED is not PROCESSED; Saga confirmation is separate. UNCERTAIN requires manual reconciliation.</p>
@@ -149,6 +190,23 @@
           <h2>Automation &amp; preferences</h2>
           <p>Configure worker limits, modular MCP instructions and background behavior.</p>
         </div>
+        <section class="panel" aria-label="Windows startup preference">
+          <label class="tray-toggle" for="auto-start-windows">
+            <input id="auto-start-windows" type="checkbox" />
+            Start Chat Orchestrator automatically when I sign in to Windows
+          </label>
+          <p class="help">Off by default. Available after installing the Windows Setup app. The managed browser uses the same dedicated profile.</p>
+        </section>
+        <section class="panel" aria-label="Application updates">
+          <div class="section-heading"><h2>Application updates</h2><span class="hint">CONSENT REQUIRED</span></div>
+          <p id="update-status" class="help" role="status">Checking published releases…</p>
+          <p class="help">Update Now waits for all Agent work, Parent reviews and queued events to finish before opening the official release page. No installer is automatically downloaded, launched or trusted. Keep the running app open until you intentionally install a verified release.</p>
+          <div class="input-row">
+            <button id="check-updates" type="button" class="secondary">Check for updates</button>
+            <button id="update-now" type="button" class="primary" disabled>Update Now</button>
+            <button id="cancel-update" type="button" class="secondary" disabled>Cancel pending</button>
+          </div>
+        </section>
     <details class="panel extension-settings-panel" id="extension-settings-panel">
       <summary>Extension settings &amp; system prompts <span id="extension-settings-sync" class="hint">Profile-scoped · opens on demand</span></summary>
       <p class="help">Proxy-managed settings synchronize over the local WebSocket when the extension connects. The extension popup configures only the WebSocket URL.</p>
@@ -159,6 +217,15 @@
           <label for="agent-max-workers">Max worker tabs (1–10)</label><input id="agent-max-workers" type="number" min="1" max="10" />
           <label for="agent-max-tasks">Max tasks per hour (1–500)</label><input id="agent-max-tasks" type="number" min="1" max="500" />
           <label for="agent-timeout">Task timeout in minutes (1–60)</label><input id="agent-timeout" type="number" min="1" max="60" />
+          <label for="completion-initial">Completion: initial explicit-tool wait (minutes)</label>
+          <input id="completion-initial" type="number" min="1" max="60" />
+          <label for="completion-retries">Completion: UI recheck gaps (minutes, comma separated)</label>
+          <input id="completion-retries" type="text" spellcheck="false" placeholder="5,3,1" />
+          <label for="completion-hydration">Completion: seconds after chat reload</label>
+          <input id="completion-hydration" type="number" min="4" max="15" />
+          <label for="completion-continued">Completion: checks after manual reminder (minutes)</label>
+          <input id="completion-continued" type="number" min="1" max="60" />
+          <p class="help">Explicit complete_task is preferred. Reload-based UI checks are best-effort and can affect ongoing website generation.</p>
           <p class="help">Worker auto-close is disabled. A parent reviews the result and any fixing tasks, then explicitly closes the worker. Saga IDs are optional references.</p>
         </div>
         <div class="extension-prompts">
@@ -207,6 +274,7 @@
         <input id="minimize-to-tray" type="checkbox" checked />
         <span>Minimize to system tray when closing</span>
       </label>
+      <p class="help" id="tray-behavior-note">When disabled, X opens the Exit confirmation. Cancel keeps the Proxy and browser running.</p>
     </section>
       </section>
     <footer class="bottom-bar">
@@ -221,6 +289,25 @@
     </footer>
     </main>
   </div>
+  <section id="closure-overlay" class="closure-overlay" role="dialog"
+    aria-modal="true" aria-labelledby="closure-heading" hidden>
+    <div class="closure-dialog">
+      <span class="eyebrow">AGENT RECOVERY · USER DECISION REQUIRED</span>
+      <h2 id="closure-heading">A managed Agent tab closed</h2>
+      <p id="closure-identity"></p>
+      <p id="closure-url" class="help"></p>
+      <p id="closure-warning" class="help"></p>
+      <div id="closure-descendants" class="coordination-scroll"></div>
+      <p id="closure-countdown" role="status" aria-live="polite"></p>
+      <p id="closure-backlog" class="help"></p>
+      <div class="input-row">
+        <button id="closure-accident" class="primary" type="button" disabled>Accident</button>
+        <button id="closure-yes" class="secondary" type="button" disabled>Yes — close descendants</button>
+        <button id="closure-cancel" class="secondary" type="button" disabled>Cancel — leave tabs unmanaged</button>
+      </div>
+      <p id="closure-error" class="help" role="alert"></p>
+    </div>
+  </section>
   <script src="renderer.js"></script>
   <script src="navigation.js"></script>
 </body>

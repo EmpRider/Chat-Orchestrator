@@ -10,8 +10,12 @@ const HOST = '127.0.0.1';
 
 export function chooseUpstream(rawUrl, agentBridgePort = 9002, orchestratorPort = 8787) {
   const url = new URL(rawUrl, 'http://localhost');
-  if (url.pathname === '/orchestrator/mcp') {
-    return { port: orchestratorPort, path: `/mcp${url.search}`, orchestrator: true };
+  if (url.pathname === '/orchestrator/mcp' ||
+      url.pathname === '/orchestrator/mcp/agent' ||
+      url.pathname.startsWith('/orchestrator/mcp/agent/')) {
+    return { port: orchestratorPort,
+      path: `${url.pathname.slice('/orchestrator'.length)}${url.search}`,
+      orchestrator: true };
   }
   return { port: agentBridgePort, path: rawUrl, orchestrator: false };
 }

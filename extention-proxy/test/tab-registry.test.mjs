@@ -51,6 +51,35 @@ test('session registry isolates reused numeric tab IDs across browser profiles',
   await registry.closeSession();
 });
 
+test('Accident recovery rebinds nested Agent ancestry without promoting grandchildren',async()=>{
+  const registry=createSessionTabRegistry();
+  const session=randomUUID();
+  const root=observed(101,session);
+  const child=observed(201,session,{managed:true});
+  const grandchild=observed(301,session,{managed:true});
+  const unrelated=observed(401,session);
+  await registry.registerRoot(root);
+  await registry.registerChild(101,child);
+  await registry.registerChild(201,grandchild);
+  await registry.registerRoot(unrelated);
+  await registry.replaceClosedAgent(101,observed(102,session),root.incarnation_id);
+  assert.equal(registry.get(101,session),null);
+  assert.equal(registry.directChild(102,201,session),true);
+  assert.equal(registry.directChild(201,301,session),true);
+  assert.equal(registry.get(301,session).rootTabId,102);
+  assert.equal(registry.get(401,session).rootTabId,401);
+  await assert.rejects(registry.replaceClosedAgent(201,
+    observed(202,session,{managed:true}),randomUUID()),/does not match/);
+  await registry.replaceClosedAgent(201,
+    observed(202,session,{managed:true}),child.incarnation_id);
+  assert.equal(registry.directChild(102,202,session),true);
+  assert.equal(registry.directChild(202,301,session),true);
+  assert.deepEqual(await registry.detachSubtree(202,session),[301,202]);
+  assert.equal(registry.get(102,session).parentTabId,null);
+  assert.equal(registry.get(401,session).parentTabId,null);
+  await registry.closeSession();
+});
+
 test('session registry ignores legacy files and preserves FIFO files untouched',async(t)=>{
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'session-registry-'));
   t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));

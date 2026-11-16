@@ -8,6 +8,7 @@
   });
   const byId = (id) => document.getElementById(id);
   const navItems = [...document.querySelectorAll('[data-view]')];
+  let initialSetupViewed = false;
 
   function showView(name) {
     if (!Object.hasOwn(titles, name)) return;
@@ -40,6 +41,10 @@
   }
   function update(state) {
     if (!state) return;
+    if(!initialSetupViewed){
+      initialSetupViewed=true;
+      if(state.onboardingComplete!==true)showView('connections');
+    }
     byId('sidebar-profile').textContent = state.profile || 'default';
     const running = state.phase === 'running';
     const ext = running && state.extensionConnected;
@@ -62,6 +67,7 @@
     } else if (!online) {
       headline = 'Your extension is ready. Connect the tunnel';
       guidance = 'Add your dedicated ngrok domain and authtoken under Connections, then select Save & connect.';
+    } else {
       headline = 'All connections are ready';
       guidance = 'The extension is synchronized and the MCP route is online. You can delegate tasks from ChatGPT.';
     }
@@ -69,5 +75,6 @@
     byId('setup-guidance').textContent = guidance;
   }
   window.bridge.onState(update);
+  window.bridge.onOpenConnectionSetup?.(()=>showView('connections'));
   window.bridge.status().then(update).catch(() => {});
 })();

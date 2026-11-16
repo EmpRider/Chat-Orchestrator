@@ -50,6 +50,15 @@ export function connectorUrl(domain) {
   return new URL('/mcp', normalizeNgrokDomain(domain)).toString();
 }
 
+// Dedicated ChatGPT custom-MCP endpoint for clients that cannot supply a
+// custom Authorization header. Keep the secret out of public UI state.
+export function agentConnectorUrl(domain,publicMcpToken){
+  if(!domain)return '';
+  if(typeof publicMcpToken!=='string' || !/^[a-f0-9]{64}$/i.test(publicMcpToken))
+    throw new Error('Valid 256-bit MCP transport key required for URL authentication');
+  return new URL('/mcp/agent/'+publicMcpToken,normalizeNgrokDomain(domain)).toString();
+}
+
 export function normalizeNgrokAuthtoken(input) {
   const value = String(input || '').trim();
   if (value.length < 10 || value.length > 1024 || /\s/.test(value)) {

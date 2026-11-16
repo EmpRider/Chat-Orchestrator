@@ -1,6 +1,6 @@
 // MCP server <-> browser extension bridge.
 //
-//   Orchestrator chat --(MCP over HTTPS, via tunnel)--> POST /mcp
+//   Orchestrator chat --(MCP over HTTPS, via tunnel)--> POST /mcp/agent/<key>
 //   this server       --(WebSocket, localhost)-------> extension service worker (/bridge)
 //   extension         --(tabs + content scripts)-----> worker chat tabs
 
@@ -16,12 +16,29 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { disabledAgentSettings, normalizeAgentSettings, replaceObsoletePromptSettings, composeAgentPrompt } from './agent-settings.mjs';
 import { createSessionTabRegistry } from './tab-registry.mjs';
+import { createCallerIdentity } from './caller-identity.mjs';
+import { createAgentBindingStore } from './agent-binding-store.mjs';
+import { createIdempotencyLedger } from './idempotency.mjs';
+import { createDurableIdempotencyLedger } from './durable-idempotency.mjs';
 import { normalizeOpenChatTabs, annotateTabPresence } from './tab-presence.mjs';
 import { createDiagnostics, classifyDiagnosticError } from './diagnostics.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || '127.0.0.1';
+const EXTENSION_PROFILE_TOKEN=process.env.CHAT_ORCH_EXTENSION_PROFILE_TOKEN || '';
+if(EXTENSION_PROFILE_TOKEN && !/^[a-f0-9]{64}$/i.test(EXTENSION_PROFILE_TOKEN))
+  throw new Error('Invalid local profile connection secret; refuse to start');
+const PUBLIC_PORT=process.env.CHAT_ORCH_PUBLIC_PORT == null
+  ? null:Number(process.env.CHAT_ORCH_PUBLIC_PORT);
+const PUBLIC_MCP_TOKEN=process.env.CHAT_ORCH_PUBLIC_MCP_TOKEN || '';
+if (PUBLIC_PORT!==null && !/^[a-f0-9]{64}$/i.test(PUBLIC_MCP_TOKEN))
+  throw new Error('Public MCP listener requires an independent 256-bit transport credential');
+if (PUBLIC_PORT!==null &&
+    (!Number.isSafeInteger(PUBLIC_PORT) || PUBLIC_PORT<1024 || PUBLIC_PORT>65535 ||
+     PUBLIC_PORT===PORT)) {
+  throw new Error('Public HTTP-only MCP port must be distinct from the local WebSocket port');
+}
 const diagnostics = createDiagnostics({component:'proxy'});
 
 // Profile settings are independent of any proxy or browser-extension secret.
@@ -91,6 +108,18 @@ const profileManagerIdentities = new Map(); // caller tab -> current connection 
 let tabRegistry = null;
 let profileSocketGeneration = 0;
 const proxySessionId = crypto.randomUUID();
+const bindingStore=(process.env.CHAT_ORCH_SETTINGS_DIR || process.env.CHAT_ORCH_PROFILE_DIR)
+  ? createAgentBindingStore(path.dirname(AGENT_SETTINGS_FILE)) : null;
+const callerIdentity = createCallerIdentity({
+  onChange:(bindings)=>bindingStore?.save(bindings),
+});
+if(bindingStore) callerIdentity.restore(bindingStore.load());
+const mcpIdempotency = createIdempotencyLedger();
+let durableIdempotency = null;
+const callerMeta = (extra) => ({
+  session: extra?._meta?.['openai/session'],
+  subject: extra?._meta?.['openai/subject'] || '',
+});
 function profileCredentialId(browserSessionId, tabId) {
   // Stable non-secret identity scoped to this app profile and browser manager tab.
   const hex = crypto.createHash('sha256')
@@ -142,45 +171,38 @@ function currentPrivatePrincipal(principal) {
     principal.credentialId === profileCredentialId(principal.browserSessionId,principal.callerTabId));
 }
 
-async function resolveCaller(args = {}, { createRoot = false } = {}) {
+async function resolveCaller(args = {}, { createRoot = false } = {}, extra) {
   if (!tabRegistry) throw new Error('Proxy tab registry unavailable');
-  if (!args.__sessionBrowserId && args.browser_session_id) {
-    args.__sessionBrowserId=args.browser_session_id;
-  }
-  const tabId = args.caller_tab_id;
-  if (!Number.isSafeInteger(tabId) || tabId <= 0) {
-    throw new Error('caller_tab_id required: call list_tabs first to identify the calling chat tab');
-  }
-  let browserSessionId=args.__sessionBrowserId || null;
-  let record=browserSessionId ? tabRegistry.get(tabId,browserSessionId) : null;
-  browserSessionId ||= record?.browserSessionId;
-  if (!browserSessionId) {
-    const matches = (await callExtension('list_tabs',{__discoveryOnly:true},10000))
-      .filter((tab)=>tab.tab_id===tabId);
-    if (matches.length !== 1) {
-      throw new Error(matches.length
-        ? 'caller_tab_id exists in multiple browser sessions; select the browser session explicitly'
-        : 'caller_tab_id not found in any connected browser session');
-    }
-    browserSessionId = matches[0].browser_session_id;
-    args.__sessionBrowserId = browserSessionId;
-  } else if (!record && !args.browser_session_id) {
-    // A read_chat tab lookup may have selected a session; never use that
-    // selection as proof that the calling tab belongs to it.
-    const matches = (await callExtension('list_tabs',{__discoveryOnly:true},10000))
-      .filter((tab)=>tab.tab_id===tabId);
-    if (matches.length !== 1 || matches[0].browser_session_id !== browserSessionId)
-      throw new Error('Caller browser session is ambiguous; pass browser_session_id from list_tabs');
-  }
+  const binding = callerIdentity.getByCredential(args.agent_credential);
+  if (!binding) throw new Error('Unpaired Agent credential; use pair_conversation in the corresponding ChatGPT tab first');
+  const tabId = binding.tabId;
+  const browserSessionId = binding.browserSessionId;
+  if (args.caller_tab_id != null && args.caller_tab_id !== tabId)
+    throw new Error('Provided tab ID conflicts with paired conversation');
+  if (args.browser_session_id != null && args.browser_session_id !== browserSessionId)
+    throw new Error('Provided browser session conflicts with paired conversation');
+  args.__sessionBrowserId = browserSessionId;
+  await waitForExtensionReconnect(browserSessionId,extra?.signal);
+  // An authenticated Extension has to reconcile approved live roots before
+  // a restored credential may perform any operation after Proxy restart.
+  const recovery=sessionRecoveryPromises.get(browserSessionId);
+  if(recovery)await recovery;
+  let record=tabRegistry.get(tabId,browserSessionId);
   const inspection = await callExtension('inspect_tab', {tab_id:tabId,
     __sessionBrowserId:browserSessionId},10000);
-  browserSessionId ||= inspection.browser_session_id;
-  args.__sessionBrowserId ||= browserSessionId;
+  if (inspection.incarnation_id !== binding.incarnationId ||
+      inspection.route_hash !== binding.routeHash) {
+    callerIdentity.revokeCredential(binding.agentCredential);
+    throw new Error('Paired tab or conversation changed; re-pair the currently opened chat');
+  }
+  if (inspection.browser_session_id !== browserSessionId)
+    throw new Error('Paired browser profile changed');
   diagnostics.debug('identity.inspected',{tabId,site:inspection.site,
     registryPresent:Boolean(record)});
   if (!record) {
-    if (!createRoot) throw new Error('Unregistered caller: use spawn_worker to establish the root relationship');
-    record = await tabRegistry.registerRoot(inspection);
+    // A public MCP invocation must never silently promote a discovered tab.
+    // Root enrollment is an explicit, user-approved pairing transaction.
+    throw new Error('Unregistered caller: explicitly approve and pair this Parent in the extension');
   }
   if (record.browserSessionId !== browserSessionId) {
     throw new Error('Caller tab belongs to another browser session; pass the browser_session_id reported by list_tabs');
@@ -222,8 +244,13 @@ async function resolveCaller(args = {}, { createRoot = false } = {}) {
   verifiedPrincipalContexts.add(principal);
   if (privateCoordinationEnabled && privateJournal) {
     // Re-enroll the verified tab after proxy/extension reconnect so its
-    // existing durable queue can be inspected. Wake remains explicitly armed.
+    // existing durable queue can be inspected. Automatic delivery is the
+    // default; an explicit user/Agent Pause still takes precedence.
     activePrivateManagers.set(principal.credentialId,principal);
+    if(!pausedPrivateDelivery.has(principal.credentialId)){
+      armedPrivateDelivery.add(principal.credentialId);
+      setImmediate(pumpPrivateQueue);
+    }
   }
   return principal;
 }
@@ -327,18 +354,107 @@ async function verifyDirectChild(callerId, childId, sessionId) {
 
 async function verifyLiveAncestry(tabId, sessionId) {
   let node = tabRegistry.get(tabId,sessionId);
+  if (!node) throw new Error('Target Agent is not registered in the caller browser session');
+  const pending=await callExtension('desktop_list_agent_closures',{
+    __trustedDesktopConsent:true,__sessionBrowserId:sessionId,
+  },10000).catch(()=>[]);
+  const isPending=(record)=>pending.some((entry)=>
+    entry.browserSessionId===sessionId &&
+    entry.oldTabId===record.tabId &&
+    entry.incarnationId===record.incarnationId &&
+    entry.status==='pending');
   while (node && node.parentTabId !== null) {
+    let current=null;
+    try {current=await callExtension('inspect_tab',{
+      tab_id:node.tabId,__sessionBrowserId:sessionId},10000);}
+    catch(error) {if(!isPending(node))throw error;}
+    if (current && (current.incarnation_id !== node.incarnationId ||
+        current.browser_session_id !== sessionId || current.site !== node.site ||
+        current.is_managed_worker !== true))
+      throw new Error('Descendant tab incarnation or site changed; read/delegation denied');
     const parent = tabRegistry.get(node.parentTabId,sessionId);
     if (!parent || parent.incarnationId !== node.parentIncarnationId)
       throw new Error('Orphaned parent tab; new delegation is held for reconciliation');
-    const observed = await callExtension('inspect_tab',{tab_id:parent.tabId,
-      __sessionBrowserId:parent.browserSessionId},10000);
-    if (observed.incarnation_id !== parent.incarnationId ||
+    let observed=null;
+    try {observed=await callExtension('inspect_tab',{tab_id:parent.tabId,
+      __sessionBrowserId:parent.browserSessionId},10000);}
+    catch(error) {if(!isPending(parent)) throw error;}
+    if (observed && (observed.incarnation_id !== parent.incarnationId ||
         observed.browser_session_id !== parent.browserSessionId ||
-        observed.site !== parent.site)
+        observed.site !== parent.site))
       throw new Error('Ancestor tab changed or closed; new delegation is held');
     node = parent;
   }
+}
+
+// Reattach only existing, still-live Child identities after a Proxy process
+// restart. Never automatically replay a browser prompt or ACK a queue event.
+async function reconstructLiveDescendants(parentTabId,browserSessionId,visited=new Set()) {
+  if (visited.has(parentTabId) || visited.size>=200)
+    throw new Error('Cannot reconcile cyclic or oversized Agent ancestry');
+  visited.add(parentTabId);
+  const ownerCredential=profileCredentialId(browserSessionId,parentTabId);
+  const children=await callExtension('recover_owned_children',{
+    __trustedRecovery:true,__sessionBrowserId:browserSessionId,
+    owner_credential:ownerCredential,
+  },12000);
+  if (!Array.isArray(children)) throw new Error('Untrusted descendant recovery response');
+  let attached=0,held=0;
+  for (const live of children) {
+    try {
+      if (visited.has(live.tab_id) || live.browser_session_id!==browserSessionId ||
+          live.is_managed_worker!==true) throw new Error('Changed Child ancestry');
+      const prior=tabRegistry.get(live.tab_id,browserSessionId);
+      if (prior && prior.parentTabId!==parentTabId)
+        throw new Error('Child belongs to a different registered Parent');
+      if (!prior) {
+        await tabRegistry.registerChild(parentTabId,live);
+        await tabRegistry.setPhase(live.tab_id,'reattached',browserSessionId);
+        attached++;
+      }
+      const nested=await reconstructLiveDescendants(live.tab_id,browserSessionId,visited);
+      attached+=nested.attached;
+      held+=nested.held;
+    } catch {
+      held++;
+      // Retain the browser tab for manual reconciliation; never invent a root.
+    }
+  }
+  return {attached,held};
+}
+
+// Reattach only verified, still-open Parents/Children on authenticated
+// extension reconnection. This creates no tabs, sends no prompts and ACKs
+// no queued events.
+const sessionRecoveryPromises=new Map();
+async function reattachApprovedAgents(browserSessionId,socket) {
+  if(!socket.profileAuthenticated || extensionSockets.get(browserSessionId)!==socket)
+    return {attached:0,held:0,skipped:true};
+  const inventory=await callExtension('inspect_all_tabs',{
+    __sessionBrowserId:browserSessionId},12000);
+  if(!Array.isArray(inventory)||inventory.length>200)
+    throw new Error('Verified browser inventory unavailable');
+  let attached=0,held=0;
+  for(const item of inventory){
+    if(item?.site!=='chatgpt'||item.parent_approved!==true||
+        item.is_managed_worker!==false)continue;
+    try {
+      const live=await callExtension('inspect_tab',{
+        tab_id:item.tab_id,__sessionBrowserId:browserSessionId},10000);
+      if(extensionSockets.get(browserSessionId)!==socket ||
+          live.browser_session_id!==browserSessionId ||
+          live.incarnation_id!==item.incarnation_id ||
+          live.site!=='chatgpt'||live.is_managed_worker||!live.parent_approved)
+        throw new Error('Parent approval or tab incarnation changed');
+      const prior=tabRegistry.get(item.tab_id,browserSessionId);
+      if(prior&&(prior.incarnationId!==live.incarnation_id||prior.parentTabId!==null))
+        throw new Error('Existing Parent ancestry differs');
+      if(!prior){await tabRegistry.registerRoot(live);attached++;}
+      const children=await reconstructLiveDescendants(item.tab_id,browserSessionId);
+      attached+=children.attached;held+=children.held;
+    }catch {held++;}
+  }
+  return {attached,held};
 }
 
 const preparingWorkerTabs = new Set(); // browser session + tab ID
@@ -355,6 +471,13 @@ async function spawnAndBindWorker(args, principal) {
   return serializeWorkerSpawn(() => prepareAndStartWorker(args,principal));
 }
 async function prepareAndStartWorker(args, principal) {
+  // D-057: retain the adapter boundary, but never create an unsupported
+  // provider tab in the ChatGPT-only first release.
+  if (args.site !== 'chatgpt') {
+    return {spawned:false,status:'PROVIDER_NOT_SUPPORTED',
+      supported_providers:['chatgpt'],
+      message:'This release supports ChatGPT workers only. Choose site "chatgpt".'};
+  }
   await verifyLiveAncestry(principal.callerTabId,principal.browserSessionId);
   const callerRecord=tabRegistry.get(principal.callerTabId,principal.browserSessionId);
   const root = tabRegistry.get(callerRecord?.rootTabId,principal.browserSessionId);
@@ -848,7 +971,8 @@ function replayPrivateJournal(bytes) {
 async function openPrivateEventJournal() {
   if (!privateCoordinationEnabled) throw new Error('Private coordination is disabled');
   // The journal belongs to this app profile and never depends on a token file.
-  const profileDir = process.env.CHAT_ORCH_PROFILE_DIR;
+  const profileDir = process.env.CHAT_ORCH_JOURNAL_DIR ||
+    process.env.CHAT_ORCH_PROFILE_DIR;
   if (!profileDir || !path.isAbsolute(profileDir))
     throw new Error('Private journal requires the desktop profile directory');
   const journalPath = path.join(profileDir, 'coordination.events.journal');
@@ -1211,6 +1335,45 @@ const pending = new Map(); // id -> { resolve, reject, timer, ws }
 let bridge = null; // most recently active socket for legacy calls
 let sessionHeartbeatTimer = null;
 const bridgeConnected = () => [...extensionSockets.values()].some((ws) => ws.readyState === 1);
+// D-029/D-030: only in-flight, authenticated MCP calls may wait for an
+// extension. A client abort or deadline removes the waiter; no offline
+// operation is persisted or later dispatched.
+const extensionReconnectionWaiters=new Map();
+function extensionSessionReady(browserSessionId) {
+  const ws=extensionSockets.get(browserSessionId);
+  return Boolean(ws && ws.readyState===1 && ws.profileReady===true);
+}
+function waitForExtensionReconnect(browserSessionId,signal,timeoutMs=55000) {
+  if(extensionSessionReady(browserSessionId))return Promise.resolve();
+  if(signal?.aborted)return Promise.reject(new Error('MCP request cancelled before bridge dispatch'));
+  return new Promise((resolve,reject)=>{
+    let settled=false;
+    const waiters=extensionReconnectionWaiters.get(browserSessionId)||new Set();
+    extensionReconnectionWaiters.set(browserSessionId,waiters);
+    const cleanup=()=>{
+      waiters.delete(complete);
+      if(!waiters.size)extensionReconnectionWaiters.delete(browserSessionId);
+      clearTimeout(timer);
+      signal?.removeEventListener?.('abort',cancel);
+    };
+    const complete=(error)=>{
+      if(settled)return;
+      settled=true;cleanup();
+      if(error)reject(error);else resolve();
+    };
+    const cancel=()=>complete(new Error('MCP request cancelled before bridge dispatch'));
+    const timer=setTimeout(()=>complete(new Error(
+      'Extension did not reconnect before the active MCP request deadline')),timeoutMs);
+    waiters.add(complete);
+    signal?.addEventListener?.('abort',cancel,{once:true});
+    if(extensionSessionReady(browserSessionId))complete();
+  });
+}
+function notifyExtensionReady(browserSessionId) {
+  if(!extensionSessionReady(browserSessionId))return;
+  for(const done of [...(extensionReconnectionWaiters.get(browserSessionId)||[])])
+    done();
+}
 
 function extensionSocketFor(params = {}) {
   const principal = params.__trustedPrincipal;
@@ -1319,15 +1482,22 @@ function bindExtensionSocket(ws, browserSessionId) {
   ws.lastHeartbeatAt = Date.now();
   extensionSockets.set(browserSessionId, ws);
   bridge = ws;
+  // Inform the trusted Desktop whenever socket ownership changes, including
+  // a fast replacement between health polling intervals. Never export a
+  // browser enrollment ID or connection secret over this event.
+  process.parentPort?.postMessage({type:'extension_session_changed'});
   diagnostics.info('bridge.connected',{socketGeneration:ws.connectionGeneration});
   if (previous && previous !== ws) {
+    callerIdentity.disconnect(previous);
     failSocketPending(previous,'This browser session reconnected; prior call outcome may be uncertain');
     previous.close(4000,'same browser session reconnected');
   }
   ws.on('close', () => {
+    callerIdentity.disconnect(ws);
     if (extensionSockets.get(browserSessionId) !== ws) return;
     extensionSockets.delete(browserSessionId);
     if (bridge === ws) bridge = [...extensionSockets.values()].at(-1) || null;
+    process.parentPort?.postMessage({type:'extension_session_changed'});
     failSocketPending(ws,'Browser extension session disconnected during call');
     for (const [managerKey, principal] of profileManagerIdentities) {
       if (principal.socket !== ws) continue;
@@ -1363,11 +1533,16 @@ function sendSessionHeartbeat() {
 }
 
 function resetExtensionSessionState() {
+  // Durable capabilities survive a Proxy restart. Every use still re-attests
+  // its live browser/incarnation, and a missing tab registry blocks execution
+  // until authenticated extension recovery reconstructs approved ancestry.
+  callerIdentity.clear({preserveBindings:true});
   profileSocketGeneration++;
   profileManagerIdentities.clear();
   activePrivateManagers.clear();
   privateManagerObservations.clear();
   armedPrivateDelivery.clear();
+  pausedPrivateDelivery.clear();
   rootRepairOffers.clear();
   rootRepairBusy.clear();
   tabRegistry = createSessionTabRegistry();
@@ -1382,6 +1557,16 @@ wss.on('connection', (ws) => {
     try { msg = JSON.parse(raw.toString()); } catch { return; }
     if (msg.type === 'register_session') {
       const sessionId = msg.browser_session_id;
+      if(EXTENSION_PROFILE_TOKEN) {
+        const supplied=typeof msg.profile_token==='string' &&
+          /^[a-f0-9]{64}$/i.test(msg.profile_token)
+          ? Buffer.from(msg.profile_token,'hex') : Buffer.alloc(32);
+        const expected=Buffer.from(EXTENSION_PROFILE_TOKEN,'hex');
+        if(!crypto.timingSafeEqual(supplied,expected)) {
+          ws.close(4002,'unpaired browser profile');
+          return;
+        }
+      }
       if (!PRIVATE_EVENT_ID.test(sessionId || '') ||
           !Number.isSafeInteger(msg.connection_generation) || msg.connection_generation < 1) {
         ws.close(4002,'invalid browser session handshake');
@@ -1389,6 +1574,13 @@ wss.on('connection', (ws) => {
       }
       if (handshakeComplete) return;
       handshakeComplete = true;
+      ws.profileAuthenticated=Boolean(EXTENSION_PROFILE_TOKEN);
+      ws.profileInstallId=PRIVATE_EVENT_ID.test(msg.profile_install_id||'')
+        ? msg.profile_install_id : null;
+      ws.browserProduct=['edge','chrome'].includes(msg.browser_product)
+        ? msg.browser_product : null;
+      ws.extensionVersion=/^\d+\.\d+\.\d+$/.test(msg.extension_version||'')
+        ? msg.extension_version : null;
       ws.requestedConnectionGeneration=msg.connection_generation;
       // A stale client must not reset unrelated browser profiles. The session
       // acknowledgement lets only this extension clear its own old state.
@@ -1403,7 +1595,19 @@ wss.on('connection', (ws) => {
     }
     if (!handshakeComplete || extensionSockets.get(ws.browserSessionId) !== ws) return;
     if (msg.type === 'session_ready') {
+      ws.profileReady=true;
       sendExtensionSettings(ws);
+      const recovery=reattachApprovedAgents(ws.browserSessionId,ws)
+        .catch((error)=>{
+          diagnostics.warn('identity.restore_held',{
+            errorClass:classifyDiagnosticError(error)});
+          return {attached:0,held:1};
+        }).finally(()=>{
+          if(sessionRecoveryPromises.get(ws.browserSessionId)===recovery)
+            sessionRecoveryPromises.delete(ws.browserSessionId);
+        });
+      sessionRecoveryPromises.set(ws.browserSessionId,recovery);
+      notifyExtensionReady(ws.browserSessionId);
       return;
     }
     if (msg.type === 'session_heartbeat_ack') {
@@ -1437,6 +1641,36 @@ function handleExtensionMessage(ws,msg) {
   }
   if (msg.type === 'ping') {
     ws.send(JSON.stringify({type:'pong'}));
+    return;
+  }
+  if (msg.type === 'pairing_offer') {
+    if (!PRIVATE_EVENT_ID.test(msg.request_id || '')) return;
+    void (async () => {
+      const live = await callExtension('inspect_tab', {
+        tab_id:msg.tab_id,__sessionBrowserId:ws.browserSessionId},10000);
+      if (live.incarnation_id !== msg.incarnation_id ||
+          live.route_hash !== msg.route_hash ||
+          live.browser_session_id !== ws.browserSessionId ||
+          extensionSockets.get(ws.browserSessionId) !== ws)
+        throw new Error('Pairing browser tab did not match');
+      if (live.is_managed_worker) {
+        const managed=tabRegistry?.get(live.tab_id,ws.browserSessionId);
+        if (!managed || managed.parentTabId === null ||
+            managed.incarnationId !== live.incarnation_id)
+          throw new Error('Only a registered, owned Child may pair as a Child');
+      } else if (live.parent_approved !== true) {
+        throw new Error('A user-approved Parent is required for root pairing');
+      }
+      callerIdentity.offer({code:msg.code,browserSessionId:ws.browserSessionId,
+        tabId:msg.tab_id,incarnationId:msg.incarnation_id,
+        routeHash:msg.route_hash,socket:ws});
+    })().then(() => {
+      if (ws.readyState === 1) ws.send(JSON.stringify({type:'pairing_offer_ack',
+        request_id:msg.request_id,ok:true}));
+    }).catch(() => {
+      if (ws.readyState === 1) ws.send(JSON.stringify({type:'pairing_offer_ack',
+        request_id:msg.request_id,ok:false,error:'Browser tab pairing could not be verified'}));
+    });
     return;
   }
   if (msg.type === 'diagnostic_event') {
@@ -1553,6 +1787,10 @@ async function registerPrivateManager(principal) {
   if (!currentPrivatePrincipal(principal)) throw new Error('Configured manager tab changed during registration');
   rememberPrivateManagerReadiness(principal, observation);
   activePrivateManagers.set(principal.credentialId, principal);
+  if(!pausedPrivateDelivery.has(principal.credentialId)){
+    armedPrivateDelivery.add(principal.credentialId);
+    setImmediate(pumpPrivateQueue);
+  }
   return { registered: true, manager_tab_id: principal.callerTabId,
     observation: observation.state, storage_ready: true };
 }
@@ -1577,8 +1815,9 @@ async function closeReviewedWorker(principal, args) {
       inspected.worker_incarnation_id !== worker.incarnationId ||
       !Array.isArray(inspected.tasks) || inspected.tasks.length === 0 ||
       inspected.tasks.some((task)=>!PRIVATE_EVENT_ID.test(task.task_id || '') ||
-        !['done','failed'].includes(task.status))) {
-    throw new Error('Worker tasks are missing, running or unresolved');
+        !['done','failed'].includes(task.status) ||
+        task.parent_reviewed !== true)) {
+    throw new Error('Worker tasks are missing, unresolved or awaiting explicit Parent review');
   }
   if (privateCoordinationEnabled && privateJournal) {
     const active = registeredPrivateManager(principal);
@@ -1625,17 +1864,105 @@ function getPrivateFullReport(principal, eventId) {
     full_report_ref: eventId, result_sha256: digest, report: structuredClone(data) };
 }
 
-async function enqueuePrivateStatus(principal, idempotencyKey, summary) {
+async function enqueuePrivateStatus(principal, idempotencyKey, summary,originParentUrl=null) {
   const active = registeredPrivateManager(principal);
   const scope = privateManagerScope(active);
   if (typeof summary !== 'string' || summary.length > 4000) {
     throw new Error('Invalid status request summary');
   }
+  const origin=verifiedParentConversationRoute(originParentUrl);
   const record = await privateJournal.append(active, scope, 'queue.transition', {
     phase: 'QUEUED', entryType: 'STATUS_REQUEST', leaseGeneration: 0,
-    leaseNonce: null, data: { summary },
+    leaseNonce: null, data: { summary,originParentUrl:origin },
   }, idempotencyKey);
   return { event_id: record.id, seq: record.seq, state: 'QUEUED' };
+}
+
+// The Child's right to notify its direct Parent comes from the attested
+// hierarchy, not from the Parent having recently invoked an MCP tool. A busy
+// or temporarily inactive Parent chat must not cause a clarification to vanish.
+// Register the *existing* live Parent as the durable FIFO recipient, without
+// changing any Parent approval, pairing credential or tab ancestry.
+async function directParentRecipient(child) {
+  const childRecord=tabRegistry.get(child.callerTabId,child.browserSessionId);
+  const parentTabId=childRecord?.parentTabId;
+  if(!parentTabId || !tabRegistry.directChild(parentTabId,child.callerTabId,child.browserSessionId))
+    throw new Error('Only a managed Child may notify its direct Parent');
+  await verifyLiveAncestry(child.callerTabId,child.browserSessionId);
+  if(!privateCoordinationEnabled || !privateJournal)
+    throw new Error('Direct Parent event queue unavailable; Child task remains pending');
+  const parentRecord=tabRegistry.get(parentTabId,child.browserSessionId);
+  const live=await callExtension('inspect_tab',{
+    tab_id:parentTabId,__sessionBrowserId:child.browserSessionId},10000);
+  if(!parentRecord || live.tab_id!==parentTabId ||
+      live.incarnation_id!==parentRecord.incarnationId ||
+      live.browser_session_id!==child.browserSessionId ||
+      live.site!==parentRecord.site ||
+      (parentRecord.parentTabId===null && live.parent_approved!==true) ||
+      (parentRecord.parentTabId!==null && live.is_managed_worker!==true))
+    throw new Error('Direct Parent tab is not currently approved and verified');
+  const current=profileManagerIdentities.get(child.browserSessionId+':'+parentTabId);
+  if(current && currentPrivatePrincipal(current))return current;
+  const observed=await callExtension('attest_profile_manager',{
+    tab_id:parentTabId,__sessionBrowserId:child.browserSessionId},10000);
+  if(observed.tab_id!==parentTabId ||
+      observed.incarnation_id!==parentRecord.incarnationId ||
+      observed.browser_session_id!==child.browserSessionId)
+    throw new Error('Direct Parent identity changed during notification enrollment');
+  const parent=profilePrincipalFromExtension(observed);
+  const key=child.browserSessionId+':'+parentTabId;
+  const previous=profileManagerIdentities.get(key);
+  if(previous && !sameProfileManager(previous,parent)){
+    activePrivateManagers.delete(previous.credentialId);
+    privateManagerObservations.delete(previous.credentialId);
+    armedPrivateDelivery.delete(previous.credentialId);
+  }
+  profileManagerIdentities.set(key,parent);
+  verifiedPrincipalContexts.add(parent);
+  activePrivateManagers.set(parent.credentialId,parent);
+  if(!pausedPrivateDelivery.has(parent.credentialId))
+    armedPrivateDelivery.add(parent.credentialId);
+  return parent;
+}
+
+// Child asks only its direct Parent. The existing FIFO status event is used
+// instead of opening a sibling channel or copying the Parent transcript.
+async function requestParentContext(child, question, idempotencyKey,taskId=null) {
+  const parent=await directParentRecipient(child);
+  const parentTabId=parent.callerTabId;
+  const held=await callExtension('hold_child_for_context',{
+    __trustedPrincipal:child,__sessionBrowserId:child.browserSessionId,
+    task_id:taskId},12000);
+  if(held.tab_id!==child.callerTabId ||
+      held.status!=='WAITING_FOR_PARENT_CONTEXT')
+    throw new Error('Child task could not be marked pending clarification');
+  const summary=JSON.stringify({kind:'CHILD_CONTEXT_REQUEST',
+    child_tab_id:child.callerTabId,parent_tab_id:parentTabId,
+    original_task_id:held.task_id,question,source:'direct_child'});
+  const result=await enqueuePrivateStatus(parent,idempotencyKey,summary,
+    held.origin_parent_url);
+  if (armedPrivateDelivery.has(parent.credentialId))
+    void pumpOnePrivateManager(parent);
+  return {...result,parent_tab_id:parentTabId,
+    original_task_id:held.task_id,task_status:'WAITING_FOR_PARENT_CONTEXT',
+    task_completed:false,auto_context_transferred:false};
+}
+
+// D-073: a Child may message its direct Parent, just as a Parent may message
+// its direct Child. Parent-bound messages join the existing FIFO journal,
+// rather than inventing a new background chat/task or sibling messaging path.
+async function sendDirectParentMessage(child,text,idempotencyKey) {
+  if(typeof text!=='string' || !text.trim() || text.length>3000)
+    throw new Error('Direct Parent message must contain 1–3000 characters');
+  const parent=await directParentRecipient(child);
+  const summary=JSON.stringify({kind:'CHILD_MESSAGE',
+    child_tab_id:child.callerTabId,parent_tab_id:parent.callerTabId,
+    message:text,source:'direct_child'});
+  const result=await enqueuePrivateStatus(parent,idempotencyKey,summary);
+  if(armedPrivateDelivery.has(parent.credentialId))
+    void pumpOnePrivateManager(parent);
+  return {...result,tab_id:parent.callerTabId,queued_for:'direct_parent',
+    sent:false,task_created:false};
 }
 
 async function acceptPrivateWorkerCompletion(packet) {
@@ -1669,6 +1996,7 @@ async function acceptPrivateWorkerCompletion(packet) {
   const error = task.error ?? null;
   const data = { taskId: packet.task_id, workerTabId: packet.tab_id,
     site: task.site, status: task.status, result, error,
+    originParentUrl:task.origin_parent_url ?? null,
     resultSha256: crypto.createHash('sha256')
       .update(JSON.stringify({ result, error })).digest('hex'),
     elapsedSeconds: task.elapsed_seconds };
@@ -1694,6 +2022,9 @@ async function acceptPrivateWorkerLoss(packet) {
       typeof packet.saved_url !== 'string' || packet.saved_url.length > 2048) {
     throw new Error('Invalid child-loss receipt');
   }
+  if (packet.resolution != null &&
+      !['UNVERIFIED','INTENTIONALLY_CLOSED','DETACHED'].includes(packet.resolution))
+    throw new Error('Invalid user closure outcome');
   const url = new URL(packet.saved_url);
   if (url.protocol !== 'https:' ||
       !['chatgpt.com','chat.openai.com','claude.ai','gemini.google.com'].includes(url.hostname) ||
@@ -1709,7 +2040,7 @@ async function acceptPrivateWorkerLoss(packet) {
     __sessionBrowserId:active.browserSessionId,task_id:packet.task_id});
   if (task.tab_id !== packet.tab_id ||
       task.source_incarnation_id !== packet.worker_incarnation_id ||
-      !['done','failed'].includes(task.status)) {
+      !['done','failed','detached'].includes(task.status)) {
     throw new Error('Child-loss receipt does not match owned task history');
   }
   const scope = Object.freeze({
@@ -1730,6 +2061,7 @@ async function acceptPrivateWorkerLoss(packet) {
     data:{taskId:packet.task_id,workerTabId:packet.tab_id,
       workerIncarnationId:packet.worker_incarnation_id,
       savedUrl:packet.saved_url,status:'UNKNOWN',
+      closureResolution:packet.resolution||'UNVERIFIED',
       originalTaskStatus:task.status,
       reason:'Tab removed or unavailable; browser cause not proven'},
   },packet.event_key);
@@ -1739,6 +2071,7 @@ async function acceptPrivateWorkerLoss(packet) {
 // A manager opts into automatic wake only after its token-verified registration.
 // This volatile arm state deliberately vanishes on restart; no blind replay.
 const armedPrivateDelivery = new Set();
+const pausedPrivateDelivery = new Set();
 const privateDispatching = new Set();
 let privateDispatchTimer = null;
 
@@ -1778,9 +2111,23 @@ function privateQueueSummary(original) {
   const text = typeof body === 'string' ? body : JSON.stringify(body);
   return JSON.stringify({
     task_id:data.taskId,worker_tab_id:data.workerTabId,status:data.status,
+    origin_parent_url:data.originParentUrl || null,
     full_report_ref:original.id,result_sha256:data.resultSha256,
     result_preview:text.slice(0,3000),preview_truncated:text.length>3000,
   });
+}
+
+function verifiedParentConversationRoute(value) {
+  if (value == null) return null;
+  if (typeof value!=='string' || value.length>180) throw new Error('Invalid Parent conversation route');
+  let parsed;
+  try {parsed=new URL(value);} catch {throw new Error('Invalid Parent conversation route');}
+  if (parsed.protocol!=='https:' || parsed.hostname!=='chatgpt.com' ||
+      parsed.port || parsed.username || parsed.password ||
+      parsed.search || parsed.hash ||
+      !/^\/c\/[a-z0-9-]{20,80}\/?$/i.test(parsed.pathname))
+    throw new Error('Parent notification route must be a supported ChatGPT conversation URL');
+  return parsed.origin+parsed.pathname;
 }
 
 async function pumpOnePrivateManager(principal) {
@@ -1811,9 +2158,16 @@ async function pumpOnePrivateManager(principal) {
     const events = [];
     const batchId = crypto.randomUUID();
     let size = 0;
+    let originParentUrl = null;
     for (const item of batchItems) {
       const original = firstEvents.get(item.ref);
       if (!original) throw new Error('Queued event source missing from durable journal');
+      const requestedOrigin=verifiedParentConversationRoute(
+        original.payload.data?.originParentUrl);
+      // Never mix notification destinations in one FIFO batch. An event
+      // without a known origin must not silently inherit another origin.
+      if (events.length && requestedOrigin!==originParentUrl) break;
+      if (!events.length) originParentUrl=requestedOrigin;
       const summary = privateQueueSummary(original);
       if (typeof summary !== 'string') throw new Error('Invalid durable event summary');
       const candidate = { event_id: original.id, type: item.entryType,
@@ -1839,7 +2193,13 @@ async function pumpOnePrivateManager(principal) {
     const ready = await callExtension('manager_state', {
       __trustedPrincipal:principal,__sessionBrowserId:principal.browserSessionId});
     rememberPrivateManagerReadiness(principal, ready);
-    if (ready.ready !== true || ready.state !== 'idle') {
+    // D-056: navigation back to the delegation-origin conversation is
+    // explicitly approved even when the *other* currently shown chat is busy.
+    // Only bypass the idle gate for a verified, different origin route; the
+    // extension rechecks the destination and its idle state before sending.
+    const returningToOrigin=Boolean(originParentUrl &&
+      ready.conversation_route && ready.conversation_route!==originParentUrl);
+    if (!returningToOrigin && (ready.ready !== true || ready.state !== 'idle')) {
       diagnostics.debug('fifo.parent_not_ready',{callerTabId:principal.callerTabId,batchId,
         status:ready.state});
       return;
@@ -1875,7 +2235,7 @@ async function pumpOnePrivateManager(principal) {
       const outcome = await callExtension('wake_manager', {
         __trustedPrincipal:principal,__sessionBrowserId:principal.browserSessionId,
         manager_tab_id:principal.callerTabId,
-        batch_id:batchId,events,
+        batch_id:batchId,events,origin_parent_url:originParentUrl,
         prompt_text:composeAgentPrompt(agentSettings,{kind:'queue',batchId,events}),
       });
       submitted = outcome?.submitted === true && outcome.uncertain !== true;
@@ -1958,23 +2318,15 @@ const errorResult = (err) => ({
 });
 
 function forward(method, principal) {
-  return async (args) => {
+  return async (args,extra) => {
     const startedAt = Date.now();
     const traceId=crypto.randomUUID();
     diagnostics.debug('mcp.call_started',{traceId,method,callerTabId:args?.caller_tab_id,
       tabId:args?.tab_id});
     try {
-      if (method === 'list_tabs' && args?.caller_tab_id == null) {
-        const candidates = await callExtension('list_tabs',{
-          __discoveryOnly:true,__sessionBrowserId:args?.browser_session_id});
-        return textResult(candidates);
-      }
       if (args?.browser_session_id) args.__sessionBrowserId=args.browser_session_id;
-      const selfRead = method === 'read_chat' &&
-        (args?.tab_id == null || args.tab_id === args.caller_tab_id);
-      const caller = await resolveCaller(args,{
-        createRoot:method === 'spawn_worker' || selfRead,
-      });
+      const caller = await resolveCaller(args,{},extra);
+      args.caller_tab_id = caller.callerTabId;
       args.__sessionBrowserId = caller.browserSessionId;
       let result;
       if (method === 'spawn_worker') {
@@ -1998,17 +2350,34 @@ function forward(method, principal) {
         }
       } else {
         const target = args?.tab_id;
+        const callerRecord=tabRegistry.get(caller.callerTabId,caller.browserSessionId);
+        const directedToParent=method==='send_to_tab' &&
+          target===callerRecord?.parentTabId && target!=null;
         if (method === 'send_to_tab' || (method === 'read_chat' && target != null)) {
-          if (target !== caller.callerTabId) await verifyDirectChild(caller.callerTabId,target,caller.browserSessionId);
+          if (target !== caller.callerTabId) {
+            if (method === 'read_chat') {
+              if (!tabRegistry.within(caller.callerTabId,target,caller.browserSessionId))
+                throw new Error('Read target is not a descendant of this caller');
+              await verifyLiveAncestry(target,caller.browserSessionId);
+              args.__ancestorRead = true; // already authorized in Proxy; read-only
+            } else if (!directedToParent)
+              await verifyDirectChild(caller.callerTabId,target,caller.browserSessionId);
+          }
         }
-        if (method === 'send_to_tab' &&
+        if (method === 'send_to_tab' && !directedToParent &&
             !['started','reattached'].includes(tabRegistry.get(target,caller.browserSessionId)?.phase))
           throw new Error('Worker is prepared or UNCERTAIN; reconcile before another message');
-        if (method === 'list_tabs') {
+        if(directedToParent){
+          result=await sendDirectParentMessage(caller,args.text,args.idempotency_key);
+        } else if (method === 'list_tabs') {
           const tabs = await callExtension('list_tabs',{__trustedPrincipal:caller,
-            __sessionBrowserId:caller.browserSessionId});
-          result = tabs.filter(t=>t.tab_id === caller.callerTabId ||
-            tabRegistry.directChild(caller.callerTabId,t.tab_id,caller.browserSessionId))
+            __sessionBrowserId:caller.browserSessionId,__descendantDiscovery:true});
+          result = tabs.filter(t=>{
+            if (t.tab_id === caller.callerTabId) return true;
+            if (!tabRegistry.within(caller.callerTabId,t.tab_id,caller.browserSessionId)) return false;
+            const known=tabRegistry.get(t.tab_id,caller.browserSessionId);
+            return t.incarnation_id === known?.incarnationId && t.site === known.site && t.role==='worker';
+          })
             .map(t=>({...t,parent_tab_id:tabRegistry.get(t.tab_id,caller.browserSessionId)?.parentTabId ?? null,
               root_tab_id:tabRegistry.get(t.tab_id,caller.browserSessionId)?.rootTabId ?? null}));
         } else result = await callExtension(method,{...args,__trustedPrincipal:caller,
@@ -2039,11 +2408,86 @@ const waitSeconds = z
   );
 
 function buildServer(principal) {
-  const callerTabInput = z.number().int().positive()
-    .describe('Browser tab_id of the calling chat conversation. Use list_tabs to discover IDs.');
+  const callerTabInput = z.number().int().positive().optional()
+    .describe('Optional assertion; caller tab is determined from the paired MCP conversation.');
   const browserSessionInput=z.string().uuid().optional()
     .describe('browser_session_id returned with list_tabs when multiple browser profiles are connected.');
   const server = new McpServer({ name: 'chat-orchestrator', version: '0.1.0' });
+  // Every public and private MCP tool shares a single admission barrier.
+  // Same-key retries get the exact first response, including an encrypted,
+  // bounded operational read snapshot. No general transcript archive exists.
+  const originalRegister=server.registerTool.bind(server);
+  server.registerTool=(name,config,handler)=>originalRegister(name,{
+    ...config,
+    inputSchema:{...config.inputSchema,
+      agent_credential:z.string().regex(/^[a-f0-9]{64}$/i).optional().describe(
+        'Opaque credential issued by pair_conversation in this exact Agent tab. Required for every tool except initial pairing.'),
+      idempotency_key:z.string().uuid().describe(
+        'Required UUID generated by the caller. Use a fresh key for each logical request, including each fresh read. Reuse the same key only when retrying the identical request.')},
+  },async (args,extra)=>{
+    try {
+      if(name==='pair_conversation') {
+        // Replaying a pairing response after restart would disclose a revoked
+        // credential. Pairing offers are deliberately process-local.
+        return await mcpIdempotency.execute(
+          'pair:'+args.code,name,args,()=>handler(args,extra));
+      }
+      const binding=callerIdentity.getByCredential(args.agent_credential);
+      if(!binding)throw new Error('Missing or revoked Agent credential; pair this tab first');
+      // Verify the live role/incarnation on EVERY call BEFORE serving any
+      // encrypted cached response, including status/read-only calls.
+      await resolveCaller(args,{},extra);
+      const scope=JSON.stringify([binding.browserSessionId,binding.tabId,
+        binding.incarnationId]);
+      return await (durableIdempotency||mcpIdempotency).execute(scope,name,args,
+        ()=>handler(args,extra));
+    } catch(error) {return errorResult(error);}
+  });
+
+  server.registerTool('pair_conversation', {
+    description:'Bind this ChatGPT conversation to the browser tab selected in the extension popup. Requires a fresh single-use pairing code.',
+    inputSchema:{code:z.string().uuid()},
+  },async (args,extra)=>{
+    try {
+      const identity=callerMeta(extra);
+      const offer=callerIdentity.peek(args.code);
+      const socket=extensionSockets.get(offer.browserSessionId);
+      if (!socket || socket !== offer.socket || socket.readyState !== 1)
+        throw new Error('Original extension socket disconnected; generate another pairing code');
+      const live=await callExtension('inspect_tab', {tab_id:offer.tabId,
+        __sessionBrowserId:offer.browserSessionId},10000);
+      if (live.incarnation_id !== offer.incarnationId || live.route_hash !== offer.routeHash)
+        throw new Error('Pairing tab changed before approval');
+      const existing=tabRegistry.get(live.tab_id,offer.browserSessionId);
+      if (live.is_managed_worker) {
+        if (!existing || existing.parentTabId === null ||
+            existing.incarnationId !== live.incarnation_id)
+          throw new Error('Only an already-owned managed Child can pair as a Child Agent');
+        await verifyLiveAncestry(live.tab_id,offer.browserSessionId);
+      } else if (!live.parent_approved || (existing && existing.parentTabId !== null)) {
+        throw new Error('Parent tab must be explicitly approved by the user before pairing');
+      }
+      const bound=callerIdentity.bind({...identity,code:args.code});
+      try {
+        if (!existing) await tabRegistry.registerRoot(live);
+      } catch (error) {
+        callerIdentity.revokeCredential(bound.agentCredential);
+        throw error;
+      }
+      let recovery={attached:0,held:0};
+      if (!live.is_managed_worker) {
+        try {
+          recovery=await reconstructLiveDescendants(live.tab_id,offer.browserSessionId);
+        } catch {
+          recovery={attached:0,held:null,reconciliation_required:true};
+        }
+      }
+      return textResult({paired:true,tab_id:bound.tabId,
+        browser_session_id:bound.browserSessionId,agent_id:bound.agentId,
+        agent_credential:bound.agentCredential,recovery,
+        no_browser_prompt_replayed:true});
+    } catch (error) {return errorResult(error);}
+  });
 
   server.registerTool(
     'list_tabs',
@@ -2067,7 +2511,8 @@ function buildServer(principal) {
         browser_session_id:browserSessionInput,
         saga_task_id:z.number().int().positive().optional()
           .describe('Optional external Saga tracking reference; not a worker identifier or closure prerequisite.'),
-        site: z.enum(['chatgpt', 'claude', 'gemini']).describe('Which chat site the worker runs on.'),
+        site: z.enum(['chatgpt', 'claude', 'gemini']).default('chatgpt').describe(
+          'ChatGPT is the only available provider in v1. Claude/Gemini requests return PROVIDER_NOT_SUPPORTED without spawning.'),
         operation: z.enum(['task','workspace','delegation']).optional().describe('Operation-specific instructions to include.'),
         role: z.string().trim().min(1).max(128).optional()
           .describe('Optional reusable seat label; any project role is allowed. This is metadata, never authorization or an injected role prompt.'),
@@ -2077,12 +2522,6 @@ function buildServer(principal) {
           .string()
           .min(1)
           .describe('Self-contained instructions for the worker. Include all the context it needs.'),
-        share_context_from: z
-          .string()
-          .optional()
-          .describe(
-            'Optional. Copy the full transcript of another tab into the worker\'s first message. Use a tab_id, "orchestrator" (the tab marked as orchestrator) or "active" (the tab the user is looking at).'
-          ),
         auto_close: z
           .boolean()
           .optional()
@@ -2110,7 +2549,7 @@ function buildServer(principal) {
     {
       title: 'Send a follow-up to an existing worker tab',
       description:
-        'Send another message to a worker tab that is already open (continues that chat). Returns a task_id; use get_result to collect the reply.',
+        'Send to a direct Child or direct Parent only. Child-bound messages return a task_id for get_result. Child-to-Parent messages enter the Parent FIFO event queue and return QUEUED with event_id, not a new task_id.',
       inputSchema: {
         caller_tab_id:callerTabInput,
         browser_session_id:browserSessionInput,
@@ -2137,12 +2576,52 @@ function buildServer(principal) {
     },
     forward('get_result', principal)
   );
+  server.registerTool('complete_task',{
+    title:'Child Agent: explicitly complete my assigned task',
+    description:'Call from the paired Child Agent only after own work is ready. Completion is held until descendants finish and are reviewed. Does not close tabs or claim substantive correctness.',
+    inputSchema:{
+      caller_tab_id:callerTabInput,
+      browser_session_id:browserSessionInput,
+      task_id:z.string().uuid().optional().describe('Assigned task ID; required if more than one task could match.'),
+      summary:z.string().trim().min(1).max(1200).optional().describe('Brief own-work completion summary; full content stays in browser chat.'),
+    },
+  },forward('complete_task',principal));
+  server.registerTool('review_task', {
+    title:'Confirm Parent review of a Child task',
+    description:'After inspecting a terminal Child result, explicitly mark its task reviewed. Only then may that same Child begin its next queued independent task.',
+    inputSchema:{
+      caller_tab_id:callerTabInput,browser_session_id:browserSessionInput,
+      tab_id:z.number().int().positive(),
+      task_id:z.string().uuid(),
+    },
+  },async (args,extra)=>{
+    try {
+      const caller=await resolveCaller(args,{},extra);
+      await verifyDirectChild(caller.callerTabId,args.tab_id,caller.browserSessionId);
+      const result=await callExtension('review_task',{
+        ...args,__trustedPrincipal:caller,__sessionBrowserId:caller.browserSessionId,
+      });
+      return textResult(result);
+    } catch(error) {return errorResult(error);}
+  });
+  server.registerTool('request_parent_context', {
+    title:'Ask the direct Parent for missing task context',
+    description:'Child retains its current task. The Proxy notifies its direct Parent through the existing ordered event queue; Parent responds using send_to_tab.',
+    inputSchema:{caller_tab_id:callerTabInput,browser_session_id:browserSessionInput,
+      task_id:z.string().uuid().optional().describe('Original Child task ID; required if more than one task might be active.'),
+      question:z.string().trim().min(1).max(3500)},
+  },async(args,extra)=>{
+    try {
+      const caller=await resolveCaller(args,{},extra);
+      return textResult(await requestParentContext(caller,args.question,args.idempotency_key,args.task_id));
+    } catch(error) {return errorResult(error);}
+  });
   server.registerTool(
     'read_chat',
     {
       title: 'Read a chat transcript',
       description:
-        'Read the conversation using the site conversation API where available, with DOM fallback. Supports ChatGPT, Claude and Gemini. Defaults to orchestrator/active tab. Reasoning is excluded by default; image and attachment names can be included.',
+        'Read an authorized ChatGPT conversation using the site conversation API where available, with DOM fallback. Reasoning is excluded by default; image and attachment names can be included.',
       inputSchema: {
         caller_tab_id:callerTabInput,
         browser_session_id:browserSessionInput,
@@ -2233,6 +2712,7 @@ function buildServer(principal) {
       try {
         const caller = await resolveCaller(args);
         registeredPrivateManager(caller);
+        pausedPrivateDelivery.delete(caller.credentialId);
         armedPrivateDelivery.add(caller.credentialId);
         setImmediate(pumpPrivateQueue);
         return textResult({ armed: true, no_replay: true });
@@ -2245,6 +2725,7 @@ function buildServer(principal) {
     }, async (args) => {
       try {
         const caller = await resolveCaller(args);
+        pausedPrivateDelivery.add(caller.credentialId);
         armedPrivateDelivery.delete(caller.credentialId);
         return textResult({ armed: false });
       } catch (error) { return errorResult(error); }
@@ -2335,6 +2816,7 @@ const privateToolHistory = [];
 let dashboardTimer = null;
 let dashboardRefreshInFlight = false;
 let currentBrowserTabs = {status:'unavailable',tabs:[],observedAt:null};
+let currentCompletionAlerts = [];
 function recordToolActivity(principal, method, ok, startedAt) {
   privateToolHistory.push({
     at: new Date().toISOString(), method, ok,
@@ -2386,6 +2868,7 @@ function privateDashboardSnapshot() {
     deliveryEnabledByDefault: false, registryError, hiddenPending,
     extensionConnected: Boolean(bridgeConnected()),
     browserTabs:currentBrowserTabs,
+    completionAlerts:currentCompletionAlerts,
     tabHierarchy:annotateTabPresence(savedHierarchy,currentBrowserTabs),
     seats, phases, queue: queue.slice(-30),
     toolCalls: privateToolHistory.slice(-25),
@@ -2398,6 +2881,7 @@ async function refreshDashboard() {
   try {
     if (!bridgeConnected()) {
       currentBrowserTabs={status:'unavailable',tabs:[],observedAt:null};
+      currentCompletionAlerts=[];
     } else {
       // Read-only tab discovery. This must never attest/register identities,
       // change durable relationships, or acknowledge/replay queued work.
@@ -2407,6 +2891,16 @@ async function refreshDashboard() {
         tabs:normalizeOpenChatTabs(discovered),
         observedAt:new Date().toISOString(),
       };
+      const profiles=[...extensionSockets.values()].filter((socket)=>
+        socket.readyState===1&&socket.profileAuthenticated);
+      const monitors=await Promise.allSettled(profiles.map(async(socket)=>{
+        const tasks=await callExtension('desktop_completion_status',{
+          __trustedDesktopConsent:true,__sessionBrowserId:socket.browserSessionId},3500);
+        return Array.isArray(tasks)?tasks.map((item)=>({
+          ...item,browser_session_id:socket.browserSessionId})): [];
+      }));
+      currentCompletionAlerts=monitors.flatMap((item)=>
+        item.status==='fulfilled'?item.value:[]).slice(0,50);
     }
   } catch {
     // A failed browser observation is UNKNOWN, not proof that tabs closed.
@@ -2441,7 +2935,7 @@ app.get('/health', (_req, res) => {
     },
   });
 });
-app.post('/mcp', attachProfile, async (req, res) => {
+const mcpHandler = async (req, res) => {
   const server = buildServer(req.bridgePrincipal);
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   res.on('close', () => {
@@ -2461,7 +2955,40 @@ app.post('/mcp', attachProfile, async (req, res) => {
       });
     }
   }
-});
+};
+app.post('/mcp', attachProfile, mcpHandler);
+
+// Match the AgentBridge route-token design: put the existing public transport
+// key in the endpoint *path*, not in query parameters or custom headers.
+// The token is not a paired Agent credential. Do not echo it in responses.
+function validAgentUrlToken(req) {
+  if(PUBLIC_PORT===null)return false;
+  let pathname='';
+  let validShape=false;
+  try {
+    const url=new URL(req.originalUrl || req.url,'http://localhost');
+    pathname=url.pathname;
+    validShape=url.search==='' && url.hash==='' &&
+      /^\/mcp\/agent\/[a-f0-9]{64}$/.test(pathname);
+  } catch { /* Invalid or malformed URLs fail closed. */ }
+  // Hash both paths to a fixed digest, just as AgentBridge does, so
+  // timingSafeEqual never throws or leaks path length.
+  const actual=crypto.createHash('sha256').update(pathname,'utf8').digest();
+  const expected=crypto.createHash('sha256')
+    .update('/mcp/agent/'+PUBLIC_MCP_TOKEN,'utf8').digest();
+  return validShape && crypto.timingSafeEqual(actual,expected);
+}
+function requireAgentUrlToken(req,res,next){
+  res.set('Cache-Control','no-store');
+  res.set('Referrer-Policy','no-referrer');
+  if(!validAgentUrlToken(req))
+    return res.status(401).json({
+      jsonrpc:'2.0',error:{code:-32001,message:'MCP URL authentication required'},id:null,
+    });
+  next();
+}
+app.use('/mcp/agent',requireAgentUrlToken);
+app.post('/mcp/agent/:token',attachProfile,mcpHandler);
 
 const methodNotAllowed = (_req, res) =>
   res.status(405).json({
@@ -2471,13 +2998,62 @@ const methodNotAllowed = (_req, res) =>
   });
 app.get('/mcp', methodNotAllowed);
 app.delete('/mcp', methodNotAllowed);
+app.get('/mcp/agent/:token',methodNotAllowed);
+app.delete('/mcp/agent/:token',methodNotAllowed);
 
 const httpServer = http.createServer(app);
+// The ngrok upstream is a separate HTTP-only listener. It has NO websocket
+// upgrade handler and exposes only /health, /mcp and /mcp/agent,
+// never /bridge or desktop
+// administration endpoints, even if ngrok rewrites Host/Origin headers.
+const publicApp=express();
+publicApp.use((req,res,next)=>{
+  if(req.path==='/health')return app(req,res,next);
+  if(req.path==='/mcp/agent' || req.path.startsWith('/mcp/agent/')){
+    // Authenticate before allowing public requests to reach the body parser.
+    // Direct loopback requests are independently checked by app.use.
+    return requireAgentUrlToken(req,res,()=>app(req,res,next));
+  }
+  if(req.path==='/mcp') {
+    const authorization=req.headers.authorization;
+    const wellFormed=typeof authorization==='string' &&
+      /^Bearer [a-f0-9]{64}$/i.test(authorization);
+    const supplied=wellFormed
+      ? Buffer.from(authorization.slice(7),'hex') : Buffer.alloc(32);
+    const expected=Buffer.from(PUBLIC_MCP_TOKEN,'hex');
+    if(!crypto.timingSafeEqual(supplied,expected) || !wellFormed) {
+      res.set('WWW-Authenticate','Bearer realm="chat-orchestrator-mcp"');
+      return res.status(401).json({
+        jsonrpc:'2.0',error:{code:-32001,message:'MCP transport authentication required'},id:null,
+      });
+    }
+    return app(req,res,next);
+  }
+  return res.status(404).end();
+});
+const publicHttpServer=PUBLIC_PORT===null?null:http.createServer(publicApp);
 
 httpServer.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url, 'http://localhost');
   if (url.pathname !== '/bridge') {
     socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+  // The bridge is LOCAL extension IPC, never a public ngrok/WebSocket API.
+  // Reject requests whose Host/Origin indicate a remotely forwarded browser
+  // or an unrelated webpage. Native loopback clients without Origin remain
+  // usable for existing local integration/diagnostic tests.
+  const host=String(req.headers.host||'').toLowerCase();
+  const boundPort=httpServer.address()?.port ?? PORT;
+  const allowedHosts=new Set([`localhost:${boundPort}`,`127.0.0.1:${boundPort}`,`[::1]:${boundPort}`]);
+  const remote=String(req.socket.remoteAddress||'').toLowerCase();
+  const localRemote=['127.0.0.1','::1','::ffff:127.0.0.1'].includes(remote);
+  const origin=String(req.headers.origin||'');
+  const allowedOrigin=!origin || /^chrome-extension:\/\/[a-p]{32}$/.test(origin) ||
+    /^moz-extension:\/\/[0-9a-f-]{36}$/i.test(origin);
+  if (!allowedHosts.has(host) || !localRemote || !allowedOrigin) {
+    socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
     socket.destroy();
     return;
   }
@@ -2491,11 +3067,17 @@ export async function startServer() {
   if (stopServerPromise) throw new Error('Cannot start while previous journal shutdown is in progress');
   if (httpServer.listening) return httpServer.address();
   reloadAgentSettings();
+  if(process.env.CHAT_ORCH_SETTINGS_DIR || process.env.CHAT_ORCH_PROFILE_DIR) {
+    durableIdempotency=await createDurableIdempotencyLedger(path.join(
+      process.env.CHAT_ORCH_SETTINGS_DIR || process.env.CHAT_ORCH_PROFILE_DIR,
+      'mcp-operational-replay.bin'));
+  }
   // Ownership is scoped to the current Proxy session. Ignore older
   // tab-relations.json entries; never modify the separate durable FIFO journal.
   if (!tabRegistry) tabRegistry = createSessionTabRegistry();
-  if (privateCoordinationRequested && !['127.0.0.1', '::1', 'localhost'].includes(HOST)) {
-    throw new Error('Private extension bridge requires loopback bind');
+  if ((privateCoordinationRequested || PUBLIC_PORT!==null) &&
+      !['127.0.0.1', '::1', 'localhost'].includes(HOST)) {
+    throw new Error('Private extension bridge and HTTP-only MCP upstream require loopback bind');
   }
   if (privateCoordinationRequested && !privateJournal) {
     privateCoordinationEnabled = true;
@@ -2511,6 +3093,14 @@ export async function startServer() {
   return new Promise((resolve, reject) => {
     const onError = async (error) => {
       httpServer.off('listening', onListening);
+      // Both ports are one startup transaction; never leave a local bridge
+      // serving an undiscoverable half-started MCP gateway.
+      if (publicHttpServer?.listening) {
+        await new Promise((done)=>publicHttpServer.close(()=>done()));
+      }
+      if (httpServer.listening) {
+        await new Promise((done)=>httpServer.close(()=>done()));
+      }
       // The journal lock was acquired before listen(). A failed bind must
       // release it, otherwise the *next* startup reports a misleading stale
       // owner even though no proxy is running.
@@ -2532,13 +3122,28 @@ export async function startServer() {
       }
       reject(error);
     };
-    const onListening = () => {
+    const onListening = async () => {
       httpServer.off('error', onError);
+      if (publicHttpServer) {
+        try {
+          await new Promise((done,fail)=>{
+            const reject=(error)=>{publicHttpServer.off('listening',accept);fail(error);};
+            const accept=()=>{publicHttpServer.off('error',reject);done();};
+            publicHttpServer.once('error',reject);
+            publicHttpServer.once('listening',accept);
+            publicHttpServer.listen(PUBLIC_PORT,HOST);
+          });
+        } catch(error) {
+          await onError(error);
+          return;
+        }
+      }
       resetExtensionSessionState();
       const address = httpServer.address();
       console.log(`Chat Orchestrator MCP server listening on http://${HOST}:${address.port}`);
       console.log('  Extension bridge: ws://localhost:' + address.port + '/bridge');
-      console.log('  MCP endpoint: /mcp');
+      console.log('  MCP endpoints: /mcp (Bearer), /mcp/agent (URL token)'+
+        (publicHttpServer?' (HTTP-only upstream '+PUBLIC_PORT+')':''));
       process.parentPort?.postMessage({ type: 'ready', port: address.port });
       clearInterval(sessionHeartbeatTimer);
       sessionHeartbeatTimer=setInterval(sendSessionHeartbeat,15000);
@@ -2570,6 +3175,7 @@ async function stopServerOnce() {
   dashboardTimer = null;
   currentBrowserTabs = {status:'unavailable',tabs:[],observedAt:null};
   armedPrivateDelivery.clear();
+  pausedPrivateDelivery.clear();
   activePrivateManagers.clear();
   privateManagerObservations.clear();
   profileManagerIdentities.clear();
@@ -2585,6 +3191,14 @@ async function stopServerOnce() {
   let listenerError;
   let journalCloseError;
   try {
+    if (publicHttpServer?.listening) {
+      const closedPublic=new Promise((resolve,reject)=>
+        publicHttpServer.close((error)=>error?reject(error):resolve()));
+      publicHttpServer.closeIdleConnections?.();
+      const forcePublic=setTimeout(()=>publicHttpServer.closeAllConnections?.(),4000);
+      forcePublic.unref?.();
+      try {await closedPublic;} finally {clearTimeout(forcePublic);}
+    }
     if (httpServer.listening) {
       // A still-open HTTP keep-alive or long-running MCP request must not
       // prevent journal.close() from ever releasing the single-writer lock.
@@ -2631,12 +3245,194 @@ export const desktopMethods = Object.freeze({
   set_orchestrator: 'desktop_set_orchestrator_tab',
   diagnose: 'desktop_diagnose_tab',
   close_legacy_workers: 'desktop_close_legacy_workers',
+  close_managed_browser: 'desktop_close_managed_browser',
+  verify_managed_browser: 'desktop_verify_managed_browser',
+  update_readiness: 'desktop_update_readiness',
 });
-export function desktopAction({action, tab_id, browser_session_id, confirmation_nonce}) {
+export async function desktopAction({action, tab_id, browser_session_id, confirmation_nonce,
+  decision_id,choice,expected_profile_install_id,expected_browser_product}) {
   if (action === 'inspect_root_repair') return inspectRootRepair(tab_id,true,browser_session_id);
   if (action === 'confirm_root_repair') return reconcileRootFromDesktop(tab_id,confirmation_nonce,browser_session_id);
+  if(action==='list_completion_monitors'||action==='set_manual_completion') {
+    const connections=[...extensionSockets.values()].filter((socket)=>
+      socket.readyState===1&&socket.profileAuthenticated &&
+      (!browser_session_id||socket.browserSessionId===browser_session_id));
+    if(connections.length!==1)
+      throw new Error('Exactly one authenticated browser profile is required');
+    const sessionId=connections[0].browserSessionId;
+    if(action==='list_completion_monitors')
+      return callExtension('desktop_completion_status',{
+        __trustedDesktopConsent:true,__sessionBrowserId:sessionId},12000);
+    if(!PRIVATE_EVENT_ID.test(decision_id||'')||
+        !['completed','in_progress'].includes(choice))
+      throw new Error('Explicit valid task ID and Completed/In Progress choice required');
+    return callExtension('desktop_set_manual_completion',{
+      __trustedDesktopConsent:true,__sessionBrowserId:sessionId,
+      task_id:decision_id,status:choice},12000);
+  }
+  if (action==='list_agent_closures' || action==='resolve_agent_closure') {
+    if (extensionSockets.size!==1 || !bridgeConnected())
+      throw new Error('Exactly one verified connected browser profile is required for closure decisions');
+    const sessionId=[...extensionSockets.keys()][0];
+    const decisions=await callExtension('desktop_list_agent_closures',{
+      __trustedDesktopConsent:true,__sessionBrowserId:sessionId,
+    },12000);
+    if(action==='list_agent_closures') return decisions;
+    if(!PRIVATE_EVENT_ID.test(decision_id||'') ||
+        !['accident','yes','cancel'].includes(choice))
+      throw new Error('Explicit valid closure decision and choice required');
+    const closed=decisions.find((item)=>item.id===decision_id &&
+      item.browserSessionId===sessionId);
+    if(!closed)throw new Error('Pending closure decision missing from selected browser profile');
+    if(Date.now()-closed.createdAt<5000)
+      throw new Error('Closure confirmation buttons remain disabled for five seconds');
+    if(choice==='accident') {
+      const resuming=closed.status==='restoring_children' &&
+        Number.isSafeInteger(closed.candidateTabId);
+      const prepared=resuming
+        ? {candidate_tab_id:closed.candidateTabId}
+        : await callExtension('desktop_prepare_accident_restore',{
+          decision_id,__trustedDesktopConsent:true,__sessionBrowserId:sessionId,
+        },15000);
+      const live=await callExtension('inspect_tab',{
+        tab_id:prepared.candidate_tab_id,__sessionBrowserId:sessionId,
+      },12000);
+      if(live.browser_session_id!==sessionId || live.tab_id===closed.oldTabId ||
+          (resuming && live.incarnation_id!==closed.candidateIncarnationId) ||
+          live.site!==(closed.url?.startsWith('https://chatgpt.com/')?'chatgpt':
+            closed.url?.startsWith('https://claude.ai/')?'claude':'gemini'))
+        throw new Error('Recovered Agent tab did not pass identity/provider verification');
+      const original=tabRegistry?.get(closed.oldTabId,sessionId);
+      if(original) {
+        await tabRegistry.replaceClosedAgent(closed.oldTabId,live,closed.incarnationId);
+      } else if (closed.kind==='parent') {
+        await tabRegistry.registerRoot(live);
+      } else {
+        const parent=tabRegistry?.get(closed.parentTabId,sessionId);
+        if(!parent)throw new Error('Child Parent must be paired before restoring missing Child ancestry');
+        await tabRegistry.registerChild(closed.parentTabId,live);
+        await tabRegistry.setPhase(live.tab_id,'reattached',sessionId);
+      }
+      const result=resuming
+        ? {restored:true,new_tab_id:live.tab_id,no_task_replay:true}
+        : await callExtension('desktop_commit_accident_restore',{
+          decision_id,new_tab_id:live.tab_id,
+          new_parent_owner:profileCredentialId(sessionId,live.tab_id),
+          __trustedDesktopConsent:true,__sessionBrowserId:sessionId,
+        },15000);
+      callerIdentity.revokeTab(sessionId,closed.oldTabId);
+      // Accident consent covers the captured recursive subtree. Restore in
+      // parent-before-child order: reuse verified live tabs, create only
+      // closed descendants, and update the Proxy ancestry after each step.
+      // Each extension create is durably reserved before its browser effect.
+      const mapping=new Map([[closed.oldTabId,live.tab_id]]);
+      const remaining=[...(closed.descendants||[])];
+      if(remaining.length>200)throw new Error('Restoration subtree exceeds safe tab limit');
+      const restored=[];
+      while(remaining.length){
+        const index=remaining.findIndex((item)=>
+          Number.isSafeInteger(item?.tabId) &&
+          Number.isSafeInteger(item?.parentTabId) &&
+          mapping.has(item.parentTabId) && !mapping.has(item.tabId));
+        if(index<0)
+          throw new Error('Captured subtree has an unresolved parent or cycle; manual reconciliation required');
+        const [item]=remaining.splice(index,1);
+        const newParentId=mapping.get(item.parentTabId);
+        const observedParent=await callExtension('inspect_tab',{
+          tab_id:newParentId,__sessionBrowserId:sessionId,
+        },12000);
+        const parentRecord=tabRegistry?.get(newParentId,sessionId);
+        if(!parentRecord ||
+            observedParent.incarnation_id!==parentRecord.incarnationId ||
+            observedParent.browser_session_id!==sessionId)
+          throw new Error('Restoration Parent changed; no Child will be created');
+        const replacement=await callExtension('desktop_restore_closure_descendant',{
+          decision_id,old_tab_id:item.tabId,
+          old_parent_tab_id:item.parentTabId,new_parent_tab_id:newParentId,
+          expected_parent_incarnation:parentRecord.incarnationId,
+          new_parent_owner:profileCredentialId(sessionId,newParentId),
+          __trustedDesktopConsent:true,__sessionBrowserId:sessionId,
+        },15000);
+        const observedChild=await callExtension('inspect_tab',{
+          tab_id:replacement.tab_id,__sessionBrowserId:sessionId,
+        },12000);
+        if(observedChild.tab_id!==replacement.tab_id ||
+            observedChild.incarnation_id!==replacement.incarnation_id ||
+            observedChild.browser_session_id!==sessionId ||
+            observedChild.site!=='chatgpt' ||
+            observedChild.is_managed_worker!==true)
+          throw new Error('Restored Child failed independent identity verification');
+        const prior=tabRegistry?.get(item.tabId,sessionId);
+        if(prior && item.tabId!==replacement.tab_id)
+          await tabRegistry.replaceClosedAgent(item.tabId,observedChild,item.incarnationId);
+        else if(prior) {
+          if(prior.incarnationId!==observedChild.incarnation_id ||
+              prior.parentTabId!==newParentId)
+            throw new Error('Still-live descendant ancestry changed during restoration');
+        } else {
+          await tabRegistry.registerChild(newParentId,observedChild);
+          await tabRegistry.setPhase(observedChild.tab_id,'reattached',sessionId);
+        }
+        if(item.tabId!==replacement.tab_id)
+          callerIdentity.revokeTab(sessionId,item.tabId);
+        mapping.set(item.tabId,replacement.tab_id);
+        restored.push({old_tab_id:item.tabId,tab_id:replacement.tab_id,
+          reused:replacement.reused===true,created:replacement.created===true});
+      }
+      const finished=await callExtension('desktop_finalize_accident_restore',{
+        decision_id,__trustedDesktopConsent:true,
+        __sessionBrowserId:sessionId,
+      },15000);
+      if(finished.restored!==true||finished.descendants_verified!==restored.length)
+        throw new Error('Restored subtree was not verified as complete');
+      let recovery={attached:0,held:0};
+      if(closed.kind==='parent') {
+        try {recovery=await reconstructLiveDescendants(live.tab_id,sessionId);}
+        catch {recovery={reconciliation_required:true};}
+      }
+      return {...result,restoration_complete:true,
+        descendants_verified:restored.length,descendant_tabs:restored,
+        recovery,no_task_replay:true};
+    }
+    const result=await callExtension('desktop_apply_agent_closure',{
+      decision_id,choice,__trustedDesktopConsent:true,
+      __sessionBrowserId:sessionId,
+    },15000);
+    const removed=tabRegistry?await tabRegistry.detachSubtree(closed.oldTabId,sessionId):[];
+    for (const id of [closed.oldTabId,...removed,...result.affected_tab_ids])
+      callerIdentity.revokeTab(sessionId,id);
+    return {...result,revoked_agent_tabs:[...new Set(removed)]};
+  }
   if (!Object.hasOwn(desktopMethods,action)) throw new Error('Unknown desktop action');
-  return callExtension(desktopMethods[action], {tab_id, __sessionBrowserId:browser_session_id}, 12000);
+  if (['close_managed_browser','verify_managed_browser','update_readiness'].includes(action)) {
+    if(extensionSockets.size!==1 || !bridgeConnected() ||
+        ![...extensionSockets.values()][0]?.profileAuthenticated)
+      throw new Error('A uniquely profile-authenticated extension is required for managed browser actions');
+    const socket=[...extensionSockets.values()][0];
+    if(!socket.profileInstallId)
+      throw new Error('Extension profile enrollment identity unavailable; reconnect and verify this browser');
+    if(action==='close_managed_browser') {
+      if(!PRIVATE_EVENT_ID.test(expected_profile_install_id||'') ||
+          expected_profile_install_id!==socket.profileInstallId ||
+          !['chrome','edge'].includes(expected_browser_product) ||
+          expected_browser_product!==socket.browserProduct)
+        throw new Error('Dedicated browser enrollment or browser product mismatch; refusing to close browser windows');
+    }
+    if(action==='verify_managed_browser') {
+      if(!socket.browserProduct||!socket.extensionVersion)
+        throw new Error('Connected extension must report a supported browser and its build version');
+      const verified=await callExtension(desktopMethods[action],{
+        __trustedDesktopConsent:true,__sessionBrowserId:socket.browserSessionId},12000);
+      if(verified?.profile_install_id!==socket.profileInstallId)
+        throw new Error('Extension enrollment changed during verification');
+      return {...verified,browser_product:socket.browserProduct,
+        extension_version:socket.extensionVersion};
+    }
+  }
+  return callExtension(desktopMethods[action], {tab_id,
+    __trustedDesktopConsent:['close_managed_browser','verify_managed_browser','update_readiness'].includes(action),
+    expected_profile_install_id:action==='close_managed_browser'?expected_profile_install_id:undefined,
+    __sessionBrowserId:browser_session_id}, 12000);
 }
 export function refreshExtensionSettings() {
   reloadAgentSettings();
@@ -2652,7 +3448,9 @@ if (process.parentPort) {
       const id = event.data.request_id;
       if (!PRIVATE_EVENT_ID.test(id || '')) return;
       const action = event.data.action;
-      if (!Object.hasOwn(desktopMethods,action) && !['inspect_root_repair','confirm_root_repair'].includes(action)) return;
+      if (!Object.hasOwn(desktopMethods,action) &&
+          !['inspect_root_repair','confirm_root_repair','verify_managed_browser','update_readiness',
+            'list_agent_closures','resolve_agent_closure'].includes(action)) return;
       try {
         const result = await desktopAction(event.data);
         process.parentPort.postMessage({type:'desktop_extension_action_result',request_id:id,ok:true,result});

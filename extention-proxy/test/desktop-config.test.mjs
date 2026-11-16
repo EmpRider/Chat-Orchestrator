@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { normalizeNgrokDomain, normalizeNgrokAuthtoken, connectorUrl, ISOLATED_NGROK_CONFIG, normalizeProxyPort, normalizeProfileName, PRIVATE_QUEUE_PREFERENCE_SCHEMA, resolvePrivateQueuePreference } from '../desktop/config.mjs';
+import { normalizeNgrokDomain, normalizeNgrokAuthtoken, connectorUrl, agentConnectorUrl, ISOLATED_NGROK_CONFIG, normalizeProxyPort, normalizeProfileName, PRIVATE_QUEUE_PREFERENCE_SCHEMA, resolvePrivateQueuePreference } from '../desktop/config.mjs';
 
 test('named profiles and per-profile proxy ports validate before filesystem or socket use', () => {
   assert.equal(normalizeProfileName('default'), 'default');
@@ -49,6 +49,18 @@ test('ngrok domain accepts only a clean HTTPS origin', () => {
 test('connector URL has no proxy-managed credential and Ngrok auth remains separate', () => {
   assert.equal(connectorUrl('https://example.ngrok.app'), 'https://example.ngrok.app/mcp');
   assert.equal(connectorUrl(''), '');
+});
+
+test('dedicated ChatGPT MCP URL includes the 256-bit transport key in the route path',()=>{
+  const key='ac'.repeat(32);
+  assert.equal(agentConnectorUrl('https://example.ngrok.app',key),
+    'https://example.ngrok.app/mcp/agent/'+key);
+  assert.equal(agentConnectorUrl('',key),'');
+  for(const invalid of [undefined,'','short','x'.repeat(64),'ab'.repeat(31),'ab'.repeat(33)])
+    assert.throws(()=>agentConnectorUrl('https://example.ngrok.app',invalid),
+      /256-bit MCP transport key/);
+  assert.throws(()=>agentConnectorUrl('https://example.ngrok.app/path',key),
+    /ngrok hostname|HTTPS origin/);
 });
 
 test('ngrok authtoken input refuses empty, short, and whitespace-containing values', () => {

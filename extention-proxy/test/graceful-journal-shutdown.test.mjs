@@ -3,14 +3,49 @@
 // Run in the owner's final coordinated regression pass, never against a live profile.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtempSync,writeFileSync,existsSync,rmSync} from 'node:fs';
+import {mkdtempSync,writeFileSync,existsSync,rmSync,mkdirSync,statSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
-import {spawn} from 'node:child_process';
+import {spawn,spawnSync} from 'node:child_process';
 import http from 'node:http';
 
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
+
+test('D-039 FIFO journal remains in persistent profile across clean Desktop/Proxy restarts',{
+  timeout:35000,
+},(t)=>{
+  const base=mkdtempSync(path.join(tmpdir(),'chat-orch-journal-persist-'));
+  t.after(()=>rmSync(base,{recursive:true,force:true}));
+  const runtime=path.join(base,'ephemeral');
+  const profile=path.join(base,'persisted-profile');
+  const journal=path.join(profile,'coordination.events.journal');
+  const lock=journal+'.lock';
+  mkdirSync(runtime,{recursive:true});
+  mkdirSync(profile,{recursive:true});
+  writeFileSync(journal,'',{flag:'wx'});
+  const script=[
+    "import {startServer,stopServer} from './server.js';",
+    'await startServer();',
+    'await stopServer();',
+    "console.log('CLEAN_STOP');",
+  ].join('\n');
+  for(let i=0;i<2;i++){
+    const result=spawnSync(process.execPath,['--input-type=module','-e',script],{
+      cwd:root,encoding:'utf8',timeout:14000,
+      env:{...process.env,HOST:'127.0.0.1',PORT:'0',
+        CHAT_ORCH_PROFILE_DIR:runtime,CHAT_ORCH_JOURNAL_DIR:profile,
+        CHAT_ORCH_PRIVATE_COORDINATION:'1'},
+    });
+    assert.equal(result.status,0,result.stderr||result.error?.message||result.stdout);
+    assert.match(result.stdout,/CLEAN_STOP/);
+    assert.equal(existsSync(journal),true,'profile journal survives process stop');
+    assert.equal(existsSync(lock),false,'owned lock released after each clean stop');
+    assert.equal(statSync(journal).size,0);
+    assert.equal(existsSync(path.join(runtime,'coordination.events.journal')),false,
+      'runtime directory must not receive the persistent FIFO');
+  }
+});
 
 test('graceful duplicate stop releases private journal lock with HTTP keep-alive', {
   timeout:25000,

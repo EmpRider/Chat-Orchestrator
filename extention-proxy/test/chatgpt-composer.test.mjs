@@ -83,6 +83,8 @@ function composerHarness({textarea,extraEnabledButton,neverEnableSend=false,netw
     addListener(fn){messageHandler=fn;},removeListener(){},
   },sendMessage:async(message)=>{
     if(message.type==='worker_diagnostic') return {ok:true};
+    if(message.type==='managed_agent_status_request')
+      return {managed:false}; // Background status read is not network/composer readiness.
     if(message.type==='composer_send_click') throw new Error('DOM sending must not use CDP transport');
     networkChecks++;
     if(networkBusyAfterInput && trustedEvents>0) {

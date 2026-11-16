@@ -97,7 +97,7 @@ function harness() {
     },
     alarms:{onAlarm:{addListener(){}},create(){}},
   };
-  const ctx=createContext({chrome,crypto:webcrypto,URL,console,
+  const ctx=createContext({chrome,crypto:webcrypto,TextEncoder,URL,console,
     setTimeout,clearTimeout,setInterval,clearInterval});
   runInContext(source,ctx);
   const ready=runInContext('stateReady',ctx);
@@ -142,13 +142,13 @@ test('initial prompts are focused and submitted one at a time; completed handoff
   h.register(firstTab);
   const secondTab=await h.create('https://chatgpt.com/',h.first,101);
   h.register(secondTab);
-  runInContext('waitReady=async()=>{}; confirmTabIdle=async()=>{};',h.ctx);
+  runInContext('waitReady=async()=>{}; confirmTabIdle=async()=>{}; issueManagedChildPairing=async()=>"11111111-1111-4111-8111-111111111111";',h.ctx);
   const starts=[];
   const submissions=[];
   h.chrome.tabs.sendMessage=async(tabId,msg)=>{
     if(msg.cmd!=='run_prompt')throw new Error('Unexpected message '+msg.cmd);
     starts.push(tabId);
-    return new Promise(resolve=>submissions.push({tabId,resolve}));
+    return new Promise(resolve=>submissions.push({tabId,resolve,msg}));
   };
   const startTask=runInContext('startTask',h.ctx);
   const cfg={taskTimeoutMin:1};
@@ -160,6 +160,9 @@ test('initial prompts are focused and submitted one at a time; completed handoff
   };
   await until(()=>starts.length===1);
   assert.equal(starts[0],firstTab.id);
+  assert.match(submissions[0].msg.text,/managed_child_setup/);
+  assert.match(submissions[0].msg.text,/call pair_conversation/);
+  assert.match(submissions[0].msg.text,/call complete_task/);
   assert.equal(h.tabs.get(firstTab.id).active,true);
   assert.equal(h.tabs.get(secondTab.id).active,false,
     'later worker must not steal focus before earlier submission is confirmed');

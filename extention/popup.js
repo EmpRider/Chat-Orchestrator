@@ -17,6 +17,9 @@ async function refresh(fillFields = false) {
       ' · Running: ' + state.running +
       ' · Queue: ' + (state.coordinationMode || 'unknown');
     if (fillFields) $('serverUrl').value = state.cfg.serverUrl;
+    $('profileToken').placeholder=state.profileTokenConfigured
+      ? 'Connection key saved for this profile (leave blank to keep it)'
+      : 'Paste the desktop connection key';
   } catch (error) {
     $('status').textContent = 'Extension background unavailable';
     $('status').className = 'status bad';
@@ -27,6 +30,7 @@ async function refresh(fillFields = false) {
 $('save').addEventListener('click', async () => {
   const button = $('save');
   const url = $('serverUrl').value.trim();
+  const profileToken=$('profileToken').value.trim();
   let validUrl = false;
   try {
     const parsed = new URL(url);
@@ -39,10 +43,16 @@ $('save').addEventListener('click', async () => {
     $('next-step').textContent = 'Use the WebSocket URL from the desktop Connections page.';
     return;
   }
+  if(profileToken && !/^[a-f0-9]{64}$/i.test(profileToken)) {
+    $('next-step').textContent='Connection key must be the 64-character key copied from the desktop application.';
+    return;
+  }
   button.disabled = true;
   button.textContent = 'Reconnecting…';
   try {
-    await chrome.storage.local.set({ serverUrl: url });
+    await chrome.storage.local.set({serverUrl:url,
+      ...(profileToken?{profileToken}:{})});
+    $('profileToken').value='';
     await chrome.runtime.sendMessage({ type: 'reconnect' });
     await new Promise((resolve) => setTimeout(resolve, 700));
     await refresh(false);
@@ -53,6 +63,26 @@ $('save').addEventListener('click', async () => {
   } finally {
     button.disabled = false;
     button.textContent = 'Save and reconnect';
+  }
+});
+$('pair').addEventListener('click', async () => {
+  const button = $('pair');
+  button.disabled = true;
+  $('pairCode').value = '';
+  try {
+    const result = await chrome.runtime.sendMessage({type:'create_pairing_offer',approve_parent:true});
+    if (result?.ok !== true || !result.code)
+      throw new Error(result?.error || 'Could not prepare a pairing code');
+    $('pairCode').value = result.code;
+    $('next-step').textContent = result.role === 'child'
+      ? 'Managed Child paired for its existing Parent hierarchy. Invoke pair_conversation in this Child conversation.'
+      : result.initialization_status === 'SENT'
+        ? 'Parent setup sent automatically. ChatGPT must still complete MCP pairing.'
+        : 'Parent approved; setup delivery is uncertain. Inspect this chat before retrying.';
+  } catch (error) {
+    $('next-step').textContent = String(error?.message || error);
+  } finally {
+    button.disabled = false;
   }
 });
 refresh(true);

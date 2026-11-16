@@ -7,6 +7,7 @@ const INTERESTING = /tunnel|session|connect|start|stop|auth|config|fail|error|en
 
 function redact(value, secrets) {
   let output = String(value)
+    .replace(/(\/mcp\/agent\/)[a-f0-9]{64}(?=\b|[?#\s"'<>/]|$)/gi, '$1[redacted]')
     .replace(/(https?:\/\/[^\s"'<>?#]+)\?[^\s"'<>]*/gi, '$1?[redacted]')
     .replace(/\b(authorization|ngrok_authtoken|authtoken|access_token|api[_-]?key|password|secret|token)\s*[:=]\s*(?:(?:Bearer|Basic)\s+)?[^\s,;]+/gi, '$1=[redacted]')
     .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+\/-]+/gi, '$1 [redacted]');

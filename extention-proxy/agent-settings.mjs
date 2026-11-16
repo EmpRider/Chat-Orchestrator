@@ -33,11 +33,15 @@ export const DEFAULT_PROMPT_MODULES = Object.freeze({
   failure: 'For TOOL_FAILURE, disconnect or UNCERTAIN delivery, report actual observed state; do not invent success or blindly replay unverified side effects.',
 });
 const LIMITS = Object.freeze({maxWorkers:[1,10],maxTasksPerHour:[1,500],taskTimeoutMin:[1,60]});
-const FIELDS = new Set(['enabled','maxWorkers','maxTasksPerHour','taskTimeoutMin','promptSchema','promptModules']);
+const FIELDS = new Set(['enabled','maxWorkers','maxTasksPerHour','taskTimeoutMin','completionMonitor','promptSchema','promptModules']);
+export const DEFAULT_COMPLETION_MONITOR=Object.freeze({
+  initialMinutes:5,retryMinutes:[5,3,1],hydrationSeconds:5,continuedMinutes:2,
+});
 const OPERATIONS = Object.freeze({task:['task'],workspace:['task','workspace'],delegation:['task','delegation']});
 const EVENTS = Object.freeze({CHILD_RESULT:'child_result',STATUS_REQUEST:'status_request',CHILD_TAB_LOST:'child_tab_lost',TOOL_FAILURE:'failure'});
 export const DEFAULT_AGENT_SETTINGS = Object.freeze({
   enabled:true,maxWorkers:10,maxTasksPerHour:100,taskTimeoutMin:60,
+  completionMonitor:DEFAULT_COMPLETION_MONITOR,
   promptSchema:PROMPT_SCHEMA,promptModules:DEFAULT_PROMPT_MODULES,
 });
 export function normalizeAgentSettings(input) {
@@ -51,6 +55,24 @@ export function normalizeAgentSettings(input) {
     if(!Number.isSafeInteger(val)||val<min||val>max) throw new Error('Invalid agent limit: '+key);
     result[key]=val;
   }
+  const monitoring=input.completionMonitor??DEFAULT_COMPLETION_MONITOR;
+  if(!monitoring||typeof monitoring!=='object'||Array.isArray(monitoring)||
+      Object.keys(monitoring).some((key)=>!Object.hasOwn(DEFAULT_COMPLETION_MONITOR,key)))
+    throw new Error('Invalid completion monitoring settings');
+  const validated={};
+  for(const [key,min,max] of [['initialMinutes',1,60],
+    ['hydrationSeconds',4,15],['continuedMinutes',1,60]]){
+    const value=monitoring[key]??DEFAULT_COMPLETION_MONITOR[key];
+    if(!Number.isSafeInteger(value)||value<min||value>max)
+      throw new Error('Invalid completion monitoring setting: '+key);
+    validated[key]=value;
+  }
+  const retry=monitoring.retryMinutes??DEFAULT_COMPLETION_MONITOR.retryMinutes;
+  if(!Array.isArray(retry)||retry.length<1||retry.length>8||
+      retry.some((n)=>!Number.isSafeInteger(n)||n<1||n>60))
+    throw new Error('Invalid completion monitoring retry schedule');
+  validated.retryMinutes=[...retry];
+  result.completionMonitor=validated;
   const overrides=input.promptModules??{};
   if(!overrides||typeof overrides!=='object'||Array.isArray(overrides)||
       Object.keys(overrides).some(k=>!PROMPT_MODULE_KEYS.includes(k))) throw new Error('Invalid prompt module catalog');

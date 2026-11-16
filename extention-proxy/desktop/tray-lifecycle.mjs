@@ -5,12 +5,15 @@ export function minimizeToTrayPreference(value) {
   return typeof value === 'boolean' ? value : DEFAULT_MINIMIZE_TO_TRAY;
 }
 
-export function installWindowCloseBehavior(window, { shouldMinimize, trayAvailable, isExiting }) {
+export function installWindowCloseBehavior(window, {
+  shouldMinimize, trayAvailable, isExiting, onTrayUnavailable, requestExit,
+}) {
   window.on('close', (event) => {
-    if (!isExiting() && trayAvailable() && shouldMinimize()) {
-      event.preventDefault();
-      window.hide();
-    }
+    if (isExiting()) return;
+    event.preventDefault();
+    if (!shouldMinimize()) requestExit();
+    else if (trayAvailable()) window.hide();
+    else onTrayUnavailable?.();
   });
 }
 

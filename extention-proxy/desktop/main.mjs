@@ -1,17 +1,20 @@
-import { app, BrowserWindow, Menu, Tray, clipboard, ipcMain, nativeImage, safeStorage, shell, utilityProcess } from 'electron';
+import { app, BrowserWindow, Menu, Tray, clipboard, dialog, ipcMain, nativeImage, safeStorage, shell, utilityProcess } from 'electron';
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { connectorUrl, ISOLATED_NGROK_CONFIG, normalizeNgrokAuthtoken, normalizeNgrokDomain, normalizeProxyPort, normalizeProfileName, PRIVATE_QUEUE_PREFERENCE_SCHEMA, resolvePrivateQueuePreference } from './config.mjs';
+import { agentConnectorUrl, ISOLATED_NGROK_CONFIG, normalizeNgrokAuthtoken, normalizeNgrokDomain, normalizeProxyPort, normalizeProfileName, PRIVATE_QUEUE_PREFERENCE_SCHEMA, resolvePrivateQueuePreference } from './config.mjs';
 import { createNgrokLogReader } from './ngrok-diagnostics.mjs';
 import { findReusableNgrokTunnel, describeNgrokExit } from './ngrok-reuse.mjs';
 import { inspectPrivateJournal, preparePrivateJournal } from './coordination-storage.mjs';
 import { createDesktopTray, installWindowCloseBehavior, minimizeToTrayPreference } from './tray-lifecycle.mjs';
 import { DEFAULT_AGENT_SETTINGS, normalizeAgentSettings, replaceObsoletePromptSettings, disabledAgentSettings, composeAgentPrompt } from '../agent-settings.mjs';
 import { createDiagnostics } from '../diagnostics.mjs';
+import { findInstalledBrowser,managedBrowserLaunchArgs,managedProfilePath,
+  normalizeManagedBrowser,matchesManagedEnrollment } from './managed-browser.mjs';
+import {checkLatestRelease,evaluateUpdateReadiness,versionParts,stillApprovedRelease} from './update-policy.mjs';
 
 // Set CHAT_ORCH_DIAGNOSTICS=1 for lifecycle messages (never credentials).
 const debug = (message) => {
@@ -19,12 +22,16 @@ const debug = (message) => {
 };
 
 const appDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const unpackedExtensionDir=()=>app.isPackaged
+  ? path.join(process.resourcesPath,'extension')
+  : path.resolve(appDir,'..','extention');
 // A two-key, test-only packaged smoke mode preserves the production port/profile.
 // It is never enabled in ordinary packaged app launches.
 const PACKAGED_SMOKE_MODE = app.isPackaged && process.env.CHAT_ORCH_PACKAGED_SMOKE === '1';
 const E2E_MODE = process.env.CHAT_ORCH_E2E_MODE === '1' &&
   (!app.isPackaged || PACKAGED_SMOKE_MODE);
 let PORT = E2E_MODE ? Number(process.env.CHAT_ORCH_E2E_PORT || 8897) : 8787;
+const publicUpstreamPort=()=>PORT===65535?65534:PORT+1;
 const PACKAGED_SMOKE_EXIT_MS = PACKAGED_SMOKE_MODE
   ? Number(process.env.CHAT_ORCH_PACKAGED_SMOKE_EXIT_MS || 45000) : 0;
 if (E2E_MODE && (!Number.isSafeInteger(PORT) || PORT < 1024 || PORT > 65535 || PORT === 8787)) {
@@ -59,6 +66,26 @@ let coordinationSnapshot = null; // Owned utilityProcess emits redacted, read-on
 let stopping = false;
 let agentSettings = normalizeAgentSettings({});
 let agentSettingsSyncRevision = 0;
+let managedBrowserSelection='none';
+let managedBrowserPhase='not_configured';
+let managedBrowserError='';
+let managedBrowserLaunchAttempted=false;
+let managedBrowserEnrollment=null; // User-verified stable extension installation for selected browser
+let liveBrowserEnrollment=null; // Live socket proof, never persisted as user approval
+let browserVerificationGeneration=0;
+let browserRecheckInFlight=false;
+let browserRecheckAttempted=false;
+let browserRecheckNextAt=0; // retry transient inspection failures without reapproving
+let onboardingComplete=false;
+let autoStartWindows=false; // explicit opt-in only; never create a login entry on fresh install
+const currentVersion=JSON.parse(fs.readFileSync(path.join(appDir,'package.json'),'utf8')).version;
+let updateRelease=null;
+let updatePhase='not_checked';
+let updateMessage='';
+let pendingUpdateVersion=null;
+let lastUpdateGateCheck=0;
+let updateGateBusy=false;
+let releaseCheckBusy=false;
 const sessionDir = path.join(os.tmpdir(), `chat-orchestrator-session-${crypto.randomUUID()}`);
 
 // Optional loopback CDP is test-only; packaged releases never expose DevTools.
@@ -106,9 +133,40 @@ if (!hasInstanceLock) app.quit();
 const dataDir = () => app.getPath('userData');
 const diagnostics = createDiagnostics({component:'desktop',directory:dataDir()});
 const settingsFile = () => path.join(dataDir(), 'settings.json');
+const extensionProfileTokenFile=()=>path.join(dataDir(),'extension-profile-token.txt');
+const publicMcpTokenFile=()=>path.join(dataDir(),'public-mcp-token.txt');
+function publicMcpToken(){
+  const file=publicMcpTokenFile();
+  if(!fs.existsSync(file)){
+    fs.mkdirSync(dataDir(),{recursive:true});
+    try{fs.writeFileSync(file,crypto.randomBytes(32).toString('hex'),
+      {flag:'wx',encoding:'utf8',mode:0o600});}
+    catch(error){if(error.code!=='EEXIST')throw error;}
+  }
+  const token=fs.readFileSync(file,'utf8').trim();
+  if(!/^[a-f0-9]{64}$/i.test(token))
+    throw new Error('Invalid public MCP transport credential');
+  return token;
+}
+function extensionProfileToken() {
+  const file=extensionProfileTokenFile();
+  if(!fs.existsSync(file)) {
+    fs.mkdirSync(dataDir(),{recursive:true});
+    const generated=crypto.randomBytes(32).toString('hex');
+    try {fs.writeFileSync(file,generated,{flag:'wx',encoding:'utf8',mode:0o600});}
+    catch(error) {if(error.code!=='EEXIST')throw error;}
+  }
+  const token=fs.readFileSync(file,'utf8').trim();
+  if(!/^[a-f0-9]{64}$/i.test(token))
+    throw new Error('Local browser profile credential is corrupt; refusing an unauthenticated extension bridge');
+  return token;
+}
 const ngrokAuthFile = () => path.join(dataDir(), 'ngrok-auth.bin');
 const ngrokConfigFile = () => path.join(dataDir(), 'ngrok-isolated.yml');
-const privateCoordinationJournalPath = () => path.join(sessionDir, 'coordination.events.journal');
+// FIFO receipts must survive a complete Desktop/Proxy process restart.
+// The temporary session directory is only for transient runtime state.
+// Keep journal + owner lock in this profile's persistent user-data directory.
+const privateCoordinationJournalPath = () => path.join(dataDir(), 'coordination.events.journal');
 
 // Provision from trusted desktop startup or IPC. A future start may use the journal,
 // but no record is ACKed merely because this file was created. On Windows,
@@ -147,12 +205,24 @@ function state() {
     agentSettingsSyncRevision,
     domain,
     profile: PROFILE,
+    managedBrowserSelection,
+    managedBrowserVerified:matchesManagedEnrollment(managedBrowserEnrollment,
+      managedBrowserSelection,liveBrowserEnrollment,extensionConnected),
+    onboardingComplete,
+    update:{currentVersion,phase:updatePhase,message:updateMessage,
+      availableVersion:updateRelease?.version||null,
+      pendingVersion:pendingUpdateVersion},
+    managedBrowserPhase,
+    managedBrowserError,
+    unpackedExtensionPath:unpackedExtensionDir(),
+    autoStartWindows,
     port: PORT,
+    publicPort:publicUpstreamPort(),
     routeVerified,
     minimizeToTray,
     trayAvailable: Boolean(tray && !tray.isDestroyed()),
     localWebSocketUrl: `ws://127.0.0.1:${PORT}/bridge`,
-    publicPath: '/mcp',
+    publicPath: '/mcp/agent', // Display only the safe path, never the secret query.
   };
 }
 
@@ -167,6 +237,14 @@ function loadSettings() {
   }
   try {
     const saved = JSON.parse(fs.readFileSync(settingsFile(), 'utf8'));
+    managedBrowserSelection=normalizeManagedBrowser(saved.managedBrowserSelection??'none');
+    managedBrowserEnrollment=saved.managedBrowserEnrollment?.browser===managedBrowserSelection &&
+      /^[0-9a-f-]{36}$/i.test(saved.managedBrowserEnrollment?.profileInstallId||'')
+      ? {browser:managedBrowserSelection,profileInstallId:saved.managedBrowserEnrollment.profileInstallId}
+      : null;
+    onboardingComplete=saved.onboardingComplete===true && Boolean(managedBrowserEnrollment);
+    pendingUpdateVersion=versionParts(saved.pendingUpdateVersion)?saved.pendingUpdateVersion:null;
+    autoStartWindows=saved.autoStartWindows===true;
     domain = saved.domain ? normalizeNgrokDomain(saved.domain) : '';
     minimizeToTray = minimizeToTrayPreference(saved.minimizeToTray);
     privateCoordinationOptIn = resolvePrivateQueuePreference(saved);
@@ -176,6 +254,11 @@ function loadSettings() {
         saved.agentSettings?.systemPrompts !== undefined || saved.agentSettings?.useWorkerSystemPrompt !== undefined) writeSettings();
   } catch {
     domain = '';
+    managedBrowserSelection='none';
+    managedBrowserEnrollment=null;
+    onboardingComplete=false;
+    pendingUpdateVersion=null;
+    autoStartWindows=false;
     minimizeToTray = true;
     privateCoordinationOptIn = false;
     agentSettings = disabledAgentSettings();
@@ -185,7 +268,44 @@ function loadSettings() {
 
 function writeSettings() {
   fs.mkdirSync(dataDir(), { recursive: true });
-  fs.writeFileSync(settingsFile(), JSON.stringify({ domain, minimizeToTray, privateCoordinationOptIn, privateQueuePreferenceSchema: PRIVATE_QUEUE_PREFERENCE_SCHEMA, proxyPort: PORT, agentSettings }, null, 2), { encoding: 'utf8', mode: 0o600 });
+  fs.writeFileSync(settingsFile(), JSON.stringify({ domain, minimizeToTray,
+    managedBrowserSelection,managedBrowserEnrollment,onboardingComplete,
+    pendingUpdateVersion,
+    autoStartWindows, privateCoordinationOptIn,
+    privateQueuePreferenceSchema: PRIVATE_QUEUE_PREFERENCE_SCHEMA,
+    proxyPort: PORT, agentSettings }, null, 2), { encoding: 'utf8', mode: 0o600 });
+}
+
+function openManagedBrowser({openExtensions=false}={}) {
+  if (managedBrowserSelection==='none')
+    throw new Error('Select Chrome or Edge before opening a managed browser');
+  const executable=findInstalledBrowser(managedBrowserSelection);
+  if (!executable)
+    throw new Error('Selected browser was not found in standard Windows installation paths');
+  const profileDir=managedProfilePath(dataDir(),managedBrowserSelection);
+  fs.mkdirSync(profileDir,{recursive:true});
+  const launched=spawn(executable,managedBrowserLaunchArgs(
+    managedBrowserSelection,profileDir,{openExtensions}),{
+    detached:true,windowsHide:true,stdio:'ignore',shell:false,
+  });
+  launched.unref();
+  managedBrowserLaunchAttempted=true;
+  managedBrowserPhase='launching';
+  managedBrowserError='';
+  launched.once('spawn',()=>{
+    managedBrowserPhase='launched';
+    publishState();
+  });
+  launched.once('error',(error)=>{
+    managedBrowserPhase='error';
+    managedBrowserError=error.code==='ENOENT'
+      ? 'Selected browser executable could not be started'
+      : 'Managed browser startup failed; inspect browser installation';
+    publishState();
+  });
+  // Browser profiles persist across app restarts; exiting the tray never
+  // terminates an unrelated/default-profile browser process.
+  return state();
 }
 
 async function saveNgrokAuth(value) {
@@ -224,18 +344,18 @@ async function startNgrok() {
   ngrokError = '';
   routeVerified = false;
   const generation = ++ngrokGeneration;
-  debug(`ngrok start requested (generation=${generation}, domain=${domain}, port=${PORT})`);
+  debug(`ngrok start requested (generation=${generation}, domain=${domain}, publicPort=${publicUpstreamPort()})`);
   publishState();
   try {
     // An app crash may leave its ngrok subprocess running. The new app must
     // not start a competing tunnel for the same dedicated domain. Match BOTH
     // exact public origin and loopback target port via the local ngrok API.
-    const existing = await findReusableNgrokTunnel(domain,PORT);
+    const existing = await findReusableNgrokTunnel(domain,publicUpstreamPort());
     if (generation !== ngrokGeneration) return;
     if (existing) {
       ngrokReused=existing;
       debug('ngrok: using matching existing local tunnel; ownership remains external');
-      diagnostics.info('ngrok.reused',{port:PORT,reused:true});
+      diagnostics.info('ngrok.reused',{port:publicUpstreamPort(),reused:true});
       publishState();
       void pollNgrok();
       return;
@@ -252,7 +372,7 @@ async function startNgrok() {
     debug('ngrok using app-isolated config and encrypted app credential (token value hidden)');
     // The isolated config contains no authtoken. NGROK_AUTHTOKEN in the child
     // environment is the sole credential source; AgentBridge is untouched.
-    const owned = spawn('ngrok', ['http', String(PORT), '--url', domain, '--config', configPath, '--log', 'stdout', '--log-format', 'json'], {
+    const owned = spawn('ngrok', ['http', String(publicUpstreamPort()), '--url', domain, '--config', configPath, '--log', 'stdout', '--log-format', 'json'], {
       cwd: app.isPackaged ? process.resourcesPath : appDir,
       env: { ...process.env, NGROK_AUTHTOKEN: auth },
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -299,13 +419,13 @@ async function startNgrok() {
       // after our attempted launch reports ERR_NGROK_334.
       void (async () => {
         if (ngrokErrorCode === 'ERR_NGROK_334') {
-          const matching = await findReusableNgrokTunnel(domain,PORT);
+          const matching = await findReusableNgrokTunnel(domain,publicUpstreamPort());
           if (generation !== ngrokGeneration || ngrokChild || ngrokReused) return;
           if (matching) {
             ngrokReused=matching;
             ngrokPhase='starting';
             ngrokError='';
-            diagnostics.info('ngrok.reused_after_conflict',{port:PORT,reused:true});
+            diagnostics.info('ngrok.reused_after_conflict',{port:publicUpstreamPort(),reused:true});
             publishState();
             void pollNgrok();
             return;
@@ -363,7 +483,7 @@ async function pollNgrok() {
   let verified = false;
   try {
     if (reused) {
-      const stillPresent = await findReusableNgrokTunnel(checkedDomain,PORT,{
+      const stillPresent = await findReusableNgrokTunnel(checkedDomain,publicUpstreamPort(),{
         ports:[reused.apiPort],
       });
       if (!stillPresent) throw new Error('Existing ngrok tunnel is no longer present');
@@ -395,6 +515,7 @@ function startProxy() {
   phase = 'starting';
   errorMessage = '';
   extensionConnected = false;
+  invalidateLiveBrowserVerification();
   agentSettingsSyncRevision = 0;
   publishState();
 
@@ -409,9 +530,13 @@ function startProxy() {
       env: {
         ...process.env,
         PORT: String(PORT),
+        CHAT_ORCH_PUBLIC_PORT:String(publicUpstreamPort()),
+        CHAT_ORCH_PUBLIC_MCP_TOKEN:publicMcpToken(),
+        CHAT_ORCH_EXTENSION_PROFILE_TOKEN:extensionProfileToken(),
         HOST: '127.0.0.1',
         CHAT_ORCH_PROFILE_DIR: sessionDir,
         CHAT_ORCH_SETTINGS_DIR: dataDir(),
+        CHAT_ORCH_JOURNAL_DIR: dataDir(),
         CHAT_ORCH_PRIVATE_COORDINATION: privateCoordinationOptIn ? '1' : '0',
       },
     });
@@ -439,6 +564,12 @@ function startProxy() {
         agentSettingsSyncRevision = Number(message.revision) || 0;
       } else if (message?.type === 'agent_settings_reloaded') {
         agentSettingsSyncRevision = Number(message.revision) || 0;
+      } else if (message?.type === 'extension_session_changed') {
+        // A different authenticated socket may replace the same browser
+        // session between two HTTP health polls. Saved approval is not live
+        // proof until we inspect the new extension installation again.
+        invalidateLiveBrowserVerification();
+        extensionConnected=false;
       } else if (message?.type === 'coordination_snapshot') {
         if (message.snapshot && typeof message.snapshot === 'object') {
           coordinationSnapshot = message.snapshot;
@@ -469,6 +600,7 @@ function startProxy() {
       }
       runningPrivateCoordination = null;
       extensionConnected = false;
+      invalidateLiveBrowserVerification();
       coordinationSnapshot = null;
       if (stopping) {
         phase = 'stopped';
@@ -553,6 +685,7 @@ async function stopProxyOnce() {
 
 async function pollHealth() {
   if (phase !== 'running') return;
+  const wasConnected=extensionConnected;
   try {
     const response = await fetch(`http://127.0.0.1:${PORT}/health`, { signal: AbortSignal.timeout(1500) });
     if (!response.ok) throw new Error('Health request failed');
@@ -565,7 +698,106 @@ async function pollHealth() {
     extensionConnected = false;
     coordinationState = 'unknown';
   }
+  if(!extensionConnected && wasConnected)
+    invalidateLiveBrowserVerification();
+  if(extensionConnected && managedBrowserEnrollment &&
+      !browserRecheckInFlight &&
+      (!browserRecheckAttempted || Date.now()>=browserRecheckNextAt)){
+    browserRecheckAttempted=true;
+    browserRecheckInFlight=true;
+    browserRecheckNextAt=Date.now()+15000;
+    const generation=browserVerificationGeneration;
+    void (async()=>{
+      try{
+        const verified=await inspectCurrentManagedExtension();
+        if(generation!==browserVerificationGeneration || !extensionConnected)return;
+        liveBrowserEnrollment=matchesManagedEnrollment(
+          managedBrowserEnrollment,managedBrowserSelection,verified)?verified:null;
+        if(liveBrowserEnrollment)browserRecheckNextAt=Number.MAX_SAFE_INTEGER;
+      }catch{
+        if(generation===browserVerificationGeneration)liveBrowserEnrollment=null;
+      }finally{
+        browserRecheckInFlight=false;
+        publishState();
+      }
+    })();
+  }
   publishState();
+}
+
+function invalidateLiveBrowserVerification(){
+  browserVerificationGeneration++;
+  liveBrowserEnrollment=null;
+  browserRecheckAttempted=false;
+  browserRecheckNextAt=0;
+}
+
+async function checkForUpdates(){
+  if(releaseCheckBusy||updateGateBusy)return state();
+  releaseCheckBusy=true;
+  updatePhase='checking';
+  publishState();
+  try{
+    updateRelease=await checkLatestRelease(currentVersion);
+    if(pendingUpdateVersion && updateRelease?.version!==pendingUpdateVersion){
+      updatePhase='held';
+      updateMessage='Approved release is unavailable. Cancel and review the new release manually.';
+    }else if(pendingUpdateVersion){
+      updatePhase='waiting';
+      updateMessage='Waiting for tasks, Parent reviews and FIFO receipts.';
+    }else{
+      updatePhase=updateRelease?'available':'current';
+      updateMessage=updateRelease
+        ? 'New version '+updateRelease.version+' available. Installation requires your approval.'
+        : 'Current version is the latest trusted published release.';
+    }
+  }catch{
+    updatePhase=pendingUpdateVersion?'held':'offline';
+    updateMessage='Cannot verify the official release feed. No update will run.';
+  }finally{
+    releaseCheckBusy=false;
+    publishState();
+  }
+  return state();
+}
+
+async function attemptUpdateHandoff(){
+  if(!pendingUpdateVersion||updateGateBusy||updatePhase==='held')return;
+  updateGateBusy=true;
+  lastUpdateGateCheck=Date.now();
+  try{
+    const approvedVersion=pendingUpdateVersion;
+    if(!updateRelease || updateRelease.version!==approvedVersion)
+      throw new Error('Approved release cannot be verified against publisher metadata');
+    if(phase!=='running'||!extensionConnected)
+      throw new Error('Connected Proxy and extension required before updating');
+    const extension=await desktopExtensionAction('update_readiness');
+    const gate=evaluateUpdateReadiness(extension,coordinationSnapshot,{
+      queueEnabled:runningPrivateCoordination===true,
+    });
+    if(!gate.ready)throw new Error(gate.blockers.slice(0,2).join('; '));
+    // A deferred approval might be hours or days old. Do not open an
+    // unverified or superseded release after the last Child finishes.
+    const latest=await checkLatestRelease(currentVersion);
+    if(!stillApprovedRelease(approvedVersion,updateRelease,latest)){
+      updatePhase='held';
+      throw new Error('Approved release changed or was withdrawn; review the latest release before continuing');
+    }
+    // Never download or execute an unsigned installer: open the trusted
+    // release page for deliberate human installation without stopping Proxy.
+    await shell.openExternal(latest.url);
+    pendingUpdateVersion=null;
+    writeSettings();
+    updatePhase='release_opened';
+    updateMessage='Official release opened. Verify installer signature/checksum before manual installation; Proxy remains running.';
+  }catch(error){
+    if(updatePhase!=='held')
+      updatePhase=updateRelease?.version!==pendingUpdateVersion?'held':'waiting';
+    updateMessage=String(error?.message||'Unknown update blocker').slice(0,220);
+  }finally{
+    updateGateBusy=false;
+    publishState();
+  }
 }
 
 function requireTrustedWindow(event) {
@@ -574,12 +806,18 @@ function requireTrustedWindow(event) {
   }
 }
 
-function desktopExtensionAction(action, tabId, nonce, browserSessionId) {
+function desktopExtensionAction(action, tabId, nonce, browserSessionId,decisionId=null,choice=null,
+  expectedProfileInstallId=null,expectedBrowserProduct=null) {
   if (!child || phase !== 'running') return Promise.reject(new Error('Start proxy and connect extension first'));
-  if (!['set_orchestrator','diagnose','close_legacy_workers','inspect_root_repair','confirm_root_repair'].includes(action)) {
+  if (!['set_orchestrator','diagnose','close_legacy_workers','close_managed_browser','verify_managed_browser','update_readiness',
+      'inspect_root_repair','confirm_root_repair','list_agent_closures','resolve_agent_closure',
+      'list_completion_monitors','set_manual_completion'].includes(action)) {
     return Promise.reject(new Error('Unsupported desktop action'));
   }
-  if (action !== 'close_legacy_workers' && (!Number.isSafeInteger(tabId) || tabId <= 0)) {
+  if (!['close_legacy_workers','close_managed_browser','verify_managed_browser','update_readiness',
+      'list_agent_closures','resolve_agent_closure',
+      'list_completion_monitors','set_manual_completion'].includes(action) &&
+      (!Number.isSafeInteger(tabId) || tabId <= 0)) {
     return Promise.reject(new Error('Enter an actual positive tab ID'));
   }
   if (browserSessionId != null &&
@@ -590,19 +828,182 @@ function desktopExtensionAction(action, tabId, nonce, browserSessionId) {
       !browserSessionId)) {
     return Promise.reject(new Error('Root recovery requires its one-use nonce and browser session ID'));
   }
+  if(action==='resolve_agent_closure' &&
+      (!/^[0-9a-f-]{36}$/i.test(decisionId||'') ||
+       !['accident','yes','cancel'].includes(choice)))
+    return Promise.reject(new Error('Valid closure decision and explicit user choice required'));
+  if(action==='set_manual_completion' &&
+      (!/^[0-9a-f-]{36}$/i.test(decisionId||'')||
+       !['completed','in_progress'].includes(choice)))
+    return Promise.reject(new Error('Explicit manual task status choice and task ID required'));
   const owned = child;
   const id = crypto.randomUUID();
   return new Promise((resolve, reject) => {
+    // Full Accident restoration may create and verify several nested tabs.
+    // A short UI IPC timeout would orphan a partially restored subtree.
+    const deadlineMs=action==='resolve_agent_closure'&&choice==='accident'
+      ? 180000 : 15000;
     const timer = setTimeout(() => {desktopExtensionActions.delete(id);
-      reject(new Error('Extension action timed out; outcome unknown'));}, 15000);
+      reject(new Error('Extension action timed out; outcome unknown'));}, deadlineMs);
     desktopExtensionActions.set(id, {resolve,reject,timer});
     try {owned.postMessage({type:'desktop_extension_action', request_id:id, action, tab_id:tabId,
-      confirmation_nonce:nonce,browser_session_id:browserSessionId});}
+      confirmation_nonce:nonce,browser_session_id:browserSessionId,
+      decision_id:decisionId,choice,expected_profile_install_id:expectedProfileInstallId,
+      expected_browser_product:expectedBrowserProduct});}
     catch (error) {clearTimeout(timer); desktopExtensionActions.delete(id); reject(error);}
   });
 }
 
+async function inspectCurrentManagedExtension(){
+  if(managedBrowserSelection==='none')
+    throw new Error('Select and open your dedicated Chrome or Edge profile first');
+  if(!extensionConnected)
+    throw new Error('Connect the extension inside the selected dedicated profile');
+  const verified=await desktopExtensionAction('verify_managed_browser');
+  if(!/^[0-9a-f-]{36}$/i.test(verified?.profile_install_id||''))
+    throw new Error('Connected extension has no stable enrollment identity');
+  if(verified.browser_product!==managedBrowserSelection)
+    throw new Error('Connected extension is not running in your selected browser');
+  const bundledManifest=JSON.parse(fs.readFileSync(
+    path.join(unpackedExtensionDir(),'manifest.json'),'utf8'));
+  if(verified.extension_version!==bundledManifest.version)
+    throw new Error('Extension version differs from this app build. Install/reload the bundled extension first');
+  return verified;
+}
+
 function registerActions() {
+  ipcMain.handle('bridge:checkUpdates',(event)=>{
+    requireTrustedWindow(event);
+    return checkForUpdates();
+  });
+  ipcMain.handle('bridge:requestUpdate',async(event)=>{
+    requireTrustedWindow(event);
+    if(!updateRelease || pendingUpdateVersion || updatePhase!=='available')
+      throw new Error('Check for a release or cancel the previous update first');
+    // A stale notification cannot authorize a release which the official
+    // publisher no longer lists. No download/installer execution occurs.
+    const latest=await checkLatestRelease(currentVersion);
+    if(!latest || latest.version!==updateRelease.version)
+      throw new Error('Available release changed; use Check for Updates again');
+    pendingUpdateVersion=updateRelease.version;
+    updatePhase='waiting';
+    updateMessage='Update consent saved; verifying that Agent work will not be interrupted.';
+    writeSettings();
+    publishState();
+    await attemptUpdateHandoff();
+    return state();
+  });
+  ipcMain.handle('bridge:cancelUpdate',(event)=>{
+    requireTrustedWindow(event);
+    if(updateGateBusy)throw new Error('Update safety check in progress; retry cancellation');
+    pendingUpdateVersion=null;
+    updatePhase=updateRelease?'available':'not_checked';
+    updateMessage='Pending update cancelled; no application changes made.';
+    writeSettings();
+    publishState();
+    return state();
+  });
+  ipcMain.handle('bridge:copyPublicMcpToken',(event)=>{
+    requireTrustedWindow(event);
+    clipboard.writeText(publicMcpToken());
+    return {copied:true};
+  });
+  ipcMain.handle('bridge:copyProfileToken',(event)=>{
+    requireTrustedWindow(event);
+    clipboard.writeText(extensionProfileToken());
+    return {copied:true};
+  });
+  ipcMain.handle('bridge:listAgentClosures',(event)=>{
+    requireTrustedWindow(event);
+    return desktopExtensionAction('list_agent_closures');
+  });
+  ipcMain.handle('bridge:resolveAgentClosure',(event,id,choice)=>{
+    requireTrustedWindow(event);
+    return desktopExtensionAction('resolve_agent_closure',null,null,null,id,choice);
+  });
+  ipcMain.handle('bridge:setCompletionStatus',(event,taskId,status,browserSessionId)=>{
+    requireTrustedWindow(event);
+    return desktopExtensionAction('set_manual_completion',null,null,browserSessionId,taskId,status);
+  });
+  ipcMain.handle('bridge:copyExtensionPath',(event)=>{
+    requireTrustedWindow(event);
+    const extensionPath=unpackedExtensionDir();
+    if (!fs.existsSync(path.join(extensionPath,'manifest.json')))
+      throw new Error('Browser extension files are missing from this installation');
+    clipboard.writeText(extensionPath);
+    return {copied:true};
+  });
+  ipcMain.handle('bridge:setAutoStartWindows',(event,enabled)=>{
+    requireTrustedWindow(event);
+    if (typeof enabled!=='boolean') throw new Error('Invalid automatic startup choice');
+    if (!app.isPackaged || process.platform!=='win32' || E2E_MODE)
+      throw new Error('Automatic startup is configurable in the installed Windows app only');
+    const args=PROFILE==='default'?[]:[`--profile=${PROFILE}`];
+    app.setLoginItemSettings({openAtLogin:enabled,args});
+    autoStartWindows=app.getLoginItemSettings({args}).openAtLogin===true;
+    writeSettings();
+    publishState();
+    return state();
+  });
+  ipcMain.handle('bridge:configureManagedBrowser',(event,value)=>{
+    requireTrustedWindow(event);
+    const selected=normalizeManagedBrowser(value);
+    if (selected!=='none' && !findInstalledBrowser(selected))
+      throw new Error('Selected browser not found. Install Chrome or Edge first');
+    if(managedBrowserSelection!==selected){
+      managedBrowserEnrollment=null;
+      onboardingComplete=false;
+      invalidateLiveBrowserVerification();
+    }
+    managedBrowserSelection=selected;
+    managedBrowserPhase=selected==='none'?'not_configured':'selected';
+    managedBrowserLaunchAttempted=false;
+    managedBrowserError='';
+    writeSettings();
+    if (selected!=='none') openManagedBrowser();
+    publishState();
+    return state();
+  });
+  ipcMain.handle('bridge:verifyManagedBrowser',async(event)=>{
+    requireTrustedWindow(event);
+    const selectedAtStart=managedBrowserSelection;
+    const generation=browserVerificationGeneration;
+    const verified=await inspectCurrentManagedExtension();
+    if(generation!==browserVerificationGeneration ||
+        selectedAtStart!==managedBrowserSelection || !extensionConnected)
+      throw new Error('Browser selection or connection changed during verification; retry');
+    if(managedBrowserEnrollment?.profileInstallId!==verified.profile_install_id)
+      onboardingComplete=false;
+    managedBrowserEnrollment={browser:managedBrowserSelection,profileInstallId:verified.profile_install_id};
+    liveBrowserEnrollment=verified;
+    browserRecheckAttempted=true;
+    browserRecheckNextAt=Number.MAX_SAFE_INTEGER;
+    writeSettings();
+    publishState();
+    return state();
+  });
+  ipcMain.handle('bridge:finishOnboarding',async(event)=>{
+    requireTrustedWindow(event);
+    if(!managedBrowserEnrollment || managedBrowserEnrollment.browser!==managedBrowserSelection ||
+        !extensionConnected)
+      throw new Error('Verify the dedicated browser extension before completing setup');
+    const selectedAtStart=managedBrowserSelection;
+    const generation=browserVerificationGeneration;
+    const verified=await inspectCurrentManagedExtension();
+    if(generation!==browserVerificationGeneration ||
+        selectedAtStart!==managedBrowserSelection || !extensionConnected ||
+        !matchesManagedEnrollment(managedBrowserEnrollment,selectedAtStart,verified))
+      throw new Error('Connected extension changed since approval; verify the new installation again');
+    liveBrowserEnrollment=verified;
+    onboardingComplete=true;
+    writeSettings();
+    publishState();
+    return state();
+  });
+  ipcMain.handle('bridge:openManagedBrowserExtensions',(event)=>{
+    requireTrustedWindow(event);
+    return openManagedBrowser({openExtensions:true});
+  });
   ipcMain.handle('bridge:extensionAction', (event, action, tabId, nonce, browserSessionId) => {
     requireTrustedWindow(event);
     return desktopExtensionAction(action, tabId, nonce, browserSessionId);
@@ -641,7 +1042,7 @@ function registerActions() {
   ipcMain.handle('bridge:copyUrl', (event) => {
     requireTrustedWindow(event);
     if (!domain) throw new Error('Save your ngrok domain first');
-    clipboard.writeText(connectorUrl(domain));
+    clipboard.writeText(agentConnectorUrl(domain,publicMcpToken()));
   });
   ipcMain.handle('bridge:configureNgrok', async (event, value, authValue) => {
     requireTrustedWindow(event);
@@ -722,6 +1123,9 @@ function createWindow() {
     shouldMinimize: () => minimizeToTray,
     trayAvailable: () => Boolean(tray && !tray.isDestroyed()),
     isExiting: () => exitStarted || exitReady,
+    requestExit: () => void requestTrayQuit(),
+    onTrayUnavailable: () => dialog.showErrorBox('System Tray unavailable',
+      'Chat Orchestrator is still running. The window cannot be hidden without a tray icon.'),
   });
   window.on('closed', () => debug('window closed'));
   window.once('ready-to-show', () => window.show());
@@ -734,6 +1138,28 @@ function restoreWindow() {
   window.focus();
 }
 
+function openConnectionSetupForBrowserVerification(){
+  restoreWindow();
+  if(window && !window.isDestroyed())
+    window.webContents.send('bridge:openConnectionSetup');
+}
+
+function showBrowserVerificationRequired(reason){
+  // A selected browser name alone cannot establish that the connected
+  // extension belongs to the *dedicated* profile. Never auto-enroll or close
+  // arbitrary normal Chrome/Edge windows from this Exit dialog.
+  const options={
+    type:'warning',title:'Verify managed browser before closing',
+    message:'Your dedicated browser profile has not been verified.',
+    detail:reason+
+      '\n\nNothing was closed. In Connection Setup, verify the extension is running in the dedicated browser profile, then click Verify connected browser profile and Finish setup.',
+    buttons:['Open Connection Setup','Cancel'],defaultId:0,cancelId:1,noLink:true,
+  };
+  const result=window && !window.isDestroyed()
+    ? dialog.showMessageBoxSync(window,options) : dialog.showMessageBoxSync(options);
+  if(result===0)openConnectionSetupForBrowserVerification();
+}
+
 function createTray() {
   // Tray is created before the browser window so X never hides without a restore path.
   try {
@@ -742,7 +1168,7 @@ function createTray() {
     tray = createDesktopTray({
       Tray, Menu, icon: image,
       restore: restoreWindow,
-      exit: () => app.quit(),
+      exit: () => void requestTrayQuit(),
     });
   } catch (error) {
     // Without a usable tray, X closes the app rather than leaving it invisible.
@@ -751,13 +1177,73 @@ function createTray() {
   }
 }
 
+async function requestTrayQuit() {
+  if (exitStarted || exitReady) return;
+  const options={
+    type:'question',title:'Exit Chat Orchestrator',
+    message:'What should happen to your managed browser?',
+    detail:'Keeping the browser open preserves ChatGPT tabs. Close Managed Browser closes all normal windows in the single connected extension profile. Confirm the connected extension is in your selected dedicated profile before choosing Close.',
+    buttons:['Keep Browser Open','Close Managed Browser','Cancel'],
+    defaultId:2,cancelId:2,noLink:true,
+  };
+  const choice=window && !window.isDestroyed()
+    ? dialog.showMessageBoxSync(window,options) : dialog.showMessageBoxSync(options);
+  if (choice===2) return;
+  if (choice===1) {
+    if (managedBrowserSelection==='none') {
+      showBrowserVerificationRequired('Select a dedicated Chrome or Edge browser first.');
+      return;
+    }
+    if(!managedBrowserEnrollment || managedBrowserEnrollment.browser!==managedBrowserSelection){
+      showBrowserVerificationRequired(
+        'You selected '+(managedBrowserSelection==='edge'?'Microsoft Edge':'Google Chrome')+
+        ', but this profile has no saved user-approved extension enrollment.');
+      return;
+    }
+    let closureDispatched=false;
+    try {
+      const selection=managedBrowserSelection;
+      const generation=browserVerificationGeneration;
+      const verified=await inspectCurrentManagedExtension();
+      if(generation!==browserVerificationGeneration ||
+          selection!==managedBrowserSelection ||
+          !matchesManagedEnrollment(managedBrowserEnrollment,selection,verified))
+        throw new Error('Connected browser identity changed before quit');
+      closureDispatched=true;
+      const closure=await desktopExtensionAction('close_managed_browser',null,null,null,null,null,
+        managedBrowserEnrollment.profileInstallId,managedBrowserSelection);
+      if(!closure || !Number.isSafeInteger(closure.windows) || closure.windows<0 ||
+          (closure.windows>0 && (closure.scheduled!==true ||
+            closure.confirmed_closed!==closure.windows-1 ||
+            closure.remaining_windows!==1)))
+        throw new Error('Managed browser close could not confirm its pre-exit steps');
+      // Let the authenticated extension attempt the final window removal
+      // before stopping its Proxy. The last close may end the extension socket,
+      // so this delay is not proof of OS-process termination.
+      if(closure.scheduled)await new Promise((resolve)=>setTimeout(resolve,700));
+    } catch(error) {
+      if(closureDispatched){
+        dialog.showErrorBox('Managed browser close not confirmed',
+          'A close request may already have reached the extension. The app remains open. Inspect the browser windows before trying again; the result is uncertain.');
+      } else {
+        showBrowserVerificationRequired(
+          'The live browser/extension could not be verified for this exit request. '+
+          String(error?.message||'Check the extension connection.'));
+      }
+      return;
+    }
+  }
+  app.quit();
+}
+
 async function shutdownOwnedServices() {
   if (exitStarted) return;
   exitStarted = true;
   try {
     await Promise.allSettled([stopNgrok(), stopProxy()]);
   } finally {
-    // Preserve the journal if the proxy did not confirm its lock was released.
+    // Never delete the persistent journal. Only temporary runtime files may
+    // be cleaned after a confirmed stop with no owned journal lock.
     if (phase === 'stopped' && !fs.existsSync(privateCoordinationJournalPath() + '.lock')) {
       try { fs.rmSync(sessionDir, {recursive:true,force:true}); }
       catch (error) { console.error('[desktop] Session cleanup failed:', error.message); }
@@ -800,8 +1286,26 @@ if (hasInstanceLock) {
     createWindow();
     startProxy();
     void startNgrok();
+    if (!E2E_MODE && managedBrowserSelection!=='none' &&
+        !managedBrowserLaunchAttempted) {
+      try {openManagedBrowser();}
+      catch(error) {
+        managedBrowserPhase='error';
+        managedBrowserError=error.message;
+        publishState();
+      }
+    }
     setInterval(pollHealth, 2000);
     setInterval(pollNgrok, 5000);
+    if(!E2E_MODE){
+      void checkForUpdates();
+      setInterval(()=>void checkForUpdates(),6*60*60*1000);
+      setInterval(()=>{
+        if(pendingUpdateVersion && !updateGateBusy &&
+            Date.now()-lastUpdateGateCheck>30000)
+          void attemptUpdateHandoff();
+      },10000);
+    }
     if (PACKAGED_SMOKE_MODE) {
       setTimeout(() => { debug('isolated packaged smoke auto-exit'); app.quit(); },
         PACKAGED_SMOKE_EXIT_MS);

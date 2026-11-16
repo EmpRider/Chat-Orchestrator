@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
+import { createHash,randomUUID } from 'node:crypto';
 import WebSocket from 'ws';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
@@ -146,10 +147,14 @@ test('multiple browser sessions stay independent and reject unknown session rout
       const message=JSON.parse(raw.toString());messages.push(message);
       if(message.type==='call'){
         const result=message.method==='list_tabs'
-          ? [{tab_id:tabId,site:'chatgpt',title:session}]
+          ? [{tab_id:tabId,site:'chatgpt',title:session,role:'orchestrator'}]
           : message.method==='read_chat' ? {profile:session}
+          : message.method==='recover_owned_children' ? []
           : {tab_id:tabId,site:'chatgpt',browser_session_id:session,
-            incarnation_id:session,is_managed_worker:false,connection_generation:1};
+            incarnation_id:session,is_managed_worker:false,
+            parent_approved:true,
+            route_hash:createHash('sha256').update([session,tabId,session,'chatgpt'].join(':')).digest('hex'),
+            connection_generation:1};
         socket.send(JSON.stringify({type:'result',id:message.id,ok:true,result}));
       }
     });
@@ -167,6 +172,7 @@ test('multiple browser sessions stay independent and reject unknown session rout
   const second=await profile(sessionB,202,'cccccccc-cccc-4ccc-8ccc-cccccccccccc');
   assert.equal(second.messages.some((message)=>message.type==='settings_snapshot'),false,
     'stale session must reset before receiving settings');
+  first.socket.send(JSON.stringify({type:'session_ready'}));
   second.socket.send(JSON.stringify({type:'session_ready'}));
   const readyDeadline=Date.now()+3000;
   while(!second.messages.some((message)=>message.type==='settings_snapshot')){
@@ -176,22 +182,45 @@ test('multiple browser sessions stay independent and reject unknown session rout
   assert.equal(first.socket.readyState,WebSocket.OPEN,'stale second profile cannot disconnect first');
   assert.equal(second.socket.readyState,WebSocket.OPEN);
   await client.connect(new StreamableHTTPClientTransport(new URL('http://127.0.0.1:'+port+'/mcp')));
-  async function list(args={}){
-    const response=await client.callTool({name:'list_tabs',arguments:args});
+  async function pair(profile,session,tabId){
+    const code=randomUUID(),request_id=randomUUID();
+    profile.socket.send(JSON.stringify({type:'pairing_offer',code,request_id,
+      tab_id:tabId,incarnation_id:session,
+      route_hash:createHash('sha256').update([session,tabId,session,'chatgpt'].join(':')).digest('hex')}));
+    const deadline=Date.now()+4000;
+    while(!profile.messages.some((m)=>m.type==='pairing_offer_ack'&&m.request_id===request_id)){
+      if(Date.now()>deadline)throw new Error('Pairing ACK timed out');
+      await delay(10);
+    }
+    const ack=profile.messages.find((m)=>m.type==='pairing_offer_ack'&&m.request_id===request_id);
+    assert.equal(ack.ok,true,ack.error);
+    const response=await client.callTool({name:'pair_conversation',
+      arguments:{code,idempotency_key:randomUUID()}});
+    assert.equal(response.isError,undefined);
+    return JSON.parse(response.content[0].text).agent_credential;
+  }
+  async function list(credential,args={}){
+    const response=await client.callTool({name:'list_tabs',arguments:{
+      ...(credential ? {agent_credential:credential}:{}),
+      idempotency_key:randomUUID(),...args}});
     return response.isError ? {error:response.content[0].text} : JSON.parse(response.content[0].text);
   }
-  assert.deepEqual((await list()).map((tab)=>[tab.browser_session_id,tab.tab_id]),
-    [[sessionA,101],[sessionB,202]]);
-  assert.deepEqual((await list({browser_session_id:sessionA})).map((tab)=>tab.tab_id),[101]);
-  assert.deepEqual((await list({browser_session_id:sessionB})).map((tab)=>tab.tab_id),[202]);
+  assert.match((await list(null)).error,/Missing or revoked Agent credential/);
+  const credentialA=await pair(first,sessionA,101);
+  const credentialB=await pair(second,sessionB,202);
+  assert.deepEqual((await list(credentialA)).map((tab)=>[tab.browser_session_id,tab.tab_id]),[[sessionA,101]]);
+  assert.deepEqual((await list(credentialB)).map((tab)=>tab.tab_id),[202]);
+  assert.deepEqual((await list(credentialA,{browser_session_id:sessionA})).map((tab)=>tab.tab_id),[101]);
   const routed=await client.callTool({name:'read_chat',arguments:{caller_tab_id:202,
-    browser_session_id:sessionB,tab_id:202}});
+    browser_session_id:sessionB,tab_id:202,agent_credential:credentialB,
+    idempotency_key:randomUUID()}});
   assert.equal(routed.isError,undefined);
   assert.equal(JSON.parse(routed.content[0].text).profile,sessionB);
-  const ambiguous=await client.callTool({name:'read_chat',arguments:{caller_tab_id:202,tab_id:101}});
+  const ambiguous=await client.callTool({name:'read_chat',arguments:{caller_tab_id:202,
+    agent_credential:credentialB,idempotency_key:randomUUID(),tab_id:101}});
   assert.equal(ambiguous.isError,true,'target tab must not select the caller browser profile');
-  assert.match((await list({browser_session_id:'dddddddd-dddd-4ddd-8ddd-dddddddddddd'})).error,
-    /Selected browser session is disconnected or unknown/);
+  assert.match((await list(credentialA,{browser_session_id:'dddddddd-dddd-4ddd-8ddd-dddddddddddd'})).error,
+    /browser session conflicts|disconnected or unknown/);
   assert.equal(first.socket.readyState,WebSocket.OPEN);
   assert.equal(second.socket.readyState,WebSocket.OPEN);
 });

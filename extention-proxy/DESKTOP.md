@@ -1,5 +1,80 @@
 # Chat Orchestrator desktop app (Windows)
 
+**Verification repair (newer source):** The selected Chrome/Edge browser type,
+extension installation ID and bundled extension version must match on enrollment.
+After an extension reinstall, use **Repair / Reverify extension** in Connections.
+Saved enrollment is not sufficient for a green live-verified status: the Desktop
+rechecks the actual connected extension after every Proxy/extension reconnect,
+including fast socket replacements. Until it matches, status shows
+**reverification required**, and browser-close commands also perform a fresh
+identity check just before executing. Choosing **Close Managed Browser**
+persists a short-lived, exact tab/incarnation intentional-exit marker before
+scheduling window closure, preventing a suspended extension from turning a
+deliberate Quit into a false Accident prompt.
+The type and version checks are a safety improvement, not cryptographic
+attestation of the operating system's native browser profile directory.
+Bundled Load unpacked is for developer/testing; Chrome Web Store and Edge
+Add-ons are planned consumer channels, with publication still unverified.
+
+## CURRENT SETUP (2026-11-15) — use this, not the archived sections below
+
+The supported first-release target is an **installed Windows Setup.exe**,
+bundled extension plus **existing Chrome or Edge**. The latest locally built NSIS
+installer is `dist/Chat Orchestrator Setup 0.1.3.exe` and remains **unsigned**.
+Real clean-install/uninstall and live ChatGPT E2E have not been verified.
+
+1. Launch the desktop application. Connections opens a first-run setup guide.
+2. Select an installed browser. The app opens its dedicated persistent user-data
+   directory. It does **not** use an ordinary personal browser profile.
+3. In the selected browser's Extensions page choose **Developer mode / Load
+   unpacked** and select the extension bundled in the app's resources. Configure
+   the local WebSocket URL and separate **profile connection key** in the popup.
+4. After the extension connects, confirm it is installed in that dedicated
+   browser, click **Verify connected browser profile** and **Finish setup**.
+   The app refuses **Close Managed Browser** without a verified, matching
+   extension installation. This enrollment ID is not cryptographic proof
+   of the operating-system process user-data directory.
+5. Configure ngrok domain and authtoken. For ChatGPT, choose
+   **No authentication**, then click **Copy Connector URL** to copy
+   `https://YOUR-DOMAIN/mcp/agent/<transport-key>`.
+   The key is embedded only in the copied URL, never the on-screen status.
+   Keep the entire URL private; tunnel operators may log the URL path.
+   Header-capable clients can still use `/mcp` with
+   `Authorization: Bearer <transport-key>` and **Copy MCP transport key**.
+   The local extension profile key is a different secret.
+6. Explicitly approve a Parent in the ChatGPT tab using the extension. The
+   resulting one-time code pairs that Agent via `pair_conversation`. All
+   further MCP tool calls require its `agent_credential` and unique UUID
+   `idempotency_key`.
+
+**Authentication choice:** The Product Owner selected **one static public
+transport key, no OAuth**. The dedicated `/mcp/agent/<transport-key>` route accepts
+the key from the URL path for ChatGPT's no-custom-header configuration;
+it is **not** an unauthenticated endpoint. The legacy `/mcp` route continues
+to require a Bearer header. Bad or absent URL tokens return 401. Real ChatGPT
+MCP registration still requires live verification.
+
+**Window X behavior:** The saved **Minimize to system tray when closing**
+checkbox stays available, checked by default. Enabled X hides to tray; disabled
+X asks the same explicit Exit confirmation as the tray menu
+(**Keep Browser Open / Close Managed Browser / Cancel**). Cancel leaves all
+work running.
+
+**Updates:** Preferences shows a trusted release notice and **Update Now**
+button. A requested update stays pending until active Child tasks, direct-Parent
+review and FIFO events are cleared. The app deliberately does **not** download,
+execute, or silently trust a new unsigned EXE; it opens the verified publisher
+release page for a separate deliberate installation without stopping the Proxy.
+Use **Cancel pending** to withdraw the request.
+
+**All sections below are historical design/diagnostic notes** from earlier
+candidate implementations. Conflicting tokenless authentication, selected-root
+registration, temporary-journal and portable-build instructions are
+**SUPERSEDED** by the above and the current source code. Preserve them for
+incident context only.
+
+---
+
 ## Local 0.1.3 redesigned UI + modular-instructions candidate (November 6, 2026)
 
 This is a local development candidate, not a published GitHub Release. The desktop has four pages
@@ -47,7 +122,9 @@ Ngrok domain/authtoken and MCP URL), **Agents & queue** (journal/worker status),
 4. In the extension popup, set `ws://127.0.0.1:8787/bridge` (or this profile's port) and
    click **Save and reconnect**. The app should show **Extension connected**, followed by settings sync.
 5. When Ngrok is online, click **Copy Connector URL** and configure it in your chat agent.
-   The URL is `https://YOUR-DOMAIN/mcp` (no proxy-generated token).
+   The clipboard URL is `https://YOUR-DOMAIN/mcp/agent/<transport-key>`.
+   The on-screen display deliberately omits the token; ChatGPT should use
+   **No authentication**. Treat the copied URL as a password.
 
 The desktop app reads its own credential-free ngrok configuration, so your existing AgentBridge account/domain can remain online independently.
 
@@ -163,10 +240,12 @@ the worker instructions, never used for uniqueness, ownership or authorization.
 browser-origin identity. `caller_tab_id` is client-supplied; tab inspection
 proves browser existence/incarnation but cannot authenticate the remote
 caller. The registry prevents accidental relationship confusion, not
-malicious spoofing from an unauthenticated public MCP endpoint. The Ngrok
-provider authtoken does *not* restrict visitors to `/mcp`. Do not expose
-browser-control tools over a public endpoint without a separately approved
-access-control boundary. No proxy/extension authentication was restored.
+malicious spoofing after transport/Agent credentials are stolen. The Ngrok
+provider authtoken does *not* restrict visitors to `/mcp` or `/mcp/agent`.
+The Proxy validates an independent, 256-bit transport key at both endpoints,
+and Agent pairing/ACLs remain required for privileged operations. A URL
+containing `/mcp/agent/<transport-key>` can be copied, logged by the tunnel provider, or otherwise
+leaked; the whole URL must be treated as sensitive. No OAuth is implemented.
 
 **Compatibility and release state:** This is an uncommitted, untested source
 candidate, not the running Electron/Edge installation. Existing journal

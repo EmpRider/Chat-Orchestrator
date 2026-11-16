@@ -1144,6 +1144,138 @@
     }
   }
 
+  // One-time, user-approved Parent setup. The user-message marker proves
+  // submission, not successful MCP pairing.
+  async function submitParentInitialization(text, marker) {
+    if (site !== 'chatgpt' || typeof text !== 'string' || text.length > 6000 ||
+        !/^[0-9a-f-]{36}$/i.test(marker || ''))
+      return {ok:false,uncertain:false,error:'Invalid Parent setup'};
+    if (observeState().state !== 'idle')
+      return {ok:false,uncertain:false,error:'Parent chat is not idle'};
+    const visibleMarker=()=>userNodes().some((node)=>
+      String(node.innerText || node.textContent || '').includes(marker));
+    if (visibleMarker())
+      return {ok:false,uncertain:true,error:'Setup message already visible'};
+    busy=true;
+    try {
+      await sendPrompt(text,marker);
+      if (!await waitFor(visibleMarker,12000,250))
+        throw new Error('Setup message visibility unverified');
+      return {ok:true,submitted:true};
+    } catch {
+      completionReceiptUncertain=true;
+      return {ok:false,uncertain:true,error:'Setup submission uncertain'};
+    } finally {busy=false;}
+  }
+
+  // D-007: tiny, unprivileged status badge. Source of authority is the
+  // extension's approved Parent/owned Child registry, never a page script.
+  const agentStatusBadgeId='chat-orchestrator-agent-status';
+  const parentOfferId='chat-orchestrator-parent-offer';
+  let parentOfferTimer=null;
+  let parentOfferDisposed=false;
+  function updateParentEnrollmentOffer(status) {
+    const existing=document.getElementById(parentOfferId);
+    if(site!=='chatgpt' || !status?.offerParent || parentOfferDisposed) {
+      if(parentOfferTimer){clearTimeout(parentOfferTimer);parentOfferTimer=null;}
+      existing?.remove();
+      return;
+    }
+    if(existing || parentOfferTimer || !document.body)return;
+    // A newly spawned Child may briefly look like an ordinary tab before the
+    // Proxy finishes binding it. Recheck extension authority just before UX.
+    parentOfferTimer=setTimeout(async()=>{
+      parentOfferTimer=null;
+      if(parentOfferDisposed || document.getElementById(parentOfferId))return;
+      let fresh;
+      try {fresh=await chrome.runtime.sendMessage({type:'managed_agent_status_request'});}
+      catch{return;}
+      if(!fresh?.offerParent || !document.body)return;
+      const panel=document.createElement('section');
+      panel.id=parentOfferId;
+      panel.setAttribute('role','group');
+      panel.setAttribute('aria-label','Chat Orchestrator Parent Agent approval');
+      panel.style.cssText=[
+        'position:fixed','top:12px','right:12px','z-index:2147483000',
+        'max-width:310px','padding:12px','border-radius:9px',
+        'background:#182334','color:#f0f5fa','border:1px solid #54739b',
+        'box-shadow:0 4px 18px #0006','font:12px/1.5 system-ui,sans-serif',
+      ].join(';');
+      const title=document.createElement('strong');
+      title.textContent='Use this ChatGPT tab as a Parent Agent?';
+      const info=document.createElement('p');
+      info.textContent='Yes enables this tab as a managed Parent. No leaves it as a normal chat tab.';
+      info.style.margin='8px 0';
+      const controls=document.createElement('div');
+      controls.style.cssText='display:flex;gap:8px';
+      const yes=document.createElement('button');
+      const no=document.createElement('button');
+      for(const button of [yes,no])
+        button.style.cssText='padding:6px 12px;border:1px solid #6589b6;border-radius:6px;cursor:pointer;color:#fff;background:#294b77';
+      yes.textContent='Yes';no.textContent='No';
+      no.addEventListener('click',async()=>{
+        if(no.textContent==='Dismiss'){panel.remove();return;}
+        no.disabled=true;
+        try{
+          const result=await chrome.runtime.sendMessage({type:'dismiss_parent_offer'});
+          if(result?.ok!==true)throw new Error('Could not save your choice');
+          panel.remove();
+        }catch{info.textContent='Could not save No; try again.';no.disabled=false;}
+      });
+      yes.addEventListener('click',async()=>{
+        yes.disabled=true;no.disabled=true;
+        info.textContent='Preparing the Parent pairing…';
+        try{
+          const result=await chrome.runtime.sendMessage({
+            type:'create_pairing_offer',approve_parent:true});
+          if(result?.ok!==true)throw new Error(result?.error||'Parent setup unavailable');
+          yes.remove();
+          no.disabled=false;no.textContent='Dismiss';
+          info.style.whiteSpace='pre-wrap';
+          info.textContent=result.initialization_status==='SENT'
+            ? 'Parent approval saved. The one-time setup message was sent; the Agent still needs to complete MCP pairing.'
+            : 'Parent approved, but setup delivery is uncertain. Inspect this chat before retrying. Pairing code: '+result.code;
+        }catch(error){
+          info.textContent=String(error?.message||'Parent pairing unavailable');
+          yes.disabled=false;no.disabled=false;
+        }
+      });
+      controls.append(yes,no);panel.append(title,info,controls);
+      document.body.appendChild(panel);
+    },1800);
+  }
+  function updateManagedAgentStatus(status) {
+    if(site!=='chatgpt' || !document?.body)return;
+    updateParentEnrollmentOffer(status);
+    let badge=document.getElementById(agentStatusBadgeId);
+    if(!status || (status.managed!==true && status.detached!==true)) {
+      badge?.remove();
+      return;
+    }
+    if(!badge) {
+      badge=document.createElement('div');
+      badge.id=agentStatusBadgeId;
+      badge.setAttribute('role','status');
+      badge.setAttribute('aria-label','Chat Orchestrator Agent status');
+      badge.style.cssText=[
+        'position:fixed','right:12px','bottom:12px','z-index:2147483000',
+        'background:rgba(23,28,39,.96)','color:#f7f8fa',
+        'border:1px solid #4b5563','border-radius:8px','padding:7px 10px',
+        'font:12px/1.3 system-ui,sans-serif','pointer-events:none',
+      ].join(';');
+      document.body.appendChild(badge);
+    }
+    if(status.detached===true && status.managed!==true) {
+      badge.textContent='Chat Orchestrator · Unmanaged tab: your Parent was closed and Cancel was selected. You can close this tab whenever you want.';
+      return;
+    }
+    const role=status.role==='parent'?'Parent':'Child';
+    const connection=status.connected===true?'Connected':'Disconnected';
+    const children=Number.isSafeInteger(status.activeChildren)?status.activeChildren:0;
+    badge.textContent='Chat Orchestrator · '+role+' · '+connection+
+      ' · '+children+' direct Child'+(children===1?'':'ren');
+  }
+
   let listenerSequence=0;
   function onMessage(msg, sender, sendResponse) {
     const cmd=msg?.cmd;
@@ -1212,6 +1344,17 @@
         });
         return true;
       }
+      case 'submit_parent_initialization': {
+        submitParentInitialization(msg.text,msg.marker).then(sendResponse).catch(() => {
+          sendResponse({ok:false,uncertain:true,error:'Parent setup submission uncertain'});
+        });
+        return true;
+      }
+      case 'set_managed_agent_status': {
+        updateManagedAgentStatus(msg.status);
+        sendResponse({ok:true});
+        break;
+      }
       case 'read_chat':
         if (typeof self !== 'undefined' && self.__chatOrchStructuredReader) {
           let readTimer;
@@ -1255,7 +1398,17 @@
     return false;
   }
   chrome.runtime.onMessage.addListener(onMessage);
+  // A reload recreates this content script and asks for its verified
+  // current role. An ordinary, unapproved ChatGPT tab shows no badge.
+  if(site==='chatgpt') {
+    Promise.resolve().then(()=>chrome.runtime.sendMessage({
+      type:'managed_agent_status_request',
+    })).then(updateManagedAgentStatus).catch(()=>{});
+  }
   window.__chatOrchCleanup = () => {
+    parentOfferDisposed=true;
+    if(parentOfferTimer)clearTimeout(parentOfferTimer);
+    document.getElementById(parentOfferId)?.remove();
     try {
       chrome.runtime.onMessage.removeListener(onMessage);
     } catch {}

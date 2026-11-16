@@ -100,11 +100,15 @@ test('tokenless profile keeps durable FIFO worker reports, barriers and processe
       case 'inspect_tab': {
         const tabId = m.params.tab_id;
         assert.equal(m.params.__sessionBrowserId,browserSession,'proxy routes inspection to this browser session');
+        const incarnation=tabId===101?managerIncarnation:workerIncarnation;
         result = {tab_id:tabId,site:'chatgpt',browser_session_id:browserSession,
-          incarnation_id:tabId===101?managerIncarnation:workerIncarnation,
+          incarnation_id:incarnation,
+          route_hash:createHash('sha256').update([browserSession,tabId,incarnation,'chatgpt'].join(':')).digest('hex'),
+          parent_approved:tabId===101,
           is_managed_worker:tabId===201 || tabId===workerTabId};
         break;
       }
+      case 'recover_owned_children': result=[];break;
       case 'manager_state':
         assert.equal(m.params.__sessionBrowserId,browserSession,'manager state uses caller session socket');
         result = { tab_id: managerAttestationMismatch ? 999 : 101,
@@ -141,7 +145,7 @@ test('tokenless profile keeps durable FIFO worker reports, barriers and processe
         break;
       case 'inspect_worker_tasks':
         result = {tab_id:m.params.tab_id,worker_incarnation_id:workerIncarnation,
-          tasks:rejectBeforeSubmission ? [] : [{task_id:taskId,status:'done'}]};
+          tasks:rejectBeforeSubmission ? [] : [{task_id:taskId,status:'done',parent_reviewed:true}]};
         break;
       case 'close_reviewed_worker':
         result = {closed:m.params.tab_id,parent_reviewed:true};
@@ -162,8 +166,39 @@ test('tokenless profile keeps durable FIFO worker reports, barriers and processe
   await new Promise((resolve, reject) => { bridge.once('open', resolve); bridge.once('error', reject); });
   bridge.send(JSON.stringify({type:'register_session',browser_session_id:browserSession,
     connection_generation:1,proxy_session_id:'test-proxy-session'}));
+  await new Promise((resolve,reject)=>{
+    const timer=setTimeout(()=>reject(new Error('Extension handshake unavailable')),4000);
+    const onMessage=(raw)=>{
+      if(JSON.parse(raw.toString()).type==='session_registered') {
+        clearTimeout(timer);bridge.off('message',onMessage);resolve();
+      }
+    };
+    bridge.on('message',onMessage);
+  });
+  bridge.send(JSON.stringify({type:'session_ready'}));
+  const pairingCode=randomUUID();
+  const pairingAck=new Promise((resolve,reject)=>{
+    const timer=setTimeout(()=>reject(new Error('Pairing ACK unavailable')),4000);
+    const onMessage=(raw)=>{
+      const m=JSON.parse(raw.toString());
+      if(m.type==='pairing_offer_ack') {
+        clearTimeout(timer);bridge.off('message',onMessage);
+        if(m.ok)resolve();else reject(Error(m.error));
+      }
+    };
+    bridge.on('message',onMessage);
+  });
+  bridge.send(JSON.stringify({type:'pairing_offer',request_id:randomUUID(),code:pairingCode,
+    tab_id:101,incarnation_id:managerIncarnation,
+    route_hash:createHash('sha256').update([browserSession,101,managerIncarnation,'chatgpt'].join(':')).digest('hex')}));
+  await pairingAck;
+  const paired=await client.callTool({name:'pair_conversation',arguments:{
+    code:pairingCode,idempotency_key:randomUUID()}});
+  assert.equal(paired.isError,undefined,'the approved Parent must pair');
+  const credential=JSON.parse(paired.content[0].text).agent_credential;
   async function call(name, args = {}) {
-    const out = await client.callTool({name,arguments:{browser_session_id:browserSession,...args}});
+    const out = await client.callTool({name,arguments:{browser_session_id:browserSession,
+      agent_credential:credential,idempotency_key:randomUUID(),...args}});
     if (out.isError) throw new Error(out.content[0].text);
     return JSON.parse(out.content[0].text);
   }

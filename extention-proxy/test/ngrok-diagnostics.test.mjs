@@ -30,6 +30,18 @@ test('ngrok diagnostics redact exact tokens, auth headers, and URL queries', () 
   assert.match(result.diagnostic, /\[redacted\]/);
 });
 
+test('ngrok diagnostics cannot print the ChatGPT dedicated MCP URL path token',()=>{
+  const urlToken='ab'.repeat(32);
+  const result=inspectNgrokLogLine(JSON.stringify({
+    lvl:'error',msg:'endpoint request failed',
+    err:'https://sample.ngrok-free.dev/mcp/agent/'+urlToken,
+  }));
+  assert.ok(result);
+  assert.doesNotMatch(result.diagnostic,new RegExp(urlToken));
+  assert.doesNotMatch(result.diagnostic,/\?token=/);
+  assert.match(result.diagnostic,/mcp\/agent\/\[redacted\]/);
+});
+
 test('ngrok diagnostics suppress unrelated log fields and unstructured output', () => {
   assert.equal(inspectNgrokLogLine('raw secrets without structure'), null);
   assert.equal(inspectNgrokLogLine(JSON.stringify({

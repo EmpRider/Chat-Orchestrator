@@ -44,7 +44,18 @@
     <div class="divider"></div>
     <label for="serverUrl">Local proxy URL</label>
     <input id="serverUrl" type="url" spellcheck="false" autocomplete="off" placeholder="ws://127.0.0.1:8787/bridge" />
+    <label for="profileToken">Dedicated browser profile connection key</label>
+    <input id="profileToken" type="password" spellcheck="false"
+      autocomplete="off" placeholder="Paste from Chat Orchestrator desktop (one time)" />
+    <p class="hint">Use Copy profile connection key in Desktop Connections. This key is saved only in this browser profile; never paste it into a chat.</p>
     <button id="save" type="button">Save and reconnect</button>
+    <div class="divider"></div>
+    <strong>Enable this ChatGPT tab</strong>
+    <p class="hint">Only approve a Parent tab you trust. Managed Children pair without becoming new Parents.</p>
+    <button id="pair" type="button">Yes — Approve Parent / Pair Child</button>
+    <label for="pairCode">One-time pairing code</label>
+    <input id="pairCode" type="text" readonly placeholder="Approve this tab to receive a code" />
+    <p class="hint">Approving a Parent automatically sends a one-time setup message to this ChatGPT tab. The AI must still complete MCP pairing. If delivery is uncertain, inspect the chat before retrying.</p>
     <div id="info"></div>
   </main>
   <script src="popup.js"></script>

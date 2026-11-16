@@ -116,6 +116,39 @@ export function createTabRegistry(file, {sessionOnly = false} = {}) {
     return updated;
   }
 
+  // User-confirmed Accident replaces a closed physical tab while preserving
+  // the original logical Agent subtree. Descendants keep their relative depth.
+  function replaceClosedAgent(oldTabId, inspection, expectedIncarnationId) {
+    const live=observed(inspection);
+    const table=tableFor(live.browser_session_id);
+    const old=table.get(oldTabId);
+    if (!old || old.incarnationId!==expectedIncarnationId ||
+        table.has(live.tab_id) || live.tab_id===oldTabId ||
+        live.site!==old.site || live.browser_session_id!==old.browserSessionId ||
+        live.is_managed_worker!==(old.parentTabId!==null))
+      throw new Error('Restored Agent does not match its original registered ancestry');
+    if (old.parentTabId!==null) {
+      const parent=table.get(old.parentTabId);
+      if (!parent || parent.incarnationId!==old.parentIncarnationId)
+        throw new Error('Original direct Parent must be restored and verified first');
+    }
+    const newRecord=Object.freeze({...old,tabId:live.tab_id,
+      incarnationId:live.incarnation_id,phase:old.parentTabId===null?'root':'reattached',
+      rootTabId:old.parentTabId===null?live.tab_id:old.rootTabId});
+    table.delete(oldTabId);
+    table.set(newRecord.tabId,newRecord);
+    for (const [id,entry] of [...table]) {
+      const direct=entry.parentTabId===oldTabId;
+      const inRoot=old.parentTabId===null && entry.rootTabId===oldTabId;
+      if (!direct && !inRoot) continue;
+      table.set(id,Object.freeze({...entry,
+        parentTabId:direct?live.tab_id:entry.parentTabId,
+        parentIncarnationId:direct?live.incarnation_id:entry.parentIncarnationId,
+        rootTabId:inRoot?live.tab_id:entry.rootTabId}));
+    }
+    return newRecord;
+  }
+
   function registerChild(parentId, inspection) {
     const live = observed(inspection);
     const table=tableFor(live.browser_session_id);
@@ -177,6 +210,20 @@ export function createTabRegistry(file, {sessionOnly = false} = {}) {
     return [...tableFor(sessionId).values()].some((entry)=>entry.parentTabId===tabId);
   }
 
+  function detachSubtree(tabId,sessionId) {
+    const table=tableFor(sessionId);
+    if(!table.has(tabId)) return [];
+    const removed=[];
+    const visit=(id)=>{
+      for (const child of [...table.values()].filter((item)=>item.parentTabId===id))
+        visit(child.tabId);
+      removed.push(id);
+    };
+    visit(tabId);
+    for(const id of removed)table.delete(id);
+    return removed;
+  }
+
   function setPhase(tabId, phase, sessionId) {
     const table=tableFor(sessionId);
     const current = table.get(tabId);
@@ -215,10 +262,13 @@ export function createTabRegistry(file, {sessionOnly = false} = {}) {
     within,
     directChild,
     hasChildren,
+    detachSubtree:(tabId,sessionId)=>mutate(()=>detachSubtree(tabId,sessionId),sessionId),
     setPhase:(tabId,phase,sessionId)=>mutate(()=>setPhase(tabId,phase,sessionId),sessionId),
     registerRoot:(inspection)=>mutate(()=>registerRoot(inspection),inspection.browser_session_id),
     reconcileRoot:(inspection,expectedIncarnationId)=>mutate(()=>
       reconcileRoot(inspection,expectedIncarnationId),inspection.browser_session_id),
+    replaceClosedAgent:(oldTabId,inspection,expectedIncarnationId)=>mutate(()=>
+      replaceClosedAgent(oldTabId,inspection,expectedIncarnationId),inspection.browser_session_id),
     registerChild:(parentId,inspection)=>mutate(()=>registerChild(parentId,inspection),
       inspection.browser_session_id),
     // Intentional closure removes one record. Descendants stay orphaned and

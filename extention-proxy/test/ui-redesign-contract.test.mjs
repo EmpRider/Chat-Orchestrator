@@ -20,8 +20,8 @@ test('redesigned navigation keeps each trusted desktop control and one page per 
   }
   for (const id of [
     'server-state', 'extension-state', 'ngrok-state', 'copy-url',
-    'connector-url', 'domain', 'ngrok-token',
-    'configure-ngrok', 'proxy-port', 'save-proxy-port', 'minimize-to-tray',
+    'connector-url', 'copy-public-mcp-token', 'domain', 'ngrok-token',
+    'configure-ngrok', 'proxy-port', 'save-proxy-port', 'tray-behavior-note', 'minimize-to-tray',
     'start', 'stop', 'agent-settings-save', 'agent-prompt-module', 'agent-prompt-text',
     'queue-items', 'agent-seats', 'tool-call-log',
   ]) assert.ok(ids.includes(id), 'trusted control missing: ' + id);
@@ -52,6 +52,51 @@ test('extension popup accepts only the local WebSocket URL', () => {
   assert.match(js, /chrome\.storage\.local\.set/);
   assert.match(js, /type: 'reconnect'/);
   assert.match(js, /Connected - Synchronizing settings/);
+});
+test('onboarding can repair an extension after first-run completion',()=>{
+  const html=desktop('index.html');
+  const renderer=desktop('renderer.js');
+  const main=desktop('main.mjs');
+  assert.match(html,/id="repair-managed-browser"/);
+  assert.match(renderer,/\$\('repair-managed-browser'\)\.addEventListener/);
+  assert.match(main,/async function inspectCurrentManagedExtension\(/);
+  assert.match(main,/if\(verified\.browser_product!==managedBrowserSelection\)/);
+  assert.match(main,/verified\.extension_version!==bundledManifest\.version/);
+  assert.match(main,/matchesManagedEnrollment\(managedBrowserEnrollment,selectedAtStart,verified\)/);
+  assert.match(main,/invalidateLiveBrowserVerification\(\)/);
+  assert.match(main,/liveBrowserEnrollment=verified/);
+  assert.match(main,/browserRecheckNextAt=Date\.now\(\)\+15000/,
+    'transient reverify failures must have a bounded retry rather than stick forever');
+});
+test('D-010 detached Child gets a persistent visible unmanaged notice',()=>{
+  const bg=extension('background.js');
+  const content=extension('content.js');
+  assert.match(bg,/detachedTabNotices\[child\.tabId\]=true/);
+  assert.match(content,/Unmanaged tab: your Parent was closed and Cancel was selected/);
+});
+test('D-005 candidate ChatGPT tab offers explicit Yes/No without auto-registering',()=>{
+  const bg=extension('background.js');
+  const content=extension('content.js');
+  assert.match(bg,/dismiss_parent_offer/);
+  assert.match(bg,/dismissedParentOffers\[sender\.tab\.id\]=true/);
+  assert.match(bg,/offerParent:!worker&&!parent/);
+  assert.match(content,/Use this ChatGPT tab as a Parent Agent\?/);
+  assert.match(content,/yes\.textContent='Yes';no\.textContent='No'/);
+  assert.match(content,/approve_parent:true/);
+  assert.match(content,/type:'dismiss_parent_offer'/);
+});
+test('D-038 ChatGPT No authentication copies a URL-token connector without exposing it in status',()=>{
+  const html=desktop('index.html');
+  const main=desktop('main.mjs');
+  const renderer=desktop('renderer.js');
+  assert.match(main,/publicPath: '\/mcp\/agent'/);
+  assert.match(main,/clipboard\.writeText\(agentConnectorUrl\(domain,publicMcpToken\(\)\)\)/);
+  assert.match(main,/ipcMain\.handle\('bridge:copyUrl', \(event\) => \{\s*requireTrustedWindow\(event\)/);
+  assert.match(renderer,/\$\('connector-url'\)\.textContent = state\.domain/);
+  assert.doesNotMatch(renderer,/\$\('connector-url'\)\.textContent[^;]*token=/);
+  assert.match(html,/select <strong>No authentication<\/strong>/);
+  assert.match(html,/mcp\/agent\/&lt;token&gt;/);
+  assert.match(html,/Treat the entire copied URL like a password/);
 });
 test('root recovery is exclusively a confirmed trusted Desktop workflow', () => {
   const html = desktop('index.html');

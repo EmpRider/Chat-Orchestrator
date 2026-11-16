@@ -2,6 +2,7 @@ const $ = (id) => document.getElementById(id);
 let currentState;
 let domainDirty = false;
 let proxyPortDirty = false;
+let browserSelectionDirty = false;
 let showSavedTabHistory = false;
 let lastCoordinationSnapshot = null;
 
@@ -22,6 +23,26 @@ function render(state) {
   $('proxy-port').disabled = portLocked;
   $('save-proxy-port').disabled = portLocked;
   if (!proxyPortDirty) $('proxy-port').value = String(state.port ?? 8787);
+  if (!browserSelectionDirty) $('managed-browser').value = state.managedBrowserSelection || 'none';
+  $('managed-browser-status').textContent = state.managedBrowserError ||
+    (state.managedBrowserSelection==='none' ? 'Select your installed browser to create a dedicated profile.'
+      : `Managed ${state.managedBrowserSelection} profile: ${state.managedBrowserPhase || 'selected'} · Extension: ${state.extensionConnected?'connected':'not yet connected'} · Identity: ${state.managedBrowserVerified?'live verified':state.onboardingComplete?'reverification required':'not yet verified'}`);
+  $('open-managed-extensions').disabled = !state.managedBrowserSelection || state.managedBrowserSelection === 'none';
+  const selected=Boolean(state.managedBrowserSelection && state.managedBrowserSelection!=='none');
+  $('onboarding-panel').hidden=state.onboardingComplete===true;
+  $('verify-managed-browser').disabled=!selected || !state.extensionConnected;
+  $('repair-managed-browser').disabled=!selected || !state.extensionConnected;
+  $('finish-onboarding').disabled=!state.managedBrowserVerified || !state.extensionConnected;
+  $('onboarding-status').textContent=state.onboardingComplete
+    ? state.managedBrowserVerified
+      ? 'Setup completed. The currently connected extension matches your saved browser enrollment.'
+      : 'Setup was saved, but the live browser connection has not yet been reverified. Use Repair / Reverify if needed.'
+    : !selected ? 'Step 1: choose and open a supported browser.'
+    : !state.extensionConnected ? 'Step 2: install the extension in the dedicated browser and connect it to the Proxy.'
+    : !state.managedBrowserVerified ? 'Step 3: confirm the connected extension is in the dedicated browser, then Verify.'
+    : 'Step 4: click Finish setup. Your verified browser enrollment is saved.';
+  $('unpacked-extension-path').textContent = state.unpackedExtensionPath || 'Unavailable';
+  $('auto-start-windows').checked = state.autoStartWindows === true;
   $('profile-description').textContent = `Profile: ${state.profile || 'default'} · Port ${state.port ?? 8787}. Stop proxy and Ngrok to change. Launch another with --profile=name.`;
   $('extension-local-url').textContent = state.localWebSocketUrl || `ws://127.0.0.1:${state.port ?? 8787}/bridge`;
   $('server-dot').className = 'dot' + (state.phase === 'running' ? ' ok' : state.phase === 'error' ? ' error' : '');
@@ -51,7 +72,17 @@ function render(state) {
     || (state.phase === 'running' && (state.ngrokPhase === 'running' || state.ngrokPhase === 'starting'));
   $('stop').disabled = (state.phase === 'stopped' && state.ngrokPhase === 'stopped') || state.phase === 'stopping' || state.ngrokPhase === 'stopping';
   $('minimize-to-tray').checked = state.minimizeToTray !== false;
-  $('minimize-to-tray').disabled = state.trayAvailable === false;
+  const update=state.update||{};
+  const pending=Boolean(update.pendingVersion);
+  $('update-status').textContent=`Installed: ${update.currentVersion||'unknown'} · ${update.phase||'not checked'}`
+    +(update.availableVersion?` · available: ${update.availableVersion}`:'')
+    +(update.message?` — ${update.message}`:'');
+  $('update-notice').hidden=!pending && update.phase!=='available';
+  $('update-notice-text').textContent=pending
+    ? `Update ${update.pendingVersion} pending — Agent work must finish first.`
+    : `Update ${update.availableVersion||''} available (manual approval required).`;
+  $('update-now').disabled=update.phase!=='available'||pending;
+  $('cancel-update').disabled=!pending;
   $('configure-private-coordination').textContent = state.privateCoordinationOptIn
     ? 'Disable private queue on next proxy start' : 'Prepare & enable queue on next proxy start';
   const journal = state.privateJournalInspection;
@@ -82,6 +113,7 @@ function render(state) {
 
 function renderCoordinationSnapshot(snapshot) {
   lastCoordinationSnapshot = snapshot;
+  const alerts=$('completion-alerts');
   const presenceSummary = $('tab-presence-summary');
   const historyToggle = $('toggle-tab-history');
   const summary = $('coordination-summary');
@@ -91,6 +123,7 @@ function renderCoordinationSnapshot(snapshot) {
   const tools = $('tool-call-log');
   if (!summary || !seats || !hierarchy || !queue || !tools) return;
   if (!snapshot) {
+    if(alerts)alerts.textContent='Proxy disconnected; pending task statuses unknown';
     summary.textContent = 'Proxy disconnected · state unknown';
     seats.textContent = 'Unknown'; hierarchy.textContent = 'Unknown';
     queue.textContent = 'Unknown'; tools.textContent = 'Unknown';
@@ -156,6 +189,29 @@ function renderCoordinationSnapshot(snapshot) {
   rows(tools, (snapshot.toolCalls || []).slice(-8).reverse(), (item) =>
     `${item.method} · ${item.ok ? 'OK' : 'ERROR'} · ${item.durationMs}ms · ${item.caller}`,
     'No tool calls recorded');
+  if(alerts){
+    alerts.textContent='';
+    const pending=Array.isArray(snapshot.completionAlerts)?snapshot.completionAlerts:[];
+    if(!pending.length)alerts.textContent='No task currently needs a manual decision';
+    for(const task of pending){
+      const line=document.createElement('div');
+      line.className='coordination-row';
+      const label=document.createElement('span');
+      label.textContent=`Child tab ${task.tab_id} · task ${task.task_id} · ${task.status} · rechecks continue`;
+      line.append(label);
+      for(const [choice,title] of [['completed','Completed'],['in_progress','In Progress']]){
+        const button=document.createElement('button');
+        button.type='button';
+        button.className='secondary';
+        button.textContent=title;
+        button.addEventListener('click',()=>perform(async()=>{
+          await window.bridge.setCompletionStatus(task.task_id,choice,task.browser_session_id);
+        },'Manual task status recorded. The dashboard will refresh.'));
+        line.append(button);
+      }
+      alerts.append(line);
+    }
+  }
 }
 
 $('toggle-tab-history')?.addEventListener('click', () => {
@@ -172,9 +228,55 @@ async function perform(action, successMessage) {
   }
 }
 
-$('copy-url').addEventListener('click', () => perform(() => window.bridge.copyUrl(), 'Connector URL copied. Keep it private.'));
+$('copy-url').addEventListener('click', () => perform(() => window.bridge.copyUrl(), 'Authenticated URL copied with token. Keep it private; select No authentication in ChatGPT.'));
 $('domain').addEventListener('input', () => { domainDirty = true; });
 $('proxy-port').addEventListener('input', () => { proxyPortDirty = true; });
+$('managed-browser').addEventListener('change',()=>{browserSelectionDirty=true;});
+$('save-managed-browser').addEventListener('click',()=>perform(async()=>{
+  const selected=await window.bridge.configureManagedBrowser($('managed-browser').value);
+  browserSelectionDirty=false;
+  render(selected);
+  notify('Dedicated browser profile configured. Install the extension once and verify its connection.');
+}));
+$('open-managed-extensions').addEventListener('click',()=>perform(
+  ()=>window.bridge.openManagedBrowserExtensions(),
+  'Browser extensions page opened in the dedicated profile.'));
+$('copy-extension-path').addEventListener('click',()=>perform(
+  ()=>window.bridge.copyExtensionPath(),
+  'Bundled extension folder copied. Choose Load unpacked in the managed browser.'));
+$('copy-profile-token').addEventListener('click',()=>perform(
+  ()=>window.bridge.copyProfileToken(),
+  'Profile connection key copied. Paste it into this managed browser extension popup only.'));
+const verifyManagedBrowser=()=>perform(async()=>{
+  if(!window.confirm('Is the connected extension running inside the dedicated Chrome/Edge profile opened by Chat Orchestrator? This binds that installation for browser-close actions.'))return;
+  render(await window.bridge.verifyManagedBrowser());
+},'Connected extension installation verified for this selected browser.');
+$('verify-managed-browser').addEventListener('click',verifyManagedBrowser);
+$('repair-managed-browser').addEventListener('click',verifyManagedBrowser);
+$('finish-onboarding').addEventListener('click',()=>perform(async()=>{
+  render(await window.bridge.finishOnboarding());
+},'First-run setup completed. You can revisit Connections any time.'));
+$('check-updates').addEventListener('click',()=>perform(async()=>{
+  render(await window.bridge.checkUpdates());
+},'Official published releases checked.'));
+$('update-now').addEventListener('click',()=>perform(async()=>{
+  if(!window.confirm('Approve an update request? It will stay pending until all Agent tasks and Parent reviews finish, then open the official publisher release page. It will NOT install or stop this app automatically.'))return;
+  render(await window.bridge.requestUpdate());
+},'Update request recorded. Review its status before manually installing anything.'));
+$('cancel-update').addEventListener('click',()=>perform(async()=>{
+  render(await window.bridge.cancelUpdate());
+},'Pending update cancelled.'));
+$('auto-start-windows').addEventListener('change',async()=>{
+  const enabled=$('auto-start-windows').checked;
+  try {
+    const next=await window.bridge.setAutoStartWindows(enabled);
+    render(next);
+    notify(next.autoStartWindows?'Windows startup enabled.':'Windows startup disabled.');
+  } catch(error) {
+    $('auto-start-windows').checked=currentState?.autoStartWindows===true;
+    notify(error.message||String(error),true);
+  }
+});
 $('save-proxy-port').addEventListener('click', () => perform(async () => {
   const saved = await window.bridge.configurePort($('proxy-port').value);
   proxyPortDirty = false;
@@ -196,6 +298,9 @@ $('configure-ngrok').addEventListener('click', async () => {
     button.disabled = false;
   }
 });
+$('copy-public-mcp-token').addEventListener('click',()=>perform(async()=>{
+  await window.bridge.copyPublicMcpToken();
+},'MCP transport key copied. Set it in a compatible MCP client Authorization header.'));
 $('start').addEventListener('click', () => perform(async () => render(await window.bridge.start()), 'Starting local proxy…'));
 $('stop').addEventListener('click', () => perform(async () => render(await window.bridge.stop()), 'Local proxy stopped.'));
 $('configure-private-coordination').addEventListener('click', () => perform(async () => {
@@ -204,11 +309,11 @@ $('configure-private-coordination').addEventListener('click', () => perform(asyn
   notify(enabled ? 'Private journal prepared; restart the proxy to activate.' : 'Private queue disabled on next proxy start. Restart to apply.');
 }));
 $('minimize-to-tray').addEventListener('change', async () => {
-  const checked = $('minimize-to-tray').checked;
+  const enabled = $('minimize-to-tray').checked;
   try {
-    const saved = await window.bridge.setMinimizeToTray(checked);
-    render(saved);
-    notify(checked ? 'Closing this window will keep the proxy in the tray.' : 'Closing this window will exit and stop the proxy.');
+    render(await window.bridge.setMinimizeToTray(enabled));
+    notify(enabled ? 'X will minimize to the system tray.'
+      : 'X will ask whether to exit, keeping or closing the managed browser.');
   } catch (error) {
     $('minimize-to-tray').checked = currentState?.minimizeToTray !== false;
     notify(error.message || String(error), true);
@@ -229,6 +334,10 @@ function displayAgentSettings(settings) {
   $('agent-max-workers').value=String(settings.maxWorkers);
   $('agent-max-tasks').value=String(settings.maxTasksPerHour);
   $('agent-timeout').value=String(settings.taskTimeoutMin);
+  $('completion-initial').value=String(settings.completionMonitor?.initialMinutes??5);
+  $('completion-retries').value=(settings.completionMonitor?.retryMinutes??[5,3,1]).join(',');
+  $('completion-hydration').value=String(settings.completionMonitor?.hydrationSeconds??5);
+  $('completion-continued').value=String(settings.completionMonitor?.continuedMinutes??2);
   activePromptModule='core';
   $('agent-prompt-module').value=activePromptModule;
   $('agent-prompt-text').value=settings.promptModules[activePromptModule];
@@ -323,9 +432,120 @@ $('agent-settings-save').addEventListener('click', () => perform(async () => {
     maxWorkers: Number($('agent-max-workers').value),
     maxTasksPerHour: Number($('agent-max-tasks').value),
     taskTimeoutMin: Number($('agent-timeout').value),
+    completionMonitor:{
+      initialMinutes:Number($('completion-initial').value),
+      retryMinutes:$('completion-retries').value.split(',').map((part)=>Number(part.trim())),
+      hydrationSeconds:Number($('completion-hydration').value),
+      continuedMinutes:Number($('completion-continued').value),
+    },
     promptSchema: agentDraft.promptSchema,
     promptModules: agentDraft.promptModules,
   };
   agentDraft = await window.bridge.saveAgentSettings(candidate);
   $('agent-settings-message').textContent = 'Saved to this profile. Sync sent to connected extension, otherwise sent on next connection.';
 }, 'Extension settings saved to this proxy profile.'));
+
+// Decisions survive Proxy restarts in the extension's local operational state.
+// Countdowns enable buttons; they never select an outcome or expire a dialog.
+const closureFirstShown=new Map();
+let closureSnapshot=[];
+let closureBusy=false;
+let closureRefreshBusy=false;
+let closureError='';
+function renderAgentClosureDialog() {
+  const overlay=$('closure-overlay');
+  if(!overlay)return;
+  const pending=closureSnapshot.filter((entry)=>entry.status!=='resolved');
+  const entry=pending[0];
+  if(!entry) {overlay.hidden=true;return;}
+  overlay.hidden=false;
+  if(!closureFirstShown.has(entry.id))closureFirstShown.set(entry.id,Date.now());
+  $('closure-heading').textContent=entry.kind==='parent'
+    ? 'An approved Parent Agent tab closed'
+    : 'A managed Child Agent tab closed';
+  $('closure-identity').textContent=
+    `${entry.title || 'Agent'} · old tab ${entry.oldTabId} · ${entry.kind}`+
+    (entry.parentTabId?` · still-owning Parent tab ${entry.parentTabId}`:'');
+  $('closure-url').textContent=entry.url?
+    `Saved conversation: ${entry.url}`:'No verified conversation URL was captured; Accident recovery is held.';
+  const descendants=Array.isArray(entry.descendants)?entry.descendants:[];
+  const active=descendants.filter((d)=>
+    ['running','uncertain','waiting_for_children','queued'].includes(d.state));
+  $('closure-warning').textContent=active.length
+    ? `${active.length} descendant Agent(s) may still be working. Their existing browser work continues while you decide. An intentional Yes closes this subtree immediately; Cancel leaves tabs open but unmanaged.`
+    : 'No active descendant tasks were observed in the captured closure snapshot.';
+  $('closure-descendants').textContent=descendants.length
+    ? descendants.map((d)=>`Tab ${d.tabId} · parent ${d.parentTabId} · ${d.title||d.site||'Agent'} · ${d.state}`).join('\n')
+    : 'No registered descendants in this closure snapshot.';
+  $('closure-backlog').textContent=pending.length>1
+    ? `${pending.length-1} other closure decision(s) are awaiting your separate choice.`:'';
+  const seconds=Math.max(0,5-Math.floor((Date.now()-closureFirstShown.get(entry.id))/1000));
+  const resuming=entry.status==='restoring_children' &&
+    Number.isSafeInteger(entry.candidateTabId);
+  const ready=seconds===0 && !closureBusy &&
+    (entry.status==='pending'||resuming) &&
+    currentState?.phase==='running' && currentState?.extensionConnected===true;
+  $('closure-accident').textContent=resuming?'Resume Accident':'Accident';
+  for (const name of ['accident','yes','cancel'])
+    $('closure-'+name).disabled=!ready || (name!=='accident'&&resuming) ||
+      (name==='accident' && !resuming && !entry.url);
+  $('closure-countdown').textContent=resuming
+    ? 'Some descendants are still being restored. Resume Accident verifies the existing tabs and never replays their tasks.'
+    : entry.status!=='pending'
+    ? 'Recovery decision is in progress or uncertain. No automatic retry or duplicate tab creation.'
+    : closureBusy?'Applying your choice; original Agent relationships are being verified…'
+    : seconds?`Actions enabled in ${seconds} second(s). No action will be selected automatically.`
+      : currentState?.extensionConnected?'Choose Accident, Yes, or Cancel. No default action.'
+        :'Extension disconnected. Decision is preserved until reconnect.';
+  $('closure-error').textContent=closureError;
+}
+async function refreshAgentClosures() {
+  if(closureRefreshBusy || typeof window.bridge.listAgentClosures!=='function' ||
+     currentState?.phase!=='running' || !currentState?.extensionConnected)return;
+  closureRefreshBusy=true;
+  try {
+    const data=await window.bridge.listAgentClosures();
+    if(Array.isArray(data)) {
+      closureSnapshot=data;
+      renderAgentClosureDialog();
+    }
+  } catch(error) {
+    // Preserve last-known dialogs: a missing bridge is not authorization to
+    // silently dismiss or choose an outcome.
+    if(closureSnapshot.length) {
+      closureError=String(error?.message||error);
+      renderAgentClosureDialog();
+    }
+  } finally {closureRefreshBusy=false;}
+}
+async function selectAgentClosure(choice) {
+  if(closureBusy || typeof window.bridge.resolveAgentClosure!=='function')return;
+  const entry=closureSnapshot.find((item)=>item.status!=='resolved');
+  if(!entry || entry.status!=='pending')return;
+  if(Date.now()-closureFirstShown.get(entry.id)<5000)return;
+  if(currentState?.phase!=='running' || !currentState.extensionConnected)return;
+  closureBusy=true;closureError='';
+  renderAgentClosureDialog();
+  try {
+    const result=await window.bridge.resolveAgentClosure(entry.id,choice);
+    if(choice==='accident')
+      notify(`Restored physical Agent tab ${result.new_tab_id}. Pair the restored Parent/Child before resuming new orchestrated work.`);
+    else if(choice==='yes')
+      notify('Closed only the selected Agent subtree. Unrelated Agent tabs remain untouched.');
+    else
+      notify('Descendant tabs remain open but are detached from Chat Orchestrator; future MCP calls are forbidden.');
+    closureSnapshot=closureSnapshot.filter((item)=>item.id!==entry.id);
+    closureFirstShown.delete(entry.id);
+  } catch(error) {
+    closureError=String(error?.message||error);
+  } finally {
+    closureBusy=false;
+    renderAgentClosureDialog();
+    void refreshAgentClosures();
+  }
+}
+for (const name of ['accident','yes','cancel'])
+  $('closure-'+name)?.addEventListener('click',()=>void selectAgentClosure(name));
+if(typeof window.setInterval==='function') {
+  window.setInterval(()=>{renderAgentClosureDialog();void refreshAgentClosures();},1000);
+}

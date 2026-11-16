@@ -9,6 +9,10 @@ const close = (server) => new Promise((resolve) => server.close(resolve));
 
 test('only the dedicated connector path is rewritten', () => {
   assert.deepEqual(chooseUpstream('/orchestrator/mcp?token=a%20b'), { port: 8787, path: '/mcp?token=a%20b', orchestrator: true });
+  assert.deepEqual(chooseUpstream('/orchestrator/mcp/agent?token=abc'),
+    {port:8787,path:'/mcp/agent?token=abc',orchestrator:true});
+  assert.deepEqual(chooseUpstream('/orchestrator/mcp/agent/'+ 'a'.repeat(64)),
+    {port:8787,path:'/mcp/agent/'+ 'a'.repeat(64),orchestrator:true});
   assert.deepEqual(chooseUpstream('/mcp?token=x'), { port: 9002, path: '/mcp?token=x', orchestrator: false });
   assert.deepEqual(chooseUpstream('/orchestrator/health'), { port: 9002, path: '/orchestrator/health', orchestrator: false });
 });
@@ -25,13 +29,25 @@ test('gateway forwards other paths to AgentBridge and the connector path to MCP'
   try {
     const route = await fetch(`http://127.0.0.1:${gatewayPort}/orchestrator/mcp?token=secret`);
     assert.equal(await route.text(), 'orchestrator:/mcp?token=secret');
+    const agentRoute=await fetch(`http://127.0.0.1:${gatewayPort}/orchestrator/mcp/agent?token=secret`);
+    assert.equal(await agentRoute.text(),'orchestrator:/mcp/agent?token=secret');
+    const pathToken='a'.repeat(64);
+    const credentialRoute=await fetch(`http://127.0.0.1:${gatewayPort}/orchestrator/mcp/agent/${pathToken}`);
+    assert.equal(await credentialRoute.text(),`orchestrator:/mcp/agent/${pathToken}`);
     const original = await fetch(`http://127.0.0.1:${gatewayPort}/health?x=1`);
     assert.equal(await original.text(), 'agentbridge:/health?x=1');
     await new Promise((resolve, reject) => {
       const socket = new WebSocket(`ws://127.0.0.1:${gatewayPort}/bridge`);
       socket.once('open', () => socket.send('ping'));
       socket.once('message', (message) => {
-        try { assert.equal(String(message), 'agentbridge:ping'); socket.close(); resolve(); }
+        // Await the full close handshake before tearing down the gateway.
+        // Killing an in-flight Win32 async socket can trip a libuv assertion
+        // when Node's test runner executes test files concurrently.
+        try {
+          assert.equal(String(message), 'agentbridge:ping');
+          socket.once('close', resolve);
+          socket.close();
+        }
         catch (error) { reject(error); }
       });
       socket.once('error', reject);

@@ -47,11 +47,18 @@ test('all six Worker Tool operations preserve profile-local tab and task state',
   let nextGroupId = 1;
   const groups = new Map();
   const windows = new Map();
+  const localData={enabled:true,token:'',maxWorkers:10,maxTasksPerHour:30,
+    orchestratorTabId:101};
   let removedCb, updatedCb;
   const chrome = {
     storage: {
       session: { get: async () => storage, set: async (next) => Object.assign(storage, next) },
-      local: { get: async () => ({ enabled: true, token: '', maxWorkers: 10, maxTasksPerHour: 30, orchestratorTabId: 101 }) },
+      local: {
+        get: async (keys) => Array.isArray(keys)
+          ? Object.fromEntries(keys.map((key)=>[key,localData[key]]))
+          : typeof keys==='string' ? {[keys]:localData[keys]} : {...localData},
+        set: async (next) => Object.assign(localData,next),
+      },
       onChanged: { addListener() {} },
     },
     tabs: {
@@ -121,7 +128,7 @@ test('all six Worker Tool operations preserve profile-local tab and task state',
       onInstalled: { addListener() {} }, onStartup: { addListener() {} }, onMessage: { addListener() {} } },
     alarms: { onAlarm: { addListener() {} }, create() {} },
   };
-  const ctx = createContext({ chrome, crypto: webcrypto, URL, console, setTimeout, clearTimeout, setInterval, clearInterval });
+  const ctx = createContext({ chrome, crypto: webcrypto, TextEncoder, URL, console, setTimeout, clearTimeout, setInterval, clearInterval });
   runInContext(source, ctx);
   const rawHandleCall = runInContext('handleCall', ctx);
   const settings=normalizeAgentSettings({});
@@ -132,6 +139,9 @@ test('all six Worker Tool operations preserve profile-local tab and task state',
   assert.match(defaults.serverUrl, /\/bridge$/);
   assert.equal(runInContext('proxySettings', ctx), null, 'Extension starts fail-closed without proxy snapshot');
   runInContext("proxySettings = { enabled: true, maxWorkers: 10, maxTasksPerHour: 100, taskTimeoutMin: 60, promptSchema: 2, promptModules: {} }", ctx);
+  // This fixture asserts authorization/queue logic, not the separate
+  // WebSocket pairing-offer handshake covered by its dedicated test.
+  runInContext('issueManagedChildPairing=async()=>"11111111-1111-4111-8111-111111111111"',ctx);
   assert.equal(runInContext('SITES.gemini.newChatUrl', ctx), 'https://gemini.google.com/app');
   const buildPrompt = runInContext('buildWorkerPrompt', ctx);
   const composed=composeAgentPrompt(settings,{kind:'task',task:'Investigate one scope'});
@@ -140,6 +150,15 @@ test('all six Worker Tool operations preserve profile-local tab and task state',
   const withOwner = (p, principal) => ({ ...p, __trustedPrincipal: principal,
     __rootTabId: principal.callerTabId,
     __rootIncarnationId:principal.sessionIncarnationId });
+  const review = (result,principal) => handleCall('review_task',withOwner({
+    tab_id:result.tab_id,task_id:result.task_id,
+  },principal));
+  const awaitRunning=async(taskId)=>{
+    const deadline=Date.now()+9000;
+    while(storage.tasks[taskId]?.status==='queued' && Date.now()<deadline)
+      await new Promise((resolve)=>setTimeout(resolve,50));
+    assert.equal(storage.tasks[taskId]?.status,'running','reviewed task should start in same tab');
+  };
 
   const ownTabs = await handleCall('list_tabs', withOwner({}, principalA));
   assert.deepEqual(Array.from(ownTabs, (t) => t.tab_id), [101, 201]);
@@ -154,10 +173,18 @@ test('all six Worker Tool operations preserve profile-local tab and task state',
   await assert.rejects(handleCall('close_worker', withOwner({ tab_id: 202 }, principalA)), /outside this caller scope/);
   await assert.rejects(handleCall('spawn_worker', withOwner({
     site: 'chatgpt', task: 'attack', share_context_from: '202',
-  }, principalA)), /outside this caller scope/);
+  }, principalA)), /Automatic chat transcript copying is not supported/);
+  const unsupported=await handleCall('spawn_worker',withOwner({
+    site:'gemini',task:'unsupported in v1',
+  },principalA));
+  assert.equal(unsupported.spawned,false);
+  assert.equal(unsupported.status,'PROVIDER_NOT_SUPPORTED');
 
   assert.doesNotMatch(source, /Only an authenticated BA principal/,
     'Watchdog is a skill-defined role label, not a built-in proxy permission');
+  // This fixture tests task ownership and tab reuse. A real profile-mode
+  // worker may begin only after durable Parent event delivery is enabled.
+  runInContext("privateQueueMode='enabled'",ctx);
   const parentStart = Date.now();
   const independent = await handleCall('spawn_worker', withOwner({
     site: 'chatgpt', role: 'council_a', task: 'Council stage 1 independent proposal',
@@ -179,7 +206,12 @@ test('all six Worker Tool operations preserve profile-local tab and task state',
     tab_id: 301, text: 'Council stage 2 same-tab peer review', wait_seconds: 0,
   }, principalA));
   assert.equal(councilFollowup.tab_id, 301, 'Council stages reuse the exact prior worker tab');
-  assert.equal(councilFollowup.status, 'running');
+  assert.equal(councilFollowup.status, 'queued', 'new follow-up must have an accepted FIFO receipt');
+  const councilDeadline = Date.now() + 9000;
+  while (storage.tasks[councilFollowup.task_id]?.status === 'queued' && Date.now() < councilDeadline)
+    await new Promise((resolve) => setTimeout(resolve,50));
+  assert.equal(storage.tasks[councilFollowup.task_id]?.status,'running',
+    'FIFO delivery must start when the owned Child is idle');
   assert.equal(nextWorkerTabId, 302, 'a Council follow-up must not create another window');
   runInContext('finishTask', ctx)(councilFollowup.task_id, {
     status: 'done', result: 'Same-tab peer review complete',
@@ -209,13 +241,20 @@ test('all six Worker Tool operations preserve profile-local tab and task state',
   assert.equal(pmSeat.status, 'running');
   assert.ok(storage.roleSeats['credential:' + A + '|101|pm|epic:15'],
     'scoped seats must be isolated to the parent tab');
-  await assert.rejects(handleCall('spawn_worker', withOwner({
+  const pendingPm = await handleCall('spawn_worker', withOwner({
     site: 'chatgpt', role: 'pm', role_scope: 'epic:15',
     task: 'Overtaking PM while active', keep_open: true,
-  }, principalA)), /outstanding task/);
+  }, principalA));
+  assert.equal(pendingPm.status,'queued','independent T2 must not overtake active T1');
   assert.equal((await handleCall('read_chat', withOwner({}, principalBA))).transcript,
     'transcript for 101', 'BA may request status while PM descendants are active');
   runInContext('finishTask', ctx)(pmSeat.task_id, { status: 'done', result: 'Epic handoff ready' });
+  assert.equal(storage.tasks[pendingPm.task_id].status,'queued',
+    'T2 must remain queued even after T1 response ends, until Parent review');
+  await review(pmSeat,principalA);
+  await awaitRunning(pendingPm.task_id);
+  runInContext('finishTask', ctx)(pendingPm.task_id,{status:'done',result:'PM correction finished'});
+  await review(pendingPm,principalA);
   const pmStage2 = await handleCall('spawn_worker', withOwner({
     site: 'chatgpt', role: 'pm', role_scope: 'epic:15',
     task: 'PM stage 2 same epic', keep_open: true,
@@ -236,6 +275,7 @@ test('all six Worker Tool operations preserve profile-local tab and task state',
     'separate roots must have distinct tab groups');
   assert.equal(groups.size,2,'one tab group per root, not per worker');
   runInContext('finishTask', ctx)(tlSeat.task_id, { status: 'done', result: 'Major-task stage 1' });
+  await review(tlSeat,principalB);
   const tlStage2 = await handleCall('spawn_worker', withOwner({
     site: 'chatgpt', role: 'tl', role_scope: 'task:68',
     task: 'TL major-task stage 2', keep_open: true,
@@ -251,6 +291,7 @@ test('all six Worker Tool operations preserve profile-local tab and task state',
     task: 'Council initial position', keep_open: true,
   }, principalA));
   runInContext('finishTask', ctx)(councilSeat.task_id, { status: 'done', result: 'Frozen initial' });
+  await review(councilSeat,principalA);
   const councilStage2 = await handleCall('spawn_worker', withOwner({
     site: 'chatgpt', role: 'council_b', role_scope: 'parent:68',
     task: 'Anonymous peer review, same tab', keep_open: true,
@@ -264,6 +305,7 @@ test('all six Worker Tool operations preserve profile-local tab and task state',
   }, principalA));
   assert.equal(customSeat.reused_tab, false, 'arbitrary skill-defined roles must be accepted');
   runInContext('finishTask', ctx)(customSeat.task_id, { status: 'done', result: 'UI issue inspected' });
+  await review(customSeat,principalA);
   const customAgain = await handleCall('spawn_worker', withOwner({
     site: 'chatgpt', role: 'ux_designer', role_scope: 'project:alpha/feature',
     task: 'Recheck UI issue', keep_open: true,
@@ -381,9 +423,10 @@ test('all six Worker Tool operations preserve profile-local tab and task state',
   assert.equal((await handleCall('get_result',withOwner({task_id:taskB.id},principalB))).status,'done');
   assert.equal((await handleCall('reopen_child',withOwner({task_id:taskB.id},principalB))).reused,true);
   await updatedCb(101,{url:'https://claude.ai/new'},tabById.get(101));
-  assert.notEqual(storage.managerIncarnations[101],MANAGER_A,
-    'switching chat providers must rotate the browser-tab incarnation');
-  await assert.rejects(handleCall('list_tabs', withOwner({}, principalA)), /incarnation changed/);
+  assert.equal(storage.managerIncarnations[101],MANAGER_A,
+    'D-053: navigating a managed Parent never silently revokes its tab-stable incarnation');
+  assert.equal((await handleCall('list_tabs', withOwner({},principalA)))[0]?.tab_id,101,
+    'same paired Parent may continue after supported-site navigation');
   assert.deepEqual(Array.from(await handleCall('list_tabs', withOwner({}, principalB)), (t) => t.tab_id), [102, tlSeat.tab_id, recovery.tab_id]);
   runInContext("browserSessionId = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'", ctx);
   await assert.rejects(handleCall('list_tabs', withOwner({}, principalB)), /incarnation changed/);

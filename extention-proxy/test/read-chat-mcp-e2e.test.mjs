@@ -10,6 +10,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createContext, runInContext } from 'node:vm';
 import WebSocket from 'ws';
+import { randomUUID, createHash } from 'node:crypto';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 
@@ -118,15 +119,18 @@ test('MCP read_chat options survive HTTP, WebSocket, background and content scri
     const extensionBrowserSession='aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
     const tabReceivers = new Map(cases.map((site) => [site.tabId, createContent(site, apiFailures, domFallback)]));
     const tabById = new Map(cases.map((site) => [site.tabId, { id: site.tabId, url: site.url }]));
+    const sessionStore={workers:[],workerOwners:{},
+      browserSessionId:extensionBrowserSession,proxySessionId:null};
+    const localStore={};
     const chrome = {
       storage: {
         local: { get: async () => ({
           enabled: true, token: EXTENSION_TOKEN, serverUrl: `ws://localhost:${PORT}/bridge`,
-          orchestratorTabId: cases[0].tabId,
-        }) },
-        session: { get: async () => ({ workers: [], workerOwners: {},
-          browserSessionId:extensionBrowserSession,proxySessionId:null }), set: async () => {},
-          remove:async()=>{} },
+          orchestratorTabId: cases[0].tabId,...localStore,
+        }), set: async(data)=>Object.assign(localStore,data) },
+        session: { get: async () => ({...sessionStore}),
+          set: async (next) => Object.assign(sessionStore,next),
+          remove:async(keys)=>{for(const key of keys)delete sessionStore[key];} },
         onChanged: { addListener() {} },
       },
       tabs: {
@@ -148,7 +152,7 @@ test('MCP read_chat options survive HTTP, WebSocket, background and content scri
       alarms: { onAlarm: { addListener() {} }, create() {} },
     };
     const bg = createContext({
-      chrome, WebSocket, URL, crypto, console,extensionBrowserSession, getContexts:async()=>[],
+      chrome, WebSocket, URL, crypto, TextEncoder, console,extensionBrowserSession, getContexts:async()=>[],
       setTimeout,
       clearTimeout,
       setInterval,
@@ -172,10 +176,39 @@ test('MCP read_chat options survive HTTP, WebSocket, background and content scri
     assert.ok(schema?.include_attachments, 'MCP schema exposes include_attachments');
     assert.ok(schema?.last_n, 'MCP schema exposes last_n');
 
+    const credentials=new Map();
+    for (const {tabId,site} of cases) {
+      const live=await runInContext(`inspectChatTab(${tabId})`,bg);
+      runInContext(`approvedParents[${tabId}]=managerIncarnations[${tabId}]`,bg);
+      const sock=runInContext('ws',bg);
+      const request_id=randomUUID();
+      const code=randomUUID();
+      const ack=new Promise((resolve,reject)=>{
+        const timeout=setTimeout(()=>reject(Error('Pairing ACK timed out')),5000);
+        const receive=(raw)=>{
+          const m=JSON.parse(raw.toString());
+          if(m.type==='pairing_offer_ack' && m.request_id===request_id){
+            clearTimeout(timeout);sock.off('message',receive);
+            if(m.ok)resolve();else reject(Error(m.error));
+          }
+        };
+        sock.on('message',receive);
+      });
+      sock.send(JSON.stringify({type:'pairing_offer',request_id,code,tab_id:tabId,
+        incarnation_id:live.incarnation_id,route_hash:live.route_hash}));
+      await ack;
+      const paired=await client.callTool({name:'pair_conversation',arguments:{
+        code,idempotency_key:randomUUID()}});
+      assert.equal(paired.isError,undefined,`Expected approved ${site} test Parent pairing`);
+      credentials.set(tabId,JSON.parse(paired.content[0].text).agent_credential);
+    }
+
     const callRead = async (args) => {
+      const target=args.tab_id ?? cases[0].tabId;
       const reply = await client.callTool({ name: 'read_chat',
-        arguments: {caller_tab_id:args.tab_id ?? cases[0].tabId,
-          browser_session_id:extensionBrowserSession,...args} });
+        arguments: {caller_tab_id:target,browser_session_id:extensionBrowserSession,
+          agent_credential:credentials.get(target),
+          idempotency_key:randomUUID(),...args} });
       assert.equal(reply.isError, undefined, 'bridge call itself should succeed: '+JSON.stringify(reply.content));
       return JSON.parse(reply.content[0].text);
     };
@@ -226,7 +259,9 @@ test('MCP read_chat options survive HTTP, WebSocket, background and content scri
     ]) {
       const response = await client.callTool({ name: 'read_chat',
         arguments: {caller_tab_id:invalid.tab_id ?? cases[0].tabId,
-          browser_session_id:extensionBrowserSession,...invalid} });
+          browser_session_id:extensionBrowserSession,
+          agent_credential:credentials.get(cases[0].tabId),
+          idempotency_key:randomUUID(),...invalid} });
       assert.equal(response.isError, true, 'invalid MCP options must be rejected');
     }
   } finally {

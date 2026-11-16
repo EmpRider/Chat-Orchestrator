@@ -22,42 +22,45 @@ messages and close tabs in the connected browser. The activity panel keeps
 the latest 500 entries, including full message contents. Close the tester
 with Ctrl+C in its window to stop it and remove its temporary journal.
 
-## Local 0.1.3 redesigned UI + modular-instructions candidate (November 6, 2026)
+## Current Windows candidate (November 15, 2026)
 
-This is a local development candidate, not yet a published GitHub Release. It includes
-four-page desktop navigation and a URL-only extension popup; proxy bridge tokens and
-manual scoped agent pairing have been removed.
+This is an **unreleased development candidate**, not a production-certified build.
+Current installer: `extention-proxy/dist/Chat Orchestrator Setup 0.1.3.exe`.
+The NSIS installer is **unsigned**. It uses installed **Chrome or Edge** with a
+dedicated browser profile, not the user's ordinary personal browser profile.
+The extension is bundled but requires user-consented installation in that profile.
 
-- Desktop EXE: `extention-proxy/dist/Chat-Orchestrator-0.1.3-no-bridge-auth.exe`
-- Browser extension ZIP: `extention-proxy/dist/Chat-Orchestrator-0.1.3-no-bridge-auth-extension.zip`
+Three independent authorization boundaries are implemented: a **local extension
+profile key** for loopback WebSocket, a **public MCP HTTP transport key** for
+ngrok ingress (Bearer header or dedicated URL-token route), and **per-Agent credentials**
+issued only after explicit Parent/Child pairing. Keep Agent credentials out of
+URLs, prompts and logs; the dedicated HTTPS URL itself is sensitive. None of these keys alone
+cryptographically proves the physical browser tab making a remote MCP call.
 
-To update an existing installation, exit the old desktop program using its **system tray > Exit**
-command (window X may only hide it), then run the new portable EXE using the **same profile**.
-Settings and the Ngrok authtoken live in the Windows profile data folder, not in the EXE.
-To update the extension, replace the files in its existing unpacked folder, choose **Reload**
-in Edge/Chrome extensions, then refresh chat tabs. Enter only the local WebSocket URL
-in the extension popup; no bridge credential is required.
-
-Verified after bridge-auth removal: `npm test` 70 PASS / 0 FAIL, tokenless MCP smoke,
-real Electron four-page UI smoke, and isolated packaged EXE settings WebSocket smoke.
-The new portable EXE and extension ZIP were built locally; GitHub release publication,
-P0 crash recovery, independent QA and live-browser end-to-end approval remain outstanding.
+**Authentication policy:** The Product Owner chose one static transport
+token for public MCP, **not OAuth**. ChatGPT's custom MCP UI does not allow custom
+Authorization headers, so the same token can be supplied in the dedicated
+`/mcp/agent/<transport-key>` URL path, following AgentBridge's route-token pattern.
+The original `/mcp` continues to require a Bearer header.
+No OAuth login endpoints are implemented. Real ChatGPT connector E2E remains unverified.
 
 
-An orchestrator chat (Claude or ChatGPT) calls MCP tools; a local server forwards them to a
-browser extension, which opens/drives worker chat tabs and returns their replies.
+An approved ChatGPT Agent calls scoped MCP tools; a local server authenticates and
+forwards them to the browser extension, which manages Child tabs and results.
 
-**Windows desktop + Chrome extension release:** Download both packages from
-[GitHub Releases](https://github.com/EmpRider/Chat-Orchestrator/releases) and follow
-[the desktop setup guide](extention-proxy/DESKTOP.md). The desktop app manages its own
-ngrok tunnel and gives you the ChatGPT connector URL.
+**Windows Setup candidate:** The installer bundles the extension resources;
+there is no separate ZIP requirement for this candidate. See the
+[desktop setup guide](extention-proxy/DESKTOP.md). The desktop manages an ngrok
+tunnel but its current static HTTP transport-key flow has not completed
+ChatGPT OAuth compatibility verification.
 
 ![Compact black desktop dashboard](docs/dark-ui-preview.png)
 
 The Windows desktop app includes a compact dark interface and a system tray
-icon. **Minimize to system tray when closing** is checked by default: closing
-the window keeps the proxy and ngrok alive. Uncheck it to exit when closing,
-or use **Exit** from the tray context menu at any time. The choice persists
+icon. **Minimize to system tray when closing** is checked by default: X keeps
+the proxy and ngrok alive. Uncheck it to request an explicit Exit confirmation,
+or use **Exit** from the tray context menu. Exit asks Keep Browser Open,
+Close Managed Browser or Cancel. The setting persists
 across restarts. Worker runtime state resets; worker chat tabs stay open.
 Desktop icon artwork is by [Icons8](https://icons8.com/).
 
@@ -68,42 +71,49 @@ Orchestrator chat --MCP/HTTPS (tunnel)--> extention-proxy (server.js)
                                    extention (MV3 service worker)
                                               | tabs + content scripts
                                               v
-                                   worker tab (ChatGPT / Claude)
+                                   worker tab (ChatGPT v1)
 ```
 
-## Tools exposed to the orchestrator
+## Tools available to approved Agents
 
 | Tool | Purpose |
 | --- | --- |
-| `list_tabs` | Open Claude/ChatGPT tabs with `tab_id`, site, role |
-| `spawn_worker(site, task, share_context_from?, wait_seconds?)` | New chat in a separate window = sub-agent |
-| `send_to_tab(tab_id, text, wait_seconds?)` | Follow-up message to an existing worker |
-| `get_result(task_id, wait_seconds?)` | Poll/wait for a worker's reply (max 50s per call) |
-| `read_chat(tab_id?, last_n?)` | Read a tab's transcript (default: orchestrator tab) |
-| `close_worker(tab_id)` | Close a worker window |
+| `pair_conversation` | Pair an explicitly user-approved Parent or owned Child |
+| `list_tabs` | Inspect eligible browser tabs |
+| `spawn_worker` / `send_to_tab` | Assign work to directly owned Children |
+| `get_result` / `read_chat` | Inspect task outcome or live conversation |
+| `complete_task` / `review_task` | Child completion and direct Parent review |
+| `close_worker` | Close an eligible Child after review |
+
+All tools require a UUID `idempotency_key`. Except `pair_conversation`,
+tools also require the scoped `agent_credential` from explicit pairing.
 
 ## Setup (Windows desktop app)
 
-1. Download the **Windows portable EXE** and **Chrome extension ZIP** from
-   [the latest release](https://github.com/EmpRider/Chat-Orchestrator/releases/latest).
-   Install the [ngrok CLI](https://ngrok.com/download/windows) separately and make sure `ngrok`
-   is available on your `PATH`.
-2. Double-click the EXE. In its UI, enter your **dedicated ngrok domain** and the
-   **matching ngrok authtoken**, then click **Save & Connect**. The app manages the tunnel
-   automatically; you do not need to start a tunnel manually. Your existing AgentBridge
-   domain and tunnel remain separate.
-3. Extract the extension ZIP. Open `chrome://extensions`, enable **Developer mode**,
-   select **Load unpacked**, and choose the extracted folder containing `manifest.json`.
-   In the extension popup, set `ws://127.0.0.1:8787/bridge` (or the configured profile port)
-   and choose **Save and reconnect**. Proxy-managed settings synchronize automatically.
-4. In desktop **Extension settings & system prompts**, select **Advanced browser actions**
-   and enter the chat tab ID (from `list_tabs`) to set the legacy orchestrator.
-   Log in to your worker-chat sites in that browser profile.
-5. Once the app shows the ngrok route as verified, click **Copy Connector URL**.
-   Add that URL as the ChatGPT connector endpoint. It uses your dedicated domain and
-   has the form `https://YOUR-DOMAIN/mcp`, with no bridge token in the URL.
-6. In the orchestrator chat, try:
-   *"Use spawn_worker on chatgpt to review this plan, wait up to 45 seconds, then summarise."*
+1. Obtain a trusted Windows installer and install [ngrok CLI](https://ngrok.com/download/windows)
+   on `PATH`.
+2. In **Connections**, choose installed Chrome or Edge. Chat Orchestrator launches
+   a dedicated, persistent browser profile, separate from your personal profile.
+3. In that browser, open its Extensions page and install the bundled extension
+   using **Developer mode > Load unpacked**. Set the extension popup's local
+   WebSocket URL and **profile connection key** from Connections.
+4. Confirm this extension is in the selected dedicated browser, click
+   **Verify connected browser profile**, then **Finish setup**.
+5. Configure your dedicated ngrok domain and authtoken. In Desktop, click
+   **Copy Connector URL**. It copies
+   `https://YOUR-DOMAIN/mcp/agent/<transport-key>` for ChatGPT's
+   **No authentication** option. The Desktop UI only displays the non-secret
+   `/mcp/agent` path. This complete URL is a secret: avoid chat messages,
+   browser history, screenshots and shared logs. Tunnel operators may record it.
+   Header-capable MCP clients can still use `https://YOUR-DOMAIN/mcp`
+   with `Authorization: Bearer <transport-key>`.
+6. Explicitly approve the ChatGPT Parent tab in the extension, which sends a
+   one-time `pair_conversation` initialization prompt.
+
+**Live ChatGPT connector compatibility still needs verification.** Offline
+MCP SDK tests confirm successful no-custom-header access at the URL-token
+endpoint; a real ChatGPT connection, UI and tool call have not yet been tested.
+Never paste the token-bearing URL into a chat or disable authentication.
 
 For more detail, see the [desktop setup guide](extention-proxy/DESKTOP.md).
 
@@ -140,10 +150,14 @@ The default profile uses port `8787`. For a separate independent local proxy, la
   task timeout, and editable **operation-specific MCP/agent communication instructions** (task,
   workspace, delegation, queue receipt/ACK, child result, status request, tab loss, and failures).
   BA/PM/TL/Council/Watchdog role policies belong in SKILL.md, never in these proxy prompts.
-  The extension popup owns only its local WebSocket URL and read-only connection status;
-  settings synchronize over that WebSocket without a proxy-generated token.
-- Neither `/mcp` nor `/bridge` uses a Chat Orchestrator bridge token; the proxy binds locally to `127.0.0.1`.
-- `send_to_tab` refuses the orchestrator tab; `close_worker` only closes tabs it spawned.
+  The extension popup configures its local WebSocket URL and profile connection key.
+  Settings synchronize over that authenticated local connection.
+- Public `/mcp` requires a Bearer header and `/mcp/agent/<transport-key>`
+  requires the same key in an exact URL path (not a query parameter). Both run on an
+  HTTP-only listener without the extension bridge. Local `/bridge` uses a
+  different, profile-scoped key.
+- `send_to_tab` requires direct Parent ownership; `close_worker` is gated by
+  ownership, task completion, descendant state and Parent review.
 
 ## Known limits
 
@@ -154,13 +168,13 @@ The default profile uses port `8787`. For a separate independent local proxy, la
 - Gemini is supported for `read_chat`; automated Gemini worker prompting is not
   enabled. Legacy DOM-only reads can still lose formatting and older virtualized turns.
 - Automating the web UIs may conflict with each site's terms; keep it to personal use.
-- Ngrok tunnel authentication is preserved, but there is no separate MCP access token.
-  Anyone who can reach your Ngrok `/mcp` URL may control your logged-in browser tabs.
+- Ngrok provider credentials alone do not authenticate MCP clients. Public HTTP
+  authentication and a separately paired Agent credential both remain mandatory.
 
 ## Modular proxy instructions (development)
 Operation-specific prompt modules: core, task, workspace, delegation, queue, child_result,
 status_request, child_tab_lost and failure. The proxy selects modules by operation/event;
 roles remain defined by SKILL.md. A recovered worker tab gets a new ID; reconcile its
-original task using read_chat and get_result. Bridge tokens and per-agent pairing are removed;
-private FIFO queue still holds uncertain events for manual reconciliation. Packaged release
-verification is still outstanding.
+original task using read_chat and get_result. Profile transport credentials and
+per-Agent pairing remain mandatory; private FIFO queue holds uncertain events
+for manual reconciliation. Live browser acceptance and signed distribution remain pending.

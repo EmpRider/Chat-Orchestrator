@@ -1,4 +1,4 @@
-// Manual Windows packaged smoke: isolated temporary profile, tokenless local settings handshake.
+// Manual Windows packaged smoke: isolated temporary profile, authenticated local settings handshake.
 // Never touches the live default profile, its Ngrok auth, or port 8787.
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
@@ -41,6 +41,10 @@ try {
   assert.ok(active, 'Packaged isolated proxy must listen on test port');
   assert.ok(!existsSync(path.join(dataDir,'extension-bridge.token')),
     'Packaged proxy must not create an obsolete extension credential');
+  const profileKeyFile=path.join(dataDir,'extension-profile-token.txt');
+  assert.ok(existsSync(profileKeyFile),'Packaged desktop must create a profile-scoped extension key');
+  const profileKey=readFileSync(profileKeyFile,'utf8').trim();
+  assert.match(profileKey,/^[a-f0-9]{64}$/);
   ws = new WebSocket(`ws://127.0.0.1:${port}/bridge`);
   const snapshot = new Promise((resolve,reject)=>{
     const timer=setTimeout(()=>reject(new Error('Settings snapshot timed out')),8000);
@@ -53,7 +57,7 @@ try {
   });
   await once(ws,'open');
   ws.send(JSON.stringify({type:'register_session',browser_session_id:'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
-    connection_generation:1}));
+    connection_generation:1,profile_token:profileKey}));
   const msg = await snapshot;
   assert.equal(msg.schema,1);
   assert.ok(msg.revision>0);

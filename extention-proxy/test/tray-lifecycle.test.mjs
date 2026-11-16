@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { createDesktopTray, installWindowCloseBehavior, minimizeToTrayPreference } from '../desktop/tray-lifecycle.mjs';
 
-test('tray preference defaults enabled, and explicit false survives reload', () => {
+test('tray setting restores saved enable/disable preference', () => {
   assert.equal(minimizeToTrayPreference(undefined), true);
   assert.equal(minimizeToTrayPreference(null), true);
   assert.equal(minimizeToTrayPreference('false'), true);
@@ -12,18 +12,22 @@ test('tray preference defaults enabled, and explicit false survives reload', () 
   assert.equal(minimizeToTrayPreference(persisted.minimizeToTray), false);
 });
 
-test('X hides and preserves window when tray is available and option is checked', () => {
+test('X uses tray setting; disabling it requests confirmation instead of silently quitting', () => {
   let handler;
   let hidden = 0;
   let stopped = 0;
   let enabled = true;
   let available = true;
   let exiting = false;
+  let warningCount = 0;
+  let exitRequests = 0;
   const win = { on(name, fn) { assert.equal(name, 'close'); handler = fn; }, hide() { hidden++; } };
   installWindowCloseBehavior(win, {
     shouldMinimize: () => enabled,
     trayAvailable: () => available,
     isExiting: () => exiting,
+    onTrayUnavailable: () => warningCount++,
+    requestExit: () => exitRequests++,
   });
   const close = () => {
     let prevented = false;
@@ -35,11 +39,15 @@ test('X hides and preserves window when tray is available and option is checked'
   assert.equal(hidden, 1);
   assert.equal(stopped, 0);
   enabled = false;
-  assert.equal(close(), false);
-  assert.equal(stopped, 1);
+  assert.equal(close(), true, 'exit confirmation must occur before shutdown');
+  assert.equal(exitRequests, 1);
+  assert.equal(stopped, 0);
+  assert.equal(hidden, 1, 'disabled preference must not hide the window');
   enabled = true;
   available = false;
-  assert.equal(close(), false, 'no tray means X always exits');
+  assert.equal(close(), true, 'unavailable tray must not trigger implicit Exit');
+  assert.equal(warningCount, 1);
+  assert.equal(stopped, 0);
   available = true;
   exiting = true;
   assert.equal(close(), false, 'application quit must never be intercepted');
