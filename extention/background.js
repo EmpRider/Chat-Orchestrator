@@ -551,10 +551,8 @@ async function pushAllManagedAgentStatuses() {
   for(const id of ids)void pushManagedAgentStatus(id);
 }
 
-// D-052: best-effort ChatGPT-only visibility emulation. Only the browser
-// extension can authorize an already-managed tab to receive MAIN-world code.
-// Never inject credentials, override real user focus, intercept events or
-// patch global requestAnimationFrame/timers.
+// Focusly-style page-facing focus emulation, limited to managed ChatGPT tabs.
+// The early MAIN-world bootstrap is inert until explicitly enabled here.
 async function enableManagedAntiFreeze(tabId) {
   await stateReady;
   if(!managedAgentStatus(tabId).managed ||
@@ -562,31 +560,24 @@ async function enableManagedAntiFreeze(tabId) {
   const tab=await chrome.tabs.get(tabId).catch(()=>null);
   if(siteOfUrl(tab?.url)!=='chatgpt')return false;
   try {
+    // Old tabs may predate this extension reload; reinstalling is idempotent.
     await chrome.scripting.executeScript({
       target:{tabId,allFrames:false},world:'MAIN',
-      func:()=>{
-        const key=Symbol.for('chat-orchestrator.managed-visibility.v1');
-        if(document[key])return;
-        const hidden=Object.getOwnPropertyDescriptor(document,'hidden');
-        const state=Object.getOwnPropertyDescriptor(document,'visibilityState');
-        try {
-          Object.defineProperty(document,'hidden',{configurable:true,get:()=>false});
-          Object.defineProperty(document,'visibilityState',{configurable:true,get:()=> 'visible'});
-          Object.defineProperty(document,key,{value:{hidden,state},configurable:true});
-        }catch {
-          // Restore on partial failure. A site refusing the shim remains
-          // subject to ordinary UI monitoring and user status intervention.
-          try{
-            if(hidden)Object.defineProperty(document,'hidden',hidden);
-            else delete document.hidden;
-            if(state)Object.defineProperty(document,'visibilityState',state);
-            else delete document.visibilityState;
-          }catch{}
-        }
-      },
+      files:['managed-focus-main.js'],
     });
-    return true;
-  } catch {return false;}
+    const activation=await chrome.scripting.executeScript({
+      target:{tabId,allFrames:false},world:'MAIN',
+      func:()=>document[Symbol.for('chat-orchestrator.managed-focus.v2')]
+        ?.setEnabled(true)===true,
+    });
+    const verified=activation?.[0]?.result===true;
+    if(!verified)extensionDiagnostic('warn','worker.focus_emulation_unverified',{tabId});
+    return verified;
+  } catch(error) {
+    extensionDiagnostic('warn','worker.focus_emulation_failed',{
+      tabId,errorType:error?.name||'Error'});
+    return false;
+  }
 }
 async function disableManagedAntiFreeze(tabId) {
   if(!chrome.scripting?.executeScript)return;
@@ -594,16 +585,8 @@ async function disableManagedAntiFreeze(tabId) {
     await chrome.scripting.executeScript({
       target:{tabId,allFrames:false},world:'MAIN',
       func:()=>{
-        const key=Symbol.for('chat-orchestrator.managed-visibility.v1');
-        const saved=document[key];
-        if(!saved || typeof saved!=='object')return;
-        try {
-          if(saved.hidden)Object.defineProperty(document,'hidden',saved.hidden);
-          else delete document.hidden;
-          if(saved.state)Object.defineProperty(document,'visibilityState',saved.state);
-          else delete document.visibilityState;
-          delete document[key];
-        } catch{}
+        document[Symbol.for('chat-orchestrator.managed-focus.v2')]
+          ?.setEnabled(false);
       },
     });
   } catch{}
@@ -636,7 +619,10 @@ async function callerManagerTab(p, cfg) {
   const principal = p.__trustedPrincipal;
   if (!principal || principal.mode === 'legacy') return cfg.orchestratorTabId;
   const tab = await chrome.tabs.get(principal.callerTabId).catch(() => null);
-  if (!tab || !siteOfUrl(tab.url)) throw new Error('Manager tab unavailable; select a supported chat tab');
+  if (!tab || !siteOfUrl(tab.url)) throw new Error(
+    `Manager tab ${principal.callerTabId} is unavailable or no longer on a supported chat page; `+
+    'Recheck/Retry require the original paired tab. If it cannot be restored, use Skip batch ' +
+    'with an operator reason to release the FIFO without sending another notification');
   if (principal.browserSessionId !== browserSessionId ||
       principal.sessionIncarnationId !== (workerIncarnations[tab.id] || managerIncarnations[tab.id])) {
     throw new Error('Manager browser/tab incarnation changed; register again');
@@ -1136,6 +1122,7 @@ async function injectContentScript(tabId) {
   extensionDiagnostic('debug','content_injection.target_resolved',{tabId,site:site || 'unsupported',
     tabStatus:tab.status || 'unknown'});
   if (site === 'chatgpt' && /^https:\/\/chatgpt\.com\//.test(tab.url)) {
+    await chrome.scripting.executeScript({ target, world:'MAIN', files:['managed-focus-main.js'] });
     await chrome.scripting.executeScript({ target, world: 'MAIN', files: [`${base}adapters/chatgpt/hook-main.js`] });
     extensionDiagnostic('debug','content_injection.main_hook_done',{tabId,site});
     await chrome.scripting.executeScript({ target, files: [
@@ -1233,7 +1220,7 @@ async function tabMessage(tabId, msg) {
   );
 }
 
-async function waitReady(tabId, expectedText, timeoutMs = 45000) {
+async function waitReady(tabId, expectedText, timeoutMs = 45000, focusEmulationReady = false) {
   const deadline = Date.now() + timeoutMs;
   let stableSince = null;
   let mismatchedDraftSince = null;
@@ -1249,7 +1236,7 @@ async function waitReady(tabId, expectedText, timeoutMs = 45000) {
     try {
       lastPage = await pageSettling.snapshot(tabId);
       const tab = await chrome.tabs.get(tabId);
-      if (lastPage.ready && tab?.active) {
+      if (lastPage.ready && (tab?.active || focusEmulationReady)) {
         extensionDiagnostic('debug','worker.readiness_ping_begin',{tabId,settledMs:lastPage.settledMs,
           active:tab.active});
         const observed = await tabMessage(tabId,{cmd:'ping',expectedText});
@@ -1292,7 +1279,7 @@ async function waitReady(tabId, expectedText, timeoutMs = 45000) {
           }
         } else stableSince = null;
       } else {
-        lastState = !tab?.active ? 'not-focused' :
+        lastState = !tab?.active && !focusEmulationReady ? 'not-focused' :
           lastPage.documentComplete ? 'post-load-settling' : 'document-loading';
         if (lastState !== lastLoggedState) {
           console.info('[chat-orch:background]',{step:'worker_readiness_observed',tabId,
@@ -1416,6 +1403,67 @@ function serializePromptStartup(operation) {
   promptStartupTail = next.catch(() => {});
   return next;
 }
+// Opt-in only. A page-facing hasFocus()/visibility shim cannot resume a
+// background Chromium compositor or deliver trusted native user input.
+// Temporarily foreground the dedicated worker window while its first user
+// turn is prepared and verified; never focus during worker tab creation.
+async function acquireForegroundSubmitLease(tabId,kind='child') {
+  const preference=await chrome.storage.local.get('foregroundSubmitEnabled');
+  if(preference?.foregroundSubmitEnabled!==true)return null;
+  const tab=await chrome.tabs.get(tabId);
+  const approved=kind==='manager'
+    ? managedAgentStatus(tabId).managed===true
+    : ownedWorker(tabId,workerOwners[tabId]);
+  if(!tab || siteOfUrl(tab.url)!=='chatgpt' || !approved)
+    throw new Error('Foreground submission is restricted to a managed ChatGPT agent');
+  if(!Number.isSafeInteger(tab.windowId))
+    throw new Error('Managed worker has no browser window to focus');
+  const originalWindow=await chrome.windows.get(tab.windowId);
+  if(!originalWindow || originalWindow.state==='minimized')
+    throw new Error('Open the managed browser window before foreground submission');
+  const previous=await chrome.windows.getLastFocused().catch(()=>null);
+  const previousBrowserWindowId=previous?.id??null;
+  const previousBrowserWindowWasFocused=previous?.focused===true;
+  const activeBefore=await chrome.tabs.query({active:true,windowId:tab.windowId})
+    .catch(()=>[]);
+  try {
+    await chrome.windows.update(tab.windowId,{focused:true});
+    if(kind==='manager')await chrome.tabs.update(tabId,{active:true});
+    const focused=await chrome.windows.get(tab.windowId);
+    if(focused?.focused!==true)
+      throw new Error('Browser declined real foreground focus; no prompt submitted');
+  }catch(error){
+    if(previousBrowserWindowWasFocused && previousBrowserWindowId!==tab.windowId)
+      await chrome.windows.update(previousBrowserWindowId,{focused:true}).catch(()=>{});
+    throw error;
+  }
+  extensionDiagnostic('info','worker.real_foreground_acquired',{tabId,
+    windowId:tab.windowId,previousBrowserWindowId});
+  let released=false;
+  return async()=>{
+    if(released)return;
+    released=true;
+    try {
+      // Never overwrite a user's later window/tab switch.
+      const current=await chrome.windows.get(tab.windowId);
+      if(current?.focused!==true)return;
+      const active=await chrome.tabs.query({active:true,windowId:tab.windowId});
+      if(active?.[0]?.id!==tabId)return;
+      if(previousBrowserWindowWasFocused && previousBrowserWindowId!==tab.windowId){
+        await chrome.windows.update(previousBrowserWindowId,{focused:true});
+      } else if(previousBrowserWindowId===tab.windowId && activeBefore?.[0]?.id!==tabId &&
+          Number.isSafeInteger(activeBefore?.[0]?.id)) {
+        await chrome.tabs.update(activeBefore[0].id,{active:true});
+      }
+      // The extension cannot restore focus to a non-browser application.
+      extensionDiagnostic('info','worker.real_foreground_released',{tabId,
+        restoredBrowserWindow:previousBrowserWindowWasFocused});
+    }catch(error){
+      extensionDiagnostic('warn','worker.real_foreground_restore_failed',{
+        tabId,errorType:error?.name||'Error'});
+    }
+  };
+}
 async function focusWorkerForStartup(tabId) {
   const tab = await chrome.tabs.get(tabId);
   if (!tab || !ownedWorker(tabId, workerOwners[tabId]))
@@ -1437,7 +1485,18 @@ async function focusWorkerForStartup(tabId) {
       console.warn('[chat-orch:background]',{step:'worker_focus_failed',tabId,attempt,
         transient,errorType:error?.name || 'Error',reason:transient?'TAB_EDIT_LOCK':
           /activated for page initialization/.test(String(error?.message))?'FOCUS_UNCONFIRMED':'OTHER'});
-      if (!transient || attempt === 5) throw error;
+      if (!transient || attempt === 5) {
+        // A tab can lose browser activation while the worker window is being
+        // rearranged. Only a verified managed ChatGPT focus shim can replace
+        // this optimization; never pretend an unknown tab is foregrounded.
+        if(siteOfUrl(tab.url)==='chatgpt' &&
+            await enableManagedAntiFreeze(tabId)){
+          extensionDiagnostic('info','worker.startup_virtual_focus_fallback',{
+            tabId,attempt});
+          return;
+        }
+        throw error;
+      }
       await sleep(300 * attempt);
     }
   }
@@ -1454,6 +1513,9 @@ async function startTask(tabId, site, text, waitSecs, cfg, autoClose = false, ow
     if (blockingTasks.length) {
       throw new Error('Worker has an outstanding task (running or uncertain); reconcile before reuse');
     }
+    const releaseForeground=site==='chatgpt'
+      ? await acquireForegroundSubmitLease(tabId) : null;
+    try {
     console.info('[chat-orch:background]', {step:'worker_focus', tabId, site});
     try {
       await focusWorkerForStartup(tabId);
@@ -1464,8 +1526,15 @@ async function startTask(tabId, site, text, waitSecs, cfg, autoClose = false, ow
       throw error;
     }
     console.info('[chat-orch:background]', {step:'worker_readiness', tabId, site});
+    // The early shim is installed on every supported ChatGPT document, but
+    // only this explicitly managed worker may enable it. Do not rely on the
+    // earlier fire-and-forget registration-side injection.
+    let focusEmulationReady=site==='chatgpt' &&
+      await enableManagedAntiFreeze(tabId);
+    extensionDiagnostic(focusEmulationReady?'info':'warn','worker.focus_emulation_checked',{
+      tabId,site,verified:focusEmulationReady});
     try {
-      await waitReady(tabId,text);
+      await waitReady(tabId,text,45000,focusEmulationReady);
       extensionDiagnostic('info','worker.readiness_complete',{tabId,site});
       await confirmTabIdle(tabId,text);
       extensionDiagnostic('info','worker.idle_confirmation_complete',{tabId,site});
@@ -1535,13 +1604,28 @@ async function startTask(tabId, site, text, waitSecs, cfg, autoClose = false, ow
     console.info('[chat-orch:background]', {step:'worker_dispatch', taskId, tabId, site});
 
     let ack;
+    let dispatchAttempted=false;
     try {
       // The content script now acknowledges only after it confirms that
       // the user message was submitted; response collection continues async.
       extensionDiagnostic('info','worker.content_dispatch_begin',{tabId,taskId,site});
       const dispatchTab=await chrome.tabs.get(tabId);
-      if(!dispatchTab?.active || !ownedWorker(tabId,owner))
-        throw new Error('Worker lost active tab focus before prompt submission; no dispatch attempted');
+      if(!ownedWorker(tabId,owner))
+        throw new Error('Worker ownership changed before prompt submission; no dispatch attempted');
+      // The user may activate another tab during page settling. Re-verify
+      // the shim on the CURRENT document; do not switch the user back.
+      if(site==='chatgpt')
+        focusEmulationReady=await enableManagedAntiFreeze(tabId);
+      if(!dispatchTab?.active && !focusEmulationReady)
+        throw new Error('Worker tab became inactive and focus emulation is unavailable; no dispatch attempted');
+      if(releaseForeground){
+        const foregroundWindow=await chrome.windows.get(dispatchTab.windowId);
+        if(!dispatchTab?.active || foregroundWindow?.focused!==true)
+          throw new Error('User switched away before foreground Send; no dispatch attempted');
+      }
+      extensionDiagnostic('info','worker.background_dispatch_authorized',{
+        tabId,active:dispatchTab?.active===true,focusEmulationReady});
+      dispatchAttempted=true;
       ack = await tabMessage(tabId, {cmd:'run_prompt',taskId,receiptNonce,
         text:dispatchText,timeoutMs:cfg.taskTimeoutMin * 60000});
       extensionDiagnostic('info','worker.content_dispatch_ack',{tabId,taskId,
@@ -1549,10 +1633,13 @@ async function startTask(tabId, site, text, waitSecs, cfg, autoClose = false, ow
     } catch (error) {
       console.warn('[chat-orch:background]', {step:'worker_dispatch_error', taskId, tabId,
         errorType:error?.name || 'Error'});
-      extensionDiagnostic('error','worker.content_dispatch_error',{tabId,taskId,reason:'NO_CONTENT_ACK'});
+      extensionDiagnostic('error','worker.content_dispatch_error',{tabId,taskId,
+        reason:dispatchAttempted?'NO_CONTENT_ACK':'DISPATCH_PRECHECK_REJECTED'});
       if (task.status === 'running') {
-        task.status = 'uncertain';
-        task.error = 'Prompt submission receipt lost; inspect this tab before retrying';
+        task.status = dispatchAttempted?'uncertain':'failed';
+        task.error = dispatchAttempted
+          ? 'Prompt submission receipt lost; inspect this tab before retrying'
+          : String(error?.message||'Dispatch precheck failed; no message sent');
         await saveState();
         (waiters[taskId] || []).forEach((resolve) => resolve());
         delete waiters[taskId];
@@ -1578,6 +1665,9 @@ async function startTask(tabId, site, text, waitSecs, cfg, autoClose = false, ow
         : {status:'failed',error:ack?.error || 'Tab refused the task before submission'});
     }
     return taskId;
+    } finally {
+      if(releaseForeground)await releaseForeground();
+    }
   });
   if (waitSecs > 0 && tasks[id]?.status === 'running') {
     await waitTask(id,Math.min(waitSecs,50)*1000);
@@ -2439,6 +2529,9 @@ async function handleCall(method, p = {}) {
         throw new Error('Untrusted Parent conversation URL');
       if (origin && siteOfUrl(managerTab.url)!=='chatgpt')
         throw new Error('Parent provider changed since original delegation');
+      const releaseForeground=siteOfUrl(managerTab.url)==='chatgpt'
+        ? await acquireForegroundSubmitLease(managerTabId,'manager') : null;
+      try {
       // D-056: when a result belongs to an earlier conversation, immediately
       // restore that conversation even if the currently displayed chat has an
       // unsent draft or is generating. The user explicitly accepted this
@@ -2470,6 +2563,11 @@ async function handleCall(method, p = {}) {
         const beforeSend=await chrome.tabs.get(managerTabId);
         if (origin && safeConversationRoute(beforeSend?.url)!==origin)
           throw new Error('Parent navigated away before FIFO delivery');
+        if(releaseForeground){
+          const focusedWindow=await chrome.windows.get(beforeSend.windowId);
+          if(!beforeSend.active || focusedWindow?.focused!==true)
+            throw new Error('Parent lost foreground focus before queue Send; no submission attempted');
+        }
         const response = await tabMessage(managerTabId, { cmd: 'submit_manager_batch', text: batchText });
         managerWakes[p.batch_id].status = response?.ok === true && response.submitted === true
           ? 'submitted' : 'uncertain';
@@ -2480,6 +2578,9 @@ async function handleCall(method, p = {}) {
         managerWakes[p.batch_id].status = 'uncertain';
         await saveState();
         return { batch_id: p.batch_id, submitted: false, uncertain: true };
+      }
+      } finally {
+        if(releaseForeground)await releaseForeground();
       }
     }
 

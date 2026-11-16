@@ -34,6 +34,7 @@ function harness() {
       get:async(id)=>tabs.get(id) || null,
       query:async(filter={})=>[...tabs.values()].filter((tab)=>
         (filter.windowId==null || tab.windowId===filter.windowId) &&
+        (filter.active==null || tab.active===filter.active) &&
         (filter.groupId==null || tab.groupId===filter.groupId)),
       create:async({windowId,url,active})=>{
         assert.equal(active,false);
@@ -97,7 +98,10 @@ function harness() {
     },
     alarms:{onAlarm:{addListener(){}},create(){}},
   };
+  // Real Chromium supplies WebSocket even when no bridge is connected. The
+  // managed-focus admission check now exercises managedAgentStatus().
   const ctx=createContext({chrome,crypto:webcrypto,TextEncoder,URL,console,
+    WebSocket:{OPEN:1},
     setTimeout,clearTimeout,setInterval,clearInterval});
   runInContext(source,ctx);
   const ready=runInContext('stateReady',ctx);
@@ -188,6 +192,92 @@ test('initial prompts are focused and submitted one at a time; completed handoff
   assert.notEqual(resultA.task_id,resultB.task_id);
   assert.deepEqual(h.events.startupSequence.filter(s=>s.startsWith('focus:')),
     ['focus:'+firstTab.id,'focus:'+secondTab.id]);
+});
+
+function optInForegroundFocus(h,focusedWindowId=2){
+  h.chrome.storage.local.get=async()=>({foregroundSubmitEnabled:true,
+    orchestratorTabId:101});
+  for(const browserWindow of h.windows.values())
+    browserWindow.focused=browserWindow.id===focusedWindowId;
+  h.chrome.windows.getLastFocused=async()=>[...h.windows.values()]
+    .find(browserWindow=>browserWindow.focused) || null;
+  h.chrome.windows.update=async(id,patch)=>{
+    const browserWindow=h.windows.get(id);
+    if(!browserWindow)throw Error('Browser window missing');
+    if(patch.focused===true){
+      for(const item of h.windows.values())item.focused=false;
+      browserWindow.focused=true;
+    }
+    h.events.startupSequence.push('windowFocus:'+id);
+    return browserWindow;
+  };
+}
+
+test('opt-in real foreground holds managed window until sent user-turn ACK, then restores prior browser window',async()=>{
+  const h=harness();await h.ready;
+  const tab=await h.create('https://chatgpt.com/',h.first,101);
+  h.register(tab);
+  optInForegroundFocus(h);
+  runInContext('waitReady=async()=>{};confirmTabIdle=async()=>{};'+
+    'issueManagedChildPairing=async()=>"11111111-1111-4111-8111-111111111111";'+
+    'proxySettings={connectorName:"PC1"};proxySettingsRevision=1;wsState="connected";',
+    h.ctx);
+  let finish;
+  h.chrome.tabs.sendMessage=async(_tabId,msg)=>new Promise(resolve=>{
+    assert.equal(msg.cmd,'run_prompt');
+    assert.equal(h.windows.get(tab.windowId).focused,true,
+      'real browser window stays focused through Send, not merely document.hasFocus()');
+    finish=resolve;
+  });
+  const started=runInContext('startTask',h.ctx)(tab.id,'chatgpt',
+    'Confirmed foreground delivery',0,{taskTimeoutMin:1},false,'credential:test');
+  for(let i=0;i<100&&!finish;i++)await new Promise(resolve=>setTimeout(resolve,10));
+  assert.ok(finish,'Send must be attempted with the browser window focused');
+  assert.equal(h.windows.get(2).focused,false);
+  finish({ok:true,submitted:true});
+  const result=await started;
+  assert.equal(result.submission_confirmed,true);
+  assert.equal(h.windows.get(2).focused,true,'restore the original focused browser window');
+  assert.equal(h.windows.get(tab.windowId).focused,false);
+  assert.deepEqual(h.events.startupSequence.filter(s=>s.startsWith('windowFocus:')),
+    ['windowFocus:'+tab.windowId,'windowFocus:2']);
+});
+
+test('foreground send fails without dispatch if browser cannot focus; no task becomes uncertain',async()=>{
+  const h=harness();await h.ready;
+  const tab=await h.create('https://chatgpt.com/',h.first,101);
+  h.register(tab);optInForegroundFocus(h);
+  h.chrome.windows.update=async(id,patch)=>{
+    if(id===tab.windowId)throw Error('Windows rejected focus');
+    return h.windows.get(id);
+  };
+  let sends=0;
+  h.chrome.tabs.sendMessage=async()=>{sends++;return {ok:true,submitted:true};};
+  await assert.rejects(runInContext('startTask',h.ctx)(tab.id,'chatgpt',
+    'Must not send',0,{taskTimeoutMin:1},false,'credential:test'),
+  /Windows rejected focus/);
+  assert.equal(sends,0);
+  assert.equal(h.windows.get(2).focused,true);
+  assert.equal(Object.keys(runInContext('tasks',h.ctx)).length,0);
+});
+
+test('foreground send fails before Send when the user switches to another window during readiness',async()=>{
+  const h=harness();await h.ready;
+  const tab=await h.create('https://chatgpt.com/',h.first,101);
+  h.register(tab);optInForegroundFocus(h);
+  runInContext('waitReady=async()=>{};'+
+    'confirmTabIdle=async()=>{await chrome.windows.update(2,{focused:true});};'+
+    'issueManagedChildPairing=async()=>"11111111-1111-4111-8111-111111111111";'+
+    'proxySettings={connectorName:"PC1"};proxySettingsRevision=1;wsState="connected";',
+    h.ctx);
+  let sends=0;
+  h.chrome.tabs.sendMessage=async()=>{sends++;return {ok:true,submitted:true};};
+  const result=await runInContext('startTask',h.ctx)(tab.id,'chatgpt',
+    'Do not interrupt',0,{taskTimeoutMin:1},false,'credential:test');
+  assert.equal(result.status,'failed');
+  assert.match(result.error,/User switched away before foreground Send/);
+  assert.equal(sends,0);
+  assert.equal(h.windows.get(2).focused,true);
 });
 
 test('a lost run_prompt callback never replays the potentially submitted prompt',async()=>{

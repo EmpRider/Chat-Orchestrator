@@ -23,6 +23,17 @@
   "content_scripts": [
     {
       "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*"
+      ],
+      "js": [
+        "managed-focus-main.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
         "https://chatgpt.com/*"
       ],
       "js": [

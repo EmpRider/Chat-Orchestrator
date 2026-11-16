@@ -16,7 +16,11 @@ async function refresh(fillFields = false) {
     $('info').textContent = 'Workers: ' + state.workers.length +
       ' · Running: ' + state.running +
       ' · Queue: ' + (state.coordinationMode || 'unknown');
-    if (fillFields) $('serverUrl').value = state.cfg.serverUrl;
+    if (fillFields) {
+      $('serverUrl').value = state.cfg.serverUrl;
+      const prefs=await chrome.storage.local.get('foregroundSubmitEnabled');
+      $('foregroundSubmit').checked=prefs?.foregroundSubmitEnabled===true;
+    }
     $('profileToken').placeholder=state.profileTokenConfigured
       ? 'Connection key saved for this profile (leave blank to keep it)'
       : 'Paste the desktop connection key';
@@ -64,6 +68,22 @@ $('save').addEventListener('click', async () => {
     button.disabled = false;
     button.textContent = 'Save and reconnect';
   }
+});
+// This is separate from connection/pairing: changing it never starts a send,
+// focuses a tab or changes agent identity.
+$('foregroundSubmit').addEventListener('change',async()=>{
+  const input=$('foregroundSubmit');
+  input.disabled=true;
+  try {
+    await chrome.storage.local.set({foregroundSubmitEnabled:input.checked===true});
+    $('next-step').textContent=input.checked
+      ? 'Foreground Send enabled for managed ChatGPT workers. The browser may briefly interrupt your other work.'
+      : 'Foreground Send disabled; browser windows will not be focused for prompt submission.';
+  } catch(error) {
+    const prefs=await chrome.storage.local.get('foregroundSubmitEnabled').catch(()=>({}));
+    input.checked=prefs.foregroundSubmitEnabled===true;
+    $('next-step').textContent='Unable to save foreground Send preference.';
+  } finally {input.disabled=false;}
 });
 $('pair').addEventListener('click', async () => {
   const button = $('pair');

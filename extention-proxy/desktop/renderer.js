@@ -6,6 +6,9 @@ let browserSelectionDirty = false;
 let connectorNameDirty = false;
 let showSavedTabHistory = false;
 let lastCoordinationSnapshot = null;
+// Recovery feedback survives the periodic snapshot render that recreates rows.
+const queueRecoveryFeedback = new Map();
+const queueRecoveryBusy = new Set();
 
 function notify(message, isError = false) {
   $('message').textContent = message;
@@ -212,45 +215,80 @@ function renderCoordinationSnapshot(snapshot) {
     label.textContent=`${item.type} · ${item.phase} · tab ${item.managerTabId} · ${item.eventId.slice(0,8)}`;
     line.append(label);
     const recipient=`${item.browserSessionId}:${item.managerTabId}:${item.principalId}`;
+    const recoveryKey=`${recipient}:${item.batchId||item.eventId}`;
     const terminal=['PROCESSED','SAGA_CONFIRMED','SKIPPED'].includes(item.phase);
     if(!terminal && !oldestByRecipient.has(recipient)){
       oldestByRecipient.add(recipient);
       if(item.batchId && ['LEASED','DISPATCHING','DELIVERED','UNCERTAIN','RETRYING'].includes(item.phase)){
+        const setFeedback=(message,isError=false)=>{
+          queueRecoveryFeedback.delete(recoveryKey);
+          queueRecoveryFeedback.set(recoveryKey,{message,isError});
+          if(queueRecoveryFeedback.size>100)
+            queueRecoveryFeedback.delete(queueRecoveryFeedback.keys().next().value);
+          notify(message,isError);
+          renderCoordinationSnapshot(lastCoordinationSnapshot);
+        };
+        const performRecovery=async(label,action)=>{
+          if(queueRecoveryBusy.has(recoveryKey))return;
+          queueRecoveryBusy.add(recoveryKey);
+          setFeedback(`${label}…`);
+          try {
+            await action();
+          } catch(error) {
+            setFeedback(`Recovery failed: ${error?.message||String(error)}`,true);
+          } finally {
+            queueRecoveryBusy.delete(recoveryKey);
+            renderCoordinationSnapshot(lastCoordinationSnapshot);
+          }
+        };
         const control=(title,callback)=>{
           const button=document.createElement('button');
           button.type='button';button.className='secondary';button.textContent=title;
-          button.addEventListener('click',()=>perform(callback));
+          button.disabled=queueRecoveryBusy.has(recoveryKey);
+          button.addEventListener('click',callback);
           line.append(button);
         };
         const operate=async(action,reason='')=>{
           const result=await window.bridge.recoverQueueBatch(item.managerTabId,
             item.browserSessionId,item.batchId,action,reason);
-          notify(result.draft_cleanup_required
+          setFeedback(result.draft_cleanup_required
             ? 'Batch skipped and journal retained, but browser draft cleanup needs manual inspection. Open tab and clear ONLY the old notification draft.'
             : result.ledger_synced===false && ['SKIPPED','DELIVERED'].includes(result.phase)
               ? 'Journal updated, but extension ledger did not synchronize. Recheck the manager tab before continuing.'
             : result.verified?'Sent user turn verified; awaiting agent review/ACK.'
             : result.phase==='SKIPPED'?'Batch skipped, original events retained in journal.'
             : result.phase==='DELIVERED'?'Batch submitted; awaiting agent review/ACK.'
-            : 'Submission not verified. Queue remains held; inspect draft or Skip.');
+            : result.matchingDraft===true
+              ? 'Exact unsent batch draft found. Retry exact draft or Skip batch.'
+              : 'No submitted user turn or matching draft verified. Queue remains held; inspect tab or Skip.');
         };
-        control('Open tab',async()=>{
+        control('Open tab',()=>performRecovery('Opening manager tab',async()=>{
           await window.bridge.focusQueueManager(item.managerTabId,item.browserSessionId);
-        });
-        control('Recheck',()=>operate('recheck'));
+          setFeedback('Manager tab focused. Check the original notification draft.');
+        }));
+        control('Recheck',()=>performRecovery('Checking for submitted batch',()=>operate('recheck')));
         if(item.phase!=='DELIVERED')
-          control('Retry exact draft',async()=>{
+          control('Retry exact draft',()=>{
             if(!window.confirm('Retry ONLY the matching unsent batch draft? An earlier Send may have succeeded. No new text will be inserted.'))return;
-            await operate('retry_draft');
+            return performRecovery('Checking exact draft before retry',()=>operate('retry_draft'));
           });
-        control('Skip batch',async()=>{
+        control('Skip batch',()=>{
           const reason=window.prompt('Reason for skipping this whole FIFO batch (minimum 10 characters):','');
           if(reason==null)return;
-          if(reason.trim().length<10)throw new Error('Provide at least 10 characters');
+          if(reason.trim().length<10){setFeedback('A skip reason must contain at least 10 characters.',true);return;}
           if(!window.confirm('Skip this batch without delivering it? Child reports remain in the journal for later review.'))return;
-          await operate('skip',reason.trim());
+          return performRecovery('Recording operator skip',()=>operate('skip',reason.trim()));
         });
       }
+    }
+    const feedback=queueRecoveryFeedback.get(recoveryKey);
+    if(feedback){
+      const status=document.createElement('span');
+      status.className='queue-recovery-feedback';
+      status.setAttribute('role','status');
+      status.style.color=feedback.isError?'#ff98a8':'#a4a4af';
+      status.textContent=feedback.message;
+      line.append(status);
     }
     queue.append(line);
   }

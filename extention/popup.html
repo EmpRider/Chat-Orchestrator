@@ -50,6 +50,13 @@
     <p class="hint">Use Copy profile connection key in Desktop Connections. This key is saved only in this browser profile; never paste it into a chat.</p>
     <button id="save" type="button">Save and reconnect</button>
     <div class="divider"></div>
+    <label for="foregroundSubmit" style="display:flex;align-items:flex-start;gap:9px">
+      <input id="foregroundSubmit" type="checkbox"
+        style="width:16px;height:16px;margin:2px 0 0;flex-shrink:0" />
+      Temporarily focus the managed worker browser window while sending a prompt
+    </label>
+    <p class="hint">Off by default. Enable only if background ChatGPT tabs stop rendering or Send does nothing. The worker browser may come to the front until Send is verified. Previously focused browser windows are restored when safe, but focus cannot be returned automatically to unrelated desktop applications.</p>
+    <div class="divider"></div>
     <strong>Enable this ChatGPT tab</strong>
     <p class="hint">Only approve a Parent tab you trust. Managed Children pair without becoming new Parents.</p>
     <button id="pair" type="button">Yes — Approve Parent / Pair Child</button>

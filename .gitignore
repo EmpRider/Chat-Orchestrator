@@ -4,6 +4,12 @@ test-output/
 *.log
 *.tmp
 
+# Generated tool indexes, browser snapshots, and one-off repair scripts
+.playwright-mcp/
+**/.codegraph/
+tmp-audit/
+patch-*.cjs
+
 # Authentication and machine-specific settings
 .token
 **/.token

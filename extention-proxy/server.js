@@ -3571,9 +3571,15 @@ export async function desktopAction({action, tab_id, browser_session_id, confirm
       principal.callerTabId===tab_id && principal.browserSessionId===browser_session_id);
     if(manager.length!==1)throw new Error('Paired manager in this browser session is unavailable');
     const principal=registeredPrivateManager(manager[0]);
-    const observation=await callExtension('manager_state',{
-      __trustedPrincipal:principal,__sessionBrowserId:principal.browserSessionId},15000);
-    rememberPrivateManagerReadiness(principal,observation);
+    // An explicit operator Skip is a durable journal decision, not a browser
+    // submission. The original tab may have closed or navigated away; requiring
+    // manager_state here would make the FIFO impossible to recover. All other
+    // actions still require live, incarnation-matched browser attestation.
+    if(action!=='recover_queue_batch'||choice!=='skip'){
+      const observation=await callExtension('manager_state',{
+        __trustedPrincipal:principal,__sessionBrowserId:principal.browserSessionId},15000);
+      rememberPrivateManagerReadiness(principal,observation);
+    }
     if(action==='focus_queue_manager')
       return callExtension('focus_manager_tab',{
         __trustedPrincipal:principal,__sessionBrowserId:principal.browserSessionId},15000);

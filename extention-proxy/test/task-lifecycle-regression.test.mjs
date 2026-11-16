@@ -1359,7 +1359,7 @@ test('D-007/D-052 managed status and anti-freeze are scoped to approved ChatGPT 
   const injected=[];
   h.ctx.chrome.scripting={executeScript:async(options)=>{
     injected.push(options);
-    return [{result:undefined}];
+    return [{result:options.func?true:undefined}];
   }};
   const noConsent=await h.evalCode('enableManagedAntiFreeze')(101);
   assert.equal(noConsent,false);
@@ -1376,14 +1376,81 @@ test('D-007/D-052 managed status and anti-freeze are scoped to approved ChatGPT 
   assert.equal(h.evalCode('managedAgentStatus(201).role'),'child');
   assert.equal(await h.evalCode('enableManagedAntiFreeze')(101),true);
   assert.equal(await h.evalCode('enableManagedAntiFreeze')(201),true);
-  assert.equal(injected.length,2);
+  assert.equal(injected.length,4);
+  for(let i=0;i<injected.length;i+=2){
+    assert.deepEqual(Array.from(injected[i].files),['managed-focus-main.js']);
+    assert.equal(typeof injected[i+1].func,'function');
+  }
   for(const opts of injected) {
     assert.equal(opts.world,'MAIN');
     assert.equal(opts.target.allFrames,false);
-    assert.equal(typeof opts.func,'function');
-    assert.doesNotMatch(opts.func.toString(),/agentCredential|pairingProof|profileToken/);
+    if(opts.func)
+      assert.doesNotMatch(opts.func.toString(),/agentCredential|pairingProof|profileToken/);
   }
   h.mockTabs.get(201).url='https://example.org/not-managed';
   assert.equal(await h.evalCode('enableManagedAntiFreeze')(201),false);
-  assert.equal(injected.length,2);
+  assert.equal(injected.length,4);
+  // Executing injection isn't proof that the target document accepted it.
+  h.ctx.chrome.scripting.executeScript=async(options)=>{
+    injected.push(options);
+    return [{result:undefined}];
+  };
+  assert.equal(await h.evalCode('enableManagedAntiFreeze')(101),false);
+  assert.equal(injected.length,6);
+});
+
+test('a worker that loses real tab focus can submit when its managed focus shim is verified',async()=>{
+  const h=setup();await h.ready;
+  h.evalCode(`
+    workers=[201];workerOwners={201:'legacy'};workerIncarnations={201:'worker-inc'};
+    __submitted=[];__readinessShim=null;
+    focusWorkerForStartup=async()=>{};
+    enableManagedAntiFreeze=async()=>true;
+    waitReady=async(tabId,text,timeout,shim)=>{__readinessShim=shim;};
+    confirmTabIdle=async()=>{};
+    tabMessage=async(tabId,msg)=>{__submitted.push(msg);return {ok:true,submitted:true};};
+  `);
+  h.mockTabs.get(201).active=false;
+  const task=await h.evalCode('startTask')(201,'chatgpt','Background task',0,
+    {taskTimeoutMin:1},false,'legacy');
+  assert.equal(task.status,'running');
+  assert.equal(h.evalCode('__readinessShim'),true);
+  assert.equal(h.evalCode('__submitted.length'),1);
+  assert.equal(h.evalCode('__submitted[0].cmd'),'run_prompt');
+});
+
+test('without verified shim, unfocused worker refuses submission before any side effect',async()=>{
+  const h=setup();await h.ready;
+  h.evalCode(`
+    workers=[201];workerOwners={201:'legacy'};workerIncarnations={201:'worker-inc'};
+    __submitted=[];__readinessShim=null;
+    focusWorkerForStartup=async()=>{};
+    enableManagedAntiFreeze=async()=>false;
+    waitReady=async(tabId,text,timeout,shim)=>{__readinessShim=shim;};
+    confirmTabIdle=async()=>{};
+    tabMessage=async(tabId,msg)=>{__submitted.push(msg);return {ok:true,submitted:true};};
+  `);
+  h.mockTabs.get(201).active=false;
+  const task=await h.evalCode('startTask')(201,'chatgpt','Cannot send',0,
+    {taskTimeoutMin:1},false,'legacy');
+  assert.equal(task.status,'failed');
+  assert.match(task.error,/focus emulation is unavailable/);
+  assert.equal(h.evalCode('__readinessShim'),false);
+  assert.equal(h.evalCode('__submitted.length'),0);
+});
+
+test('startup activation failure uses verified virtual focus only for managed worker',async()=>{
+  for(const shimAvailable of [true,false]){
+    const h=setup();await h.ready;
+    h.evalCode(`
+      workers=[201];workerOwners={201:'legacy'};
+      workerIncarnations={201:'worker-inc'};
+      enableManagedAntiFreeze=async()=>${shimAvailable};
+    `);
+    h.ctx.chrome.tabs.update=async()=>{throw new Error('Tab was unfocused');};
+    if(shimAvailable)
+      await h.evalCode('focusWorkerForStartup')(201);
+    else
+      await assert.rejects(h.evalCode('focusWorkerForStartup')(201),/Tab was unfocused/);
+  }
 });
