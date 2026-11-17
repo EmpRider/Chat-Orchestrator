@@ -1394,9 +1394,11 @@ async function confirmTabIdle(tabId, expectedText = null) {
   }
 }
 
-// Only one worker may be foregrounded and receive its initial prompt at a
-// time. Chat pages can defer initialization in background Edge tabs. Release
-// this gate once the user turn is confirmed; model responses run concurrently.
+// One FIFO for ALL focus-sensitive browser actions, not just worker startup.
+// A Child completion wake may foreground its Parent while another worker is
+// still submitting; that focus theft can cancel the worker Send. Hold this
+// gate through each verified user-turn receipt (or uncertain outcome), then
+// release it without waiting for the model reply. Read-only calls stay outside.
 let promptStartupTail = Promise.resolve();
 function serializePromptStartup(operation) {
   const next = promptStartupTail.then(operation);
@@ -2429,6 +2431,7 @@ async function handleCall(method, p = {}) {
         incarnation_id: workerIncarnations[manager] || managerIncarnations[manager] };
     }
     case 'focus_manager_tab': {
+      return serializePromptStartup(async()=>{
       if(p.__trustedPrincipal?.mode!=='profile')throw new Error('Paired manager required');
       const tabId=await callerManagerTab(p,await getConfig());
       const tab=await chrome.tabs.get(tabId);
@@ -2436,10 +2439,12 @@ async function handleCall(method, p = {}) {
       if(Number.isSafeInteger(tab.windowId))
         await chrome.windows.update(tab.windowId,{focused:true});
       return {focused:true,tab_id:tabId};
+      });
     }
     case 'inspect_manager_batch':
     case 'retry_manager_batch':
     case 'clear_skipped_manager_batch': {
+      const recovery=async()=>{
       if(p.__trustedPrincipal?.mode!=='profile')throw new Error('Paired manager required');
       if(!/^[0-9a-f-]{36}$/i.test(p.batch_id||'') ||
          typeof p.prompt_text!=='string' || p.prompt_text.length>60000 ||
@@ -2471,6 +2476,11 @@ async function handleCall(method, p = {}) {
         }
       }
       return result;
+      };
+      // Inspect is read-only and must remain available for reconciliation
+      // even while a Send is in progress. Retry/clear can change the composer.
+      return method==='inspect_manager_batch' ? recovery() :
+        serializePromptStartup(recovery);
     }
     case 'resolve_manager_recovery': {
       if(p.__trustedPrincipal?.mode!=='profile')throw new Error('Paired manager required');
@@ -2493,6 +2503,7 @@ async function handleCall(method, p = {}) {
       return {recorded:true};
     }
     case 'wake_manager': {
+      return serializePromptStartup(async()=>{
       if (p.__trustedPrincipal?.mode !== 'profile') throw new Error('Configured profile manager required');
       const cfg = await guard();
       const managerTabId = await callerManagerTab(p, cfg);
@@ -2582,6 +2593,7 @@ async function handleCall(method, p = {}) {
       } finally {
         if(releaseForeground)await releaseForeground();
       }
+      });
     }
 
     case 'manager_processed': {

@@ -84,6 +84,24 @@ a new user turn → return `submission_confirmed: true`. The next spawn
 starts only after that successful submission handoff, not after the Child
 finishes its model response; independent models can generate in parallel.
 
+The Extension also uses the **same focus-sensitive FIFO** for Child/Grandchild
+prompt submissions, direct-Parent completion notification delivery
+(`wake_manager`), manual Parent-tab focusing, and notification retry/clear
+actions. A new action must not switch tabs or windows while an earlier action
+is still awaiting its Send receipt. This preserves the existing opt-in
+temporary foreground-focus behavior; it does **not** serialize the model's
+subsequent response generation. Read-only inspection is not blocked by the
+focus queue, and queue admission is not proof of message submission.
+
+For Parent completion notifications specifically, the content script activates
+the enabled composer **Send button once**, rather than invoking the surrounding
+form's `requestSubmit()` (which some ChatGPT composer versions ignore and leave
+as an unsent draft). A verified submitted user turn remains required before
+reporting delivery. If the existing batch is already `UNCERTAIN`, use Desktop
+Queue Recovery **Recheck** to inspect the original Parent user turn and draft;
+only use **Retry exact draft** after confirming it was not submitted. Never
+auto-replay an uncertain message or treat a blue Send arrow as a delivery ACK.
+
 Merely inserting a draft, enabling Send, receiving an Extension reply,
 or observing a model loading spinner does **not** confirm submission.
 ChatGPT may normalize editor newlines to spaces; only the exact,

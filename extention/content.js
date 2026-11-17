@@ -459,10 +459,13 @@
   // button.click() for a Send control whose HTML type is "submit". Use one
   // submission method only: never retry by clicking after requestSubmit(),
   // since the first attempt may already have created a chat turn.
-  function activateSendOnce(button,composer,taskId) {
+  function activateSendOnce(button,composer,taskId,preferButtonClick=false) {
     const form=button?.form || composer?.closest?.('form') || null;
     const type=String(button?.type || button?.getAttribute?.('type') || '').toLowerCase();
-    if(site==='chatgpt' && form && type==='submit' &&
+    // Queue notifications use the enabled Send control's click path: on some
+    // ChatGPT builds the form ignores requestSubmit and strands the draft.
+    // Choose exactly one activation path; never replay after a possible send.
+    if(!preferButtonClick && site==='chatgpt' && form && type==='submit' &&
         typeof form.requestSubmit==='function' &&
         (!button.form || button.form===form)) {
       logStep(taskId,'send_activation',{method:'form_request_submit',formPresent:true});
@@ -622,7 +625,7 @@
   // Submit only once through the provider's enabled Send control. Prefer
   // native form submission for a real submit button, otherwise click. Never
   // retry a side effect automatically if delivery cannot be confirmed.
-  async function sendPrompt(text, taskId) {
+  async function sendPrompt(text, taskId, preferButtonClick=false) {
     let submitAttempted = false;
     let insertedByUs = false;
     let stage = 'composer_wait';
@@ -857,7 +860,7 @@
     submitAttempted = true;
     logStep(taskId,'send_click_begin',{userTurnsBefore:userBefore,
       testId:button.getAttribute('data-testid'),ariaLabel:button.getAttribute('aria-label')});
-    try { activateSendOnce(button,input,taskId); }
+    try { activateSendOnce(button,input,taskId,preferButtonClick); }
     catch(error) {
       logStep(taskId,'send_click_error',{errorType:error?.name || 'Error'});
       throw error;
@@ -1424,7 +1427,7 @@
     }
     busy = true;
     try {
-      await sendPrompt(text, batchMarker);
+      await sendPrompt(text, batchMarker, true);
       if (!(await waitFor(markerVisible, 12000, 250))) {
         throw new Error('Manager batch not visible after UI submission');
       }
@@ -1509,7 +1512,7 @@
         evidence.matchingDraft?'NOT_READY':'EXACT_DRAFT_REQUIRED'};
     busy=true;
     try {
-      await sendPrompt(text,marker);
+      await sendPrompt(text,marker,true);
       const verified=userTurnHasMarker(marker) && !chatgptAccountChanged();
       if(verified)completionReceiptUncertain=false;
       return {ok:verified,submitted:verified,uncertain:!verified};

@@ -213,6 +213,117 @@ function optInForegroundFocus(h,focusedWindowId=2){
   };
 }
 
+function completionWake(h){
+  runInContext('approvedParents[101]="'+ROOT_A+'";'+
+    'guard=async()=>({});confirmTabIdle=async()=>{};'+
+    'waitReady=async()=>{};'+
+    'issueManagedChildPairing=async()=>"11111111-1111-4111-8111-111111111111";'+
+    'proxySettings={connectorName:"PC1"};proxySettingsRevision=1;wsState="connected";',h.ctx);
+  return {__trustedPrincipal:{mode:'profile',browserSessionId:SESSION,
+    credentialId:'dddddddd-dddd-4ddd-8ddd-dddddddddddd',callerTabId:101,
+    sessionIncarnationId:ROOT_A},
+    batch_id:'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
+    events:[{event_id:'ffffffff-ffff-4fff-8fff-ffffffffffff',
+      type:'CHILD_RESULT',summary:'Child finished',recorded_at:new Date().toISOString()}],
+    prompt_text:'<system_instructions>Completion</system_instructions>\n'+
+      '<queue_batch id="eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee">Result</queue_batch>'};
+}
+
+async function untilStarted(check){
+  for(let i=0;i<100;i++){
+    if(check())return;
+    await new Promise(resolve=>setTimeout(resolve,10));
+  }
+  throw Error('Queued browser action did not start');
+}
+
+test('Child completion notification cannot take focus from an unfinished worker Send',async()=>{
+  const h=harness();await h.ready;
+  const tab=await h.create('https://chatgpt.com/',h.first,101);
+  h.register(tab);optInForegroundFocus(h);
+  const wake=completionWake(h);
+  const calls=[];
+  let workerAck,managerAck;
+  h.chrome.tabs.sendMessage=async(tabId,msg)=>new Promise(resolve=>{
+    calls.push({tabId,cmd:msg.cmd});
+    if(msg.cmd==='run_prompt')workerAck=resolve;
+    else if(msg.cmd==='submit_manager_batch')managerAck=resolve;
+    else throw Error('Unexpected browser message '+msg.cmd);
+  });
+  const worker=runInContext('startTask',h.ctx)(tab.id,'chatgpt','First worker',0,
+    {taskTimeoutMin:1},false,'credential:test');
+  await untilStarted(()=>Boolean(workerAck));
+  const notification=runInContext('handleCall',h.ctx)('wake_manager',wake);
+  await new Promise(resolve=>setTimeout(resolve,30));
+  assert.equal(managerAck,undefined,'completion must wait for the worker receipt');
+  assert.equal(h.windows.get(tab.windowId).focused,true,'worker retains its real focus');
+  workerAck({ok:true,submitted:true});
+  assert.equal((await worker).submission_confirmed,true);
+  await untilStarted(()=>Boolean(managerAck));
+  assert.deepEqual(calls.map(c=>c.cmd),['run_prompt','submit_manager_batch']);
+  assert.equal(h.windows.get(1).focused,true,'Parent gets focus only after worker Send');
+  managerAck({ok:true,submitted:true});
+  assert.equal((await notification).submitted,true);
+  assert.equal(h.windows.get(2).focused,true,'original browser focus restored');
+});
+
+test('worker startup waits for a pending Parent completion notification Send',async()=>{
+  const h=harness();await h.ready;
+  const tab=await h.create('https://chatgpt.com/',h.first,101);
+  h.register(tab);optInForegroundFocus(h);
+  const wake=completionWake(h);
+  const calls=[];
+  let workerAck,managerAck;
+  h.chrome.tabs.sendMessage=async(_tabId,msg)=>new Promise(resolve=>{
+    calls.push(msg.cmd);
+    if(msg.cmd==='run_prompt')workerAck=resolve;
+    else if(msg.cmd==='submit_manager_batch')managerAck=resolve;
+    else throw Error('Unexpected browser message '+msg.cmd);
+  });
+  const notification=runInContext('handleCall',h.ctx)('wake_manager',wake);
+  await untilStarted(()=>Boolean(managerAck));
+  const worker=runInContext('startTask',h.ctx)(tab.id,'chatgpt','Second worker',0,
+    {taskTimeoutMin:1},false,'credential:test');
+  await new Promise(resolve=>setTimeout(resolve,30));
+  assert.equal(workerAck,undefined,'worker must not steal the Parent notification focus');
+  assert.equal(h.windows.get(1).focused,true);
+  managerAck({ok:true,submitted:true});
+  assert.equal((await notification).submitted,true);
+  await untilStarted(()=>Boolean(workerAck));
+  assert.deepEqual(calls,['submit_manager_batch','run_prompt']);
+  assert.equal(h.windows.get(tab.windowId).focused,true);
+  workerAck({ok:true,submitted:true});
+  assert.equal((await worker).submission_confirmed,true);
+  assert.equal(h.windows.get(2).focused,true);
+});
+
+test('manual Parent focus and retry are FIFO behind an unfinished worker Send',async()=>{
+  const h=harness();await h.ready;
+  const tab=await h.create('https://chatgpt.com/',h.first,101);
+  h.register(tab);optInForegroundFocus(h);
+  const wake=completionWake(h);
+  let workerAck,retried=0;
+  h.chrome.tabs.sendMessage=async(_tabId,msg)=>{
+    if(msg.cmd==='run_prompt')return new Promise(resolve=>{workerAck=resolve;});
+    if(msg.cmd==='retry_manager_draft'){retried++;return {ok:true,submitted:true};}
+    throw Error('Unexpected browser message '+msg.cmd);
+  };
+  const worker=runInContext('startTask',h.ctx)(tab.id,'chatgpt','Worker prompt',0,
+    {taskTimeoutMin:1},false,'credential:test');
+  await untilStarted(()=>Boolean(workerAck));
+  const handleCall=runInContext('handleCall',h.ctx);
+  const focus=handleCall('focus_manager_tab',wake);
+  const retry=handleCall('retry_manager_batch',wake);
+  await new Promise(resolve=>setTimeout(resolve,30));
+  assert.equal(h.windows.get(tab.windowId).focused,true);
+  assert.equal(retried,0,'manual Retry cannot interrupt worker submission');
+  workerAck({ok:true,submitted:true});
+  assert.equal((await worker).submission_confirmed,true);
+  assert.equal((await focus).focused,true);
+  assert.equal((await retry).submitted,true);
+  assert.equal(retried,1,'Retry is delivered exactly once after the worker Send');
+});
+
 test('opt-in real foreground holds managed window until sent user-turn ACK, then restores prior browser window',async()=>{
   const h=harness();await h.ready;
   const tab=await h.create('https://chatgpt.com/',h.first,101);

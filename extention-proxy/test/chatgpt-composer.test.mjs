@@ -8,6 +8,7 @@ const source=readFileSync(new URL('../../extention/content.js',import.meta.url),
 
 function composerHarness({textarea,extraEnabledButton,neverEnableSend=false,
   networkBusyAfterInput=false,nativeSubmitButton=false,syntheticClickIgnored=false,
+  nativeSubmitIgnored=false,
   driftAfterInsert=null,renderedUserText=null,userTurnWrapperOnly=false,
   copyUserText=null,hideNewUserTurn=false,existingUserTurn=false,
   routeAfterSubmit=false,generatingAfterSubmit=false,existingConversation=false,
@@ -96,7 +97,7 @@ function composerHarness({textarea,extraEnabledButton,neverEnableSend=false,
     requestSubmit(button){
       assert.equal(button,primary);
       nativeSubmissions++;
-      markSubmitted();
+      if(!nativeSubmitIgnored)markSubmitted();
     },
   };
   const document={
@@ -422,6 +423,42 @@ test('prompt still sends when a background fetch starts after the draft is inser
   assert.equal(resultState.draft,'');
   assert.equal(resultState.networkChecks,1,
     'CDP readiness must not be required again after the page accepts the draft');
+});
+
+test('completion notification clicks the enabled Send arrow when requestSubmit would strand the draft', {
+  timeout:10000,
+},async()=>{
+  const h=composerHarness({textarea:false,extraEnabledButton:false,
+    nativeSubmitButton:true,nativeSubmitIgnored:true});
+  const text=batch();
+  const outcome=await h.call(text);
+  assert.equal(outcome.submitted,true,JSON.stringify(outcome));
+  assert.equal(h.info().primaryClicks,1,'notification must activate the Send control once');
+  assert.equal(h.info().nativeSubmissions,0,
+    'an ignored form requestSubmit must not strand a queue notification');
+  assert.equal(h.info().submitted,text);
+  assert.equal(h.info().draft,'');
+  assert.equal(h.diagnostics().find((event)=>event.step==='send_activation')?.method,
+    'button_click');
+});
+
+test('explicit retry of a retained completion batch activates Send once, never requestSubmit', {
+  timeout:10000,
+},async()=>{
+  const h=composerHarness({textarea:false,extraEnabledButton:false,
+    nativeSubmitButton:true,nativeSubmitIgnored:true});
+  const text=batch();
+  const batchId=JSON.parse(text.match(/<queue_batch>(.*?)<\/queue_batch>/)[1]).batch_id;
+  h.setDraft(text);
+  h.markQueueUncertain();
+  const result=await h.command('retry_manager_draft',{batchId,text});
+  assert.equal(result.submitted,true,JSON.stringify(result));
+  assert.equal(h.info().nativeSubmissions,0);
+  assert.equal(h.info().primaryClicks,1);
+  assert.equal(h.info().draft,'');
+  const duplicate=await h.command('retry_manager_draft',{batchId,text});
+  assert.notEqual(duplicate.submitted,true,'sent batch must never be retried');
+  assert.equal(h.info().primaryClicks,1);
 });
 
 test('Parent setup uses native ChatGPT form submission when isolated-world button.click would be ignored', {
