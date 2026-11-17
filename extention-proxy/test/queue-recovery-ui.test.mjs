@@ -86,3 +86,66 @@ test('queue actions expose persistent per-row results and errors across polling 
   assert.equal(calls.every(call=>call.tab===101&&call.session===browserSessionId&&
     call.batch===batchId),true,'buttons use exact original recipient and batch');
 });
+
+test('D-044 manual status UI displays evidence and descendants, serializes clicks and preserves waiting state',async()=>{
+  const elements=new Map();
+  const element=(id)=>{
+    if(!elements.has(id))elements.set(id,makeNode());
+    return elements.get(id);
+  };
+  const taskId=randomUUID(),browserSessionId=randomUUID(),childTaskId=randomUUID();
+  const alert={
+    task_id:taskId,tab_id:201,browser_session_id:browserSessionId,
+    status:'running',completion_evidence:'UNKNOWN',manual_required:true,
+    check_count:4,last_observation:{state:'IDLE_RESPONSE_UNVERIFIED',evidence:'NONE'},
+    pending_descendants:true,pending_descendant_tasks:[
+      {tab_id:301,task_id:childTaskId,status:'running',parent_reviewed:false}],
+  };
+  const snapshot={storageReady:true,phases:{},seats:[],tabHierarchy:[],
+    queue:[],toolCalls:[],completionAlerts:[alert]};
+  const state={phase:'running',ngrokPhase:'stopped',ngrokAuthConfigured:false,
+    error:'',ngrokError:'',extensionConnected:true,domain:'',
+    publicPath:'/mcp',port:8787,profile:'default',coordinationSnapshot:snapshot};
+  let listener,release;
+  const calls=[];
+  const bridge={
+    onState(cb){listener=cb;},status:async()=>state,
+    setCompletionStatus:(task,status,session)=>{
+      calls.push({task,status,session});
+      return new Promise(resolve=>{release=resolve;});
+    },
+  };
+  const document={getElementById:element,createElement:makeNode};
+  const window={bridge,addEventListener(){}};
+  const source=readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)),
+    '..','desktop','renderer.js'),'utf8');
+  runInNewContext(source,{document,window,Map,Set});
+  await new Promise(resolve=>setImmediate(resolve));
+  const row=()=>element('completion-alerts').children[0];
+  const item=(name)=>row().children.find(el=>el.textContent===name);
+  assert.match(row().children[0].textContent,/IDLE_RESPONSE_UNVERIFIED/);
+  assert.match(row().children[1].textContent,/tab 301/);
+  assert.match(row().children[1].textContent,new RegExp(childTaskId));
+  const first=item('Completed').dispatch('click');
+  assert.equal(calls.length,1);
+  assert.equal(calls[0].task,taskId);
+  assert.equal(calls[0].session,browserSessionId);
+  assert.equal(item('In Progress').disabled,true);
+  await item('In Progress').dispatch('click');
+  assert.equal(calls.length,1,'no second decision during an unresolved request');
+  release({task_id:taskId,status:'waiting_for_children',pending_descendants:true});
+  await first;
+  assert.match(element('message').textContent,/waiting for descendant review/i);
+  listener({...state,coordinationSnapshot:{...snapshot,completionAlerts:[
+    {...alert,status:'waiting_for_children',completion_evidence:'USER_CONFIRMED',
+      manual_required:false}]}});
+  assert.equal(item('Completed'),undefined,'a deferred task cannot be confirmed twice');
+  assert.equal(item('In Progress'),undefined);
+  assert.match(row().children[0].textContent,/USER_CONFIRMED/);
+  listener({...state,coordinationSnapshot:{...snapshot,completionAlerts:[
+    {...alert,status:'done',completion_evidence:'USER_CONFIRMED',
+      manual_required:false,pending_descendants:false,
+      pending_descendant_tasks:[],notification_pending:true}]}});
+  assert.match(row().children[0].textContent,/Parent FIFO journal receipt NOT confirmed/);
+  assert.equal(item('Completed'),undefined,'journal reconciliation must never re-run a completion choice');
+});

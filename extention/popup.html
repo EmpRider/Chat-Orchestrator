@@ -20,8 +20,8 @@
     #next-step { margin: 9px 0 18px; color: #bdd2ed; }
     .divider { border-top: 1px solid #2b384b; margin: 16px 0; }
     label { display: block; color: #d0dceb; margin: 13px 0 5px; font-weight: 650; }
-    input { width: 100%; height: 39px; padding: 9px 11px; background: #0f1926; color: #f0f5fb; border: 1px solid #425169; border-radius: 8px; outline: none; font: 12px "Segoe UI", sans-serif; }
-    input:focus-visible { border-color: #91b7fd; box-shadow: 0 0 0 2px #547cac44; }
+    input, select { width: 100%; height: 39px; padding: 9px 11px; background: #0f1926; color: #f0f5fb; border: 1px solid #425169; border-radius: 8px; outline: none; font: 12px "Segoe UI", sans-serif; }
+    input:focus-visible, select:focus-visible { border-color: #91b7fd; box-shadow: 0 0 0 2px #547cac44; }
     input::placeholder { color: #798ba3; }
     button { width: 100%; margin-top: 17px; padding: 10px 12px; border-radius: 8px; background: #487fd6; border: 1px solid #6397e9; color: #fff; font-weight: 700; cursor: pointer; }
     button:hover:not(:disabled) { background: #5b91e9; }
@@ -55,7 +55,24 @@
         style="width:16px;height:16px;margin:2px 0 0;flex-shrink:0" />
       Temporarily focus the managed worker browser window while sending a prompt
     </label>
-    <p class="hint">Off by default. Enable only if background ChatGPT tabs stop rendering or Send does nothing. The worker browser may come to the front until Send is verified. Previously focused browser windows are restored when safe, but focus cannot be returned automatically to unrelated desktop applications.</p>
+    <p class="hint">Off by default. This option applies to managed worker startup and explicit Parent setup, NOT automatic FIFO notifications. Automatic Parent notifications stay in the background and do not steal OS window focus. Enabling this option can still bring the worker browser to the front while its Send is verified.</p>
+    <p class="hint">When enabled, a minimized managed window is temporarily restored for Send and minimized again only if you have not changed its focus or active tab.</p>
+    <div class="divider"></div>
+    <strong>Optional ChatGPT model for managed agents</strong>
+    <label for="chatgptModelLabel">Exact visible model name (blank = leave unchanged)</label>
+    <input id="chatgptModelLabel" type="text" maxlength="80" spellcheck="false"
+      placeholder="e.g. GPT-6" />
+    <label for="chatgptReasoningEffort">Thinking effort</label>
+    <select id="chatgptReasoningEffort">
+      <option value="">Leave unchanged</option>
+      <option value="Instant">Instant</option>
+      <option value="Medium">Medium</option>
+      <option value="High">High</option>
+      <option value="Extra High">Extra High</option>
+      <option value="Pro">Pro (if available)</option>
+    </select>
+    <button id="saveModelPreferences" type="button">Save optional model preferences</button>
+    <p class="hint">Off by default. A configured model/effort must be verified in ChatGPT's picker before Send. Unsupported UI/settings block Send without changing the draft.</p>
     <div class="divider"></div>
     <strong>Enable this ChatGPT tab</strong>
     <p class="hint">Only approve a Parent tab you trust. Managed Children pair without becoming new Parents.</p>

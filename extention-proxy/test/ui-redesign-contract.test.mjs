@@ -123,7 +123,12 @@ test('root recovery is exclusively a confirmed trusted Desktop workflow', () => 
   assert.match(renderer,/offer\.browserSessionId/);
   assert.match(main,/requireTrustedWindow\(event\)/);
   assert.match(main,/confirmation_nonce:nonce,browser_session_id:browserSessionId/);
-  assert.match(server,/await desktopAction\(event\.data\)/);
+  assert.match(server,/if\(await handleDesktopExtensionActionPacket\(event\?\.data,process\.parentPort\)\)return;/,
+    'utility IPC must route every desktop action through the shared checked packet handler');
+  assert.match(server,/if\(!isSupportedDesktopExtensionAction\(packet\.action\)\)/,
+    'untrusted or unsupported utility actions must not reach a privileged dispatcher');
+  assert.match(server,/const result=await dispatch\(packet\)/,
+    'the trusted desktop handler must execute an authorized action and return its response');
   assert.match(server,/action === 'confirm_root_repair'\) return reconcileRootFromDesktop\(tab_id,confirmation_nonce,browser_session_id\)/);
   assert.match(server,/rootRepairOffers\.delete\(repairKey\)/);
   assert.match(server,/privateJournal\?\.unresolvedForTab\(tabId,browserSessionId\)/);

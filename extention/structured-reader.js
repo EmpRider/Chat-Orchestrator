@@ -84,6 +84,27 @@
     return makeResult(normalized.conversation, site, lastN, opts);
   }
 
+  // Internal, authenticated evidence for the submit/response lifecycle.
+  // Never infer acceptance from a cleared editor or page-wide text. Counts
+  // are taken from one conversation and compared with a PRE-Send baseline.
+  // Tokens and raw responses never cross the extension boundary.
+  async function snapshotChatgptTurns() {
+    const api=ns.chatgptApi;
+    const id=api?.parseConvIdFromUrl(location.href);
+    if (!id) throw new Error('Conversation not available for receipt verification');
+    const token=await api.getAccessToken();
+    const raw=await api.fetchConversation(id,token);
+    const normalized=ns.chatgptNormalize.normalize(raw,{inlineTextFiles:false});
+    if (!Array.isArray(normalized?.conversation?.turns))
+      throw new Error('Conversation snapshot unavailable');
+    const messages=toMessages(normalized.conversation,false,false);
+    const users=messages.filter(item=>item.role==='user');
+    const assistants=messages.filter(item=>item.role==='assistant');
+    return {conversationId:id,userCount:users.length,assistantCount:assistants.length,
+      lastUserText:users.length?users[users.length-1].text:'',
+      lastAssistantText:assistants.length?assistants[assistants.length-1].text:''};
+  }
+
   // Exported only inside the isolated content-script context.
-  self.__chatOrchStructuredReader = { readChat, makeResult };
+  self.__chatOrchStructuredReader = { readChat, makeResult, snapshotChatgptTurns };
 })();

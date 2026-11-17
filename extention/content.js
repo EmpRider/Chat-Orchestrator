@@ -24,9 +24,15 @@
 
   const CONFIGS = {
     chatgpt: {
-      input: ['#prompt-textarea', 'div[contenteditable="true"][data-virtualkeyboard]', 'textarea'],
-      send: ['button[data-testid="send-button"]', 'button[aria-label="Send prompt"]'],
-      stop: ['button[data-testid="stop-button"]', 'button[aria-label="Stop streaming"]', 'button[aria-label*="stop" i]'],
+      input: ['#prompt-textarea', '[data-testid="prompt-textarea"]',
+        '[contenteditable="true"][data-lexical-editor="true"]',
+        'form[data-chatgpt-composer] [data-composer-markdown][contenteditable="true"][role="textbox"]',
+        '.ProseMirror[contenteditable="true"]',
+        'div[contenteditable="true"][data-virtualkeyboard]', 'textarea'],
+      send: ['button[data-testid="send-button"]', 'button[aria-label="Send prompt"]',
+        'button[aria-label="Send"]'],
+      stop: ['button[data-testid="stop-button"]', 'button[aria-label="Stop streaming"]',
+        'button[aria-label="Stop"]', 'button[aria-label*="stop" i]'],
       assistant: [
         '[data-response-body]',
         '[data-message-author-role="assistant"]',
@@ -60,7 +66,7 @@
     },
   };
   const A = CONFIGS[site];
-  const CONTENT_BUILD='worker-submit-modern-turns-20261116-v5';
+  const CONTENT_BUILD='worker-submit-modern-turns-20261117-v6';
   // These milestones remain readable even when the full low-level trace is
   // noisy. Detailed steps are still available in the Console at Debug level.
   const TRACE_MILESTONES=new Set(['submission_begin','page_settled','draft_insert_done',
@@ -105,18 +111,6 @@
       collapsedFirstDifference:actualCollapsed===expectedCollapsed?null:
         firstDifference(actualCollapsed,expectedCollapsed)};
   }
-  // ChatGPT's contenteditable can replace inserted line breaks with spaces
-  // during React's input reaction (for BOTH Parent and Child prompts).
-  // Accept ONLY the exact LF -> ASCII-space transformation of a draft that
-  // this extension just inserted. Arbitrary whitespace or text drift fails.
-  function parentSetupDraftMatches(el,expected,insertedByUs,taskId) {
-    const actual=composerText(el);
-    if(actual===expected)return true;
-    return site==='chatgpt' && insertedByUs &&
-      el?.tagName==='DIV' && expected.includes('\n') &&
-      actual===expected.replace(/\n/g,' ');
-  }
-
   function textShape(value) {
     const normalized=normalizePrompt(value);
     const lines=normalized.split('\n');
@@ -237,6 +231,16 @@
     !!el && (el.offsetParent !== null || el.getClientRects().length > 0);
 
   function q(selectors) {
+    if(site==='chatgpt' && selectors===A.input) {
+      // Do not choose an arbitrary composer when more than one is visible.
+      // Some builds wrap the actual ProseMirror editor in #prompt-textarea;
+      // choose the inner editable only in that nested case.
+      const found=[...new Set(selectors.flatMap(sel=>
+        [...document.querySelectorAll(sel)]))].filter(visible);
+      const leaves=found.filter(el=>!found.some(other=>
+        other!==el && el.contains?.(other)));
+      return leaves.length===1?leaves[0]:null;
+    }
     for (const sel of selectors) {
       const el = [...document.querySelectorAll(sel)].find(visible);
       if (el) return el;
@@ -311,6 +315,338 @@
       node.querySelector?.('[data-user-message-bubble="true"]');
     return String(copy?.textContent || copy?.innerText ||
       node.textContent || node.innerText || '');
+  }
+  async function authenticatedTurnSnapshot(timeoutMs=4000) {
+    if(site!=='chatgpt' || typeof self==='undefined' ||
+        typeof self.__chatOrchStructuredReader?.snapshotChatgptTurns!=='function')
+      return null;
+    let timer;
+    try {
+      const result=await Promise.race([
+        self.__chatOrchStructuredReader.snapshotChatgptTurns(),
+        new Promise(resolve=>{timer=setTimeout(()=>resolve(null),timeoutMs);}),
+      ]);
+      return result && typeof result.conversationId==='string' &&
+        Number.isSafeInteger(result.userCount) &&
+        Number.isSafeInteger(result.assistantCount) ? result : null;
+    }catch{return null;}
+    finally {clearTimeout(timer);}
+  }
+  function exactSubmittedText(actual,expected) {
+    const received=normalizePrompt(actual),intended=normalizePrompt(expected);
+    return received===intended || received===intended.replace(/\n/g,' ');
+  }
+  // ChatGPT rolls out its composer, model rows and effort control independently.
+  // Keep the recognition variants separate, as in the upstream Playwright adapter;
+  // never infer the whole UI from a single marker.
+  const CHATGPT_MODEL_TRIGGER_SELECTOR=[
+    'button[aria-haspopup="menu"][data-tone="neutral"]',
+    'button[data-testid="model-switcher-dropdown-button"][aria-haspopup="menu"]',
+    'button[data-codex-intelligence-trigger="true"][data-composer-navigation-target="reasoning"][aria-haspopup="menu"]',
+    'button[data-composer-navigation-target="reasoning"][data-selected-reasoning-effort][aria-haspopup="menu"]',
+    'button[aria-label="Select ChatGPT model"]',
+    '[role="button"][aria-label="Select ChatGPT model"]',
+  ].join(',');
+  const CHATGPT_EFFORT_SURFACE_SELECTOR=[
+    '[data-model-reasoning-effort-slider]',
+    '[data-model-picker-power-slider]',
+    '[data-reasoning-slider]',
+  ].join(',');
+  const CHATGPT_EFFORT_ORDER=['Instant','Medium','High','Extra High','Pro'];
+  function modelPickerNodes(selector,root=document) {
+    return [...new Set([...root.querySelectorAll(selector)])].filter(visible);
+  }
+  function chatgptModelPickerTrigger() {
+    const form=q(A.input)?.closest?.('form');
+    const triggers=modelPickerNodes(CHATGPT_MODEL_TRIGGER_SELECTOR)
+      .filter(node=>!form || form.contains(node));
+    if(triggers.length!==1 || !buttonEnabled(triggers[0]))
+      throw new Error('ChatGPT model picker missing or ambiguous');
+    return triggers[0];
+  }
+  function chatgptOwnedPickerMenu(trigger) {
+    // Prefer ARIA ownership to page-wide menus; hidden outgoing menus are not active.
+    const controls=trigger.getAttribute?.('aria-controls');
+    if(controls && typeof document.getElementById==='function') {
+      const owned=document.getElementById(controls);
+      if(owned && visible(owned))return owned;
+    }
+    const menus=modelPickerNodes(
+      '[role="menu"],[role="group"],[data-testid="composer-intelligence-picker-content"]')
+      .filter(menu=>menu.querySelector?.(CHATGPT_EFFORT_SURFACE_SELECTOR+', [role="menuitemradio"]'));
+    const ownedLeaves=menus.filter(menu=>!menus.some(other=>
+      other!==menu && menu.contains?.(other)));
+    if(ownedLeaves.length>1)throw new Error('ChatGPT exposed ambiguous model menus');
+    return ownedLeaves[0] || null;
+  }
+  function chatgptPickerOpen(trigger) {
+    if(trigger.getAttribute?.('aria-expanded')==='false' ||
+       trigger.getAttribute?.('data-state')==='closed')return false;
+    const menu=chatgptOwnedPickerMenu(trigger);
+    if(menu)return true;
+    // The legacy menu has no discoverable parent; accept its globally unique
+    // slider or radio controls only when the trigger is not explicitly closed.
+    return modelPickerNodes(CHATGPT_EFFORT_SURFACE_SELECTOR).length===1 ||
+      modelPickerNodes('[role="menuitemradio"]').length>0;
+  }
+  async function openChatgptPicker(trigger) {
+    if(chatgptPickerOpen(trigger))return;
+    trigger.click();
+    if(await waitFor(()=>chatgptPickerOpen(trigger),3000,50))return;
+    // Upstream's pointerdown fallback is useful for some menu-trigger versions.
+    // This isolated-world event is not trusted: always require actual DOM evidence.
+    if(typeof PointerEvent==='function' && typeof trigger.dispatchEvent==='function')
+      trigger.dispatchEvent(new PointerEvent('pointerdown',{
+        button:0,buttons:1,pointerType:'mouse',isPrimary:true,bubbles:true}));
+    if(!await waitFor(()=>chatgptPickerOpen(trigger),3000,50))
+      throw new Error('ChatGPT model picker did not expose its owned menu');
+  }
+  async function closeChatgptPicker(trigger) {
+    if(!chatgptPickerOpen(trigger))return;
+    if(typeof KeyboardEvent==='function' && typeof trigger.dispatchEvent==='function')
+      trigger.dispatchEvent(new KeyboardEvent('keydown',{
+        key:'Escape',bubbles:true,cancelable:true}));
+    if(await waitFor(()=>!chatgptPickerOpen(trigger),500,50))return;
+    // A native click is a different menu-close path, not a second Send attempt.
+    trigger.click();
+    if(!await waitFor(()=>!chatgptPickerOpen(trigger),2000,50) &&
+        trigger.getAttribute?.('aria-expanded')==='true')
+      throw new Error('ChatGPT model picker did not close');
+  }
+  function chatgptModelRows(trigger) {
+    const menu=chatgptOwnedPickerMenu(trigger);
+    return modelPickerNodes('[role="menuitemradio"]',menu || document);
+  }
+  async function revealChatgptModelRows(trigger) {
+    const menu=chatgptOwnedPickerMenu(trigger);
+    const view=menu?.querySelector?.('[data-model-picker-view]');
+    const mode=view?.getAttribute?.('data-model-picker-view');
+    if(mode==='simple') {
+      const toggles=modelPickerNodes('[data-model-picker-view-toggle="true"]',view);
+      if(toggles.length!==1)throw new Error('ChatGPT advanced model view is unavailable');
+      toggles[0].click();
+      if(!await waitFor(()=>view.getAttribute('data-model-picker-view')==='advanced',2500,50))
+        throw new Error('ChatGPT advanced model view did not open');
+    } else if(mode && mode!=='advanced') {
+      throw new Error('ChatGPT model picker exposes an unknown view');
+    } else if(!view && menu) {
+      const toggles=modelPickerNodes('[role="menuitem"][aria-expanded][aria-hidden="false"]',menu);
+      if(toggles.length===1 && toggles[0].getAttribute('aria-expanded')==='false')
+        toggles[0].click();
+    }
+  }
+  function chatgptModelChoices(model,effort='') {
+    // A generic "Latest" is never proof of GPT-6; shared rows require an
+    // explicit model identity in their own picker header/announcement.
+    if(/^GPT[- ]?6$/i.test(model))
+      return effort==='Pro'
+        ? ['GPT-6 Astra','GPT-6','6','Latest']
+        : ['GPT-6 Sol','GPT-6','6','Latest'];
+    if(/^GPT[- ]?6 Sol$/i.test(model))
+      return effort==='Pro'?[]:['GPT-6 Sol','GPT-6','6','Latest'];
+    if(/^GPT[- ]?6 Astra$/i.test(model))return ['GPT-6 Astra'];
+    if(/^GPT[- ]?5\.6 Sol$/i.test(model))return ['GPT-5.6 Sol'];
+    return [model];
+  }
+  function chatgptSelectedModelRow(trigger,model,effort='') {
+    const rows=chatgptModelRows(trigger);
+    for(const choice of chatgptModelChoices(model,effort)){
+      const matches=rows.filter(row=>(row.innerText||row.textContent||'').trim()===choice);
+      if(matches.length>1)throw new Error('ChatGPT exposed duplicate model rows');
+      if(matches.length===1)return matches[0];
+    }
+    throw new Error('Requested ChatGPT model is unavailable or ambiguous');
+  }
+  function chatgptEffortSurface(trigger) {
+    const menu=chatgptOwnedPickerMenu(trigger);
+    const surfaces=modelPickerNodes(CHATGPT_EFFORT_SURFACE_SELECTOR,menu || document);
+    if(surfaces.length!==1)throw new Error('ChatGPT thinking-effort control unavailable or ambiguous');
+    return surfaces[0];
+  }
+  function chatgptEffortSnapshot(surface) {
+    const sliders=surface.querySelectorAll?.('[role="slider"]') ||
+      (surface.querySelector?.('[role="slider"]')?[surface.querySelector('[role="slider"]')]:[]);
+    if(sliders.length!==1)throw new Error('ChatGPT effort slider is ambiguous');
+    const slider=sliders[0];
+    const parse=(name)=>{
+      const raw=slider.getAttribute(name);
+      if(raw===null || !/^-?\d+$/.test(raw))throw new Error('Invalid ChatGPT effort range');
+      const value=Number(raw);
+      if(!Number.isSafeInteger(value))throw new Error('Invalid ChatGPT effort value');
+      return value;
+    };
+    const min=parse('aria-valuemin'),max=parse('aria-valuemax'),value=parse('aria-valuenow');
+    if(max<min || max-min+1>6 || min>value || value>max)
+      throw new Error('Invalid ChatGPT effort slider state');
+    const ticks=[...(surface.querySelectorAll?.('[data-selected]')||[])];
+    const power=surface.hasAttribute?.('data-model-picker-power-slider') &&
+      Boolean(surface.querySelector?.('[data-orientation="horizontal"][aria-disabled="false"]'));
+    if(ticks.length && ticks.length!==max-min+1)
+      throw new Error('ChatGPT effort ticks did not match its slider range');
+    if(!ticks.length && !surface.hasAttribute?.('data-reasoning-slider'))
+      throw new Error('ChatGPT effort slider tick availability is unknown');
+    const available=ticks.length?ticks.map(tick=>{
+      const locked=tick.getAttribute('data-locked');
+      if(locked==='true')return false;
+      if(locked==='false' || (locked===null && power))return true;
+      throw new Error('ChatGPT effort tick lock state is unknown');
+    }):Array(max-min+1).fill(true);
+    // The current picker announces its *semantic* effort separately from the
+    // index. Six-position Default and Astra pickers do NOT use the same order.
+    const parent=slider.closest?.('[role="menuitem"]') ||
+      surface.closest?.('[role="menuitem"]');
+    const descriptions=String(parent?.getAttribute?.('aria-describedby')||'')
+      .split(/\s+/).filter(Boolean).map(id=>
+        document.getElementById?.(id)?.textContent||'');
+    const announced=String(slider.getAttribute('aria-valuetext')||'')+
+      ' '+descriptions.join(' ');
+    const match=/(?:^|[\s,])(?:\d+(?:\.\d+)?\s+(?:Sol|Astra)\s+)?(Extra High|Instant|Medium|High|Pro|Max|Light|Ultra)(?=[\s,.]|$)/i.exec(announced.trim());
+    return {min,max,value,available,slider,
+      announcedEffort:match?.[1]||null};
+  }
+  function chatgptPickerModelEvidence(trigger,model,effort='') {
+    const row=chatgptSelectedModelRow(trigger,model,effort);
+    if(row.getAttribute('aria-checked')!=='true')
+      throw new Error('ChatGPT model change was not verified');
+    if((row.innerText||row.textContent||'').trim()!=='Latest')return;
+    const menu=chatgptOwnedPickerMenu(trigger);
+    const headers=modelPickerNodes('[data-model-picker-view-toggle="true"]',menu || document);
+    const text=headers.map(header=>header.textContent||'').join(' ');
+    if(!/(?:^|\W)(?:GPT[- ]?)?6(?:\s|$)/i.test(text))
+      throw new Error('ChatGPT Latest row does not verify the requested GPT-6 model');
+  }
+  function chatgptEffortTarget(snapshot,effort,model='') {
+    // Dated upstream six-tick fixtures show independent sequences for Default
+    // and Astra. Never apply the ordinary five-tick index to an unknown model.
+    const count=snapshot.max-snapshot.min+1;
+    const order=count===6 && /^Default$/i.test(model)
+      ? ['Instant','High','Light','Medium','Extra High','Pro']
+      : count===6 && /^GPT[- ]?6 Astra$/i.test(model)
+      ? ['Light','Medium','High','Extra High','Pro','Ultra']
+      : count===6 ? [] : CHATGPT_EFFORT_ORDER;
+    const index=order.indexOf(effort);
+    if(index<0 || index>snapshot.max-snapshot.min ||
+        !snapshot.available[index])
+      throw new Error('Requested ChatGPT effort is unavailable or locked');
+    return snapshot.min+index;
+  }
+  function assertChatgptEffortAnnouncement(snapshot,effort,model) {
+    // A slider's ARIA position alone is not a model/effort identity.
+    const actual=snapshot.announcedEffort;
+    const expected=effort==='Pro' && /^GPT[- ]?6 Astra$/i.test(model)
+      ? 'Max' : effort;
+    if(actual && actual.toLowerCase()!==expected.toLowerCase())
+      throw new Error('ChatGPT effort announcement conflicts with the requested mode');
+    if(snapshot.max-snapshot.min+1===6 && !actual)
+      throw new Error('Six-position ChatGPT effort has no verifiable mode announcement');
+  }
+  async function verifyChatgptModelPreferences(preferences,taskId,preserveDraftText=false) {
+    if(!preferences)return;
+    const before=q(A.input),draft=composerText(before);
+    const trigger=chatgptModelPickerTrigger();
+    await openChatgptPicker(trigger);
+    try {
+      if(preferences.model) {
+        await revealChatgptModelRows(trigger);
+        chatgptPickerModelEvidence(trigger,preferences.model,preferences.effort);
+      }
+      if(preferences.effort) {
+        const snapshot=chatgptEffortSnapshot(chatgptEffortSurface(trigger));
+        const selectedModel=preferences.model
+          ? (chatgptSelectedModelRow(trigger,preferences.model,preferences.effort).innerText||'').trim()
+          : '';
+        if(snapshot.value!==chatgptEffortTarget(snapshot,preferences.effort,selectedModel))
+          throw new Error('ChatGPT did not retain the requested thinking effort');
+        assertChatgptEffortAnnouncement(snapshot,preferences.effort,selectedModel);
+      }
+    } finally {await closeChatgptPicker(trigger);}
+    if(q(A.input)!==before || before?.isConnected===false ||
+        (preserveDraftText && composerText(q(A.input))!==draft))
+      throw new Error('ChatGPT model verification changed the pending composer');
+    logStep(taskId,'model_preferences_presend_verified',{
+      modelConfigured:Boolean(preferences.model),effortConfigured:Boolean(preferences.effort)});
+  }
+  // Optional per-profile preference. Disabled unless explicitly configured
+  // and authorized for this managed Parent/Child. No prompt has been inserted.
+  async function enforceChatgptModelPreferences(taskId) {
+    if(site!=='chatgpt' || !chrome.storage?.local?.get)return null;
+    const stored=await chrome.storage.local.get(['chatgptModelLabel','chatgptReasoningEffort']);
+    if(!stored?.chatgptModelLabel && !stored?.chatgptReasoningEffort)return null;
+    const approved=await chrome.runtime.sendMessage({type:'managed_chatgpt_model_preferences'});
+    if(approved?.ok!==true)throw new Error('Managed model preferences not authorized');
+    const preferences={model:approved.model,effort:approved.effort};
+    if(!preferences.model && !preferences.effort)return null;
+    if(preferences.effort && !CHATGPT_EFFORT_ORDER.includes(preferences.effort))
+      throw new Error('Unsupported ChatGPT thinking effort');
+    const before=q(A.input),draft=composerText(before);
+    const trigger=chatgptModelPickerTrigger();
+    await openChatgptPicker(trigger);
+    try {
+      if(preferences.model) {
+        await revealChatgptModelRows(trigger);
+        let row=chatgptSelectedModelRow(trigger,preferences.model,preferences.effort);
+        if(row.getAttribute('aria-disabled')==='true')
+          throw new Error('Requested ChatGPT model is locked');
+        if(row.getAttribute('aria-checked')!=='true') {
+          row.click();
+          await openChatgptPicker(trigger);
+          await revealChatgptModelRows(trigger);
+          row=chatgptSelectedModelRow(trigger,preferences.model,preferences.effort);
+        }
+        chatgptPickerModelEvidence(trigger,preferences.model,preferences.effort);
+      }
+      if(preferences.effort) {
+        await openChatgptPicker(trigger);
+        const surface=chatgptEffortSurface(trigger);
+        let snapshot=chatgptEffortSnapshot(surface);
+        const selectedModel=preferences.model
+          ? (chatgptSelectedModelRow(trigger,preferences.model,preferences.effort).innerText||'').trim()
+          : '';
+        const target=chatgptEffortTarget(snapshot,preferences.effort,selectedModel);
+        const initialMin=snapshot.min;
+        while(snapshot.value!==target) {
+          const previous=snapshot.value;
+          const direction=target>previous?1:-1;
+          const ticks=[...(surface.querySelectorAll?.('[data-selected]')||[])];
+          // Native click on an enabled tick is the closest extension-available
+          // counterpart of Playwright's trusted ArrowRight/ArrowLeft press.
+          // If the site has no clickable ticks, try its keyboard handler; never
+          // accept a synthetic event without checking the actual ARIA value.
+          const next=ticks[previous-initialMin+direction];
+          if(next && snapshot.available[previous-initialMin+direction])next.click();
+          await sleep(150);
+          let updated=chatgptEffortSnapshot(surface);
+          if(updated.value===previous && typeof KeyboardEvent==='function'){
+            const key=direction>0?'ArrowRight':'ArrowLeft';
+            const owner=surface.closest?.('[role="menuitem"]')||surface;
+            owner.focus?.();
+            owner.dispatchEvent(new KeyboardEvent('keydown',{
+              key,bubbles:true,cancelable:true}));
+            await sleep(150);
+            updated=chatgptEffortSnapshot(surface);
+          }
+          if(updated.min!==initialMin || updated.value!==previous+direction)
+            throw new Error('ChatGPT thinking-effort slider did not move exactly one step');
+          snapshot=updated;
+        }
+        if(chatgptEffortSnapshot(surface).value!==target)
+          throw new Error('ChatGPT thinking-effort change was not verified');
+        assertChatgptEffortAnnouncement(chatgptEffortSnapshot(surface),
+          preferences.effort,selectedModel);
+      }
+    } finally {await closeChatgptPicker(trigger);}
+    if(q(A.input)!==before || composerText(q(A.input))!==draft)
+      throw new Error('ChatGPT model selection changed the composer draft');
+    await verifyChatgptModelPreferences(preferences,taskId,true);
+    logStep(taskId,'model_preferences_verified',{
+      modelConfigured:Boolean(preferences.model),effortConfigured:Boolean(preferences.effort)});
+    return preferences;
+  }
+  function verifiedNewUserTurn(before,after,expected) {
+    return Boolean(before && after &&
+      before.conversationId===after.conversationId &&
+      after.userCount===before.userCount+1 &&
+      exactSubmittedText(after.lastUserText,expected));
   }
   const userTurnHasMarker=(marker)=>submissionUserNodes().some((node)=>
     submittedUserText(node).includes(marker));
@@ -462,6 +798,20 @@
   function activateSendOnce(button,composer,taskId,preferButtonClick=false) {
     const form=button?.form || composer?.closest?.('form') || null;
     const type=String(button?.type || button?.getAttribute?.('type') || '').toLowerCase();
+    const label=String(button?.getAttribute?.('aria-label') || '').trim();
+    // The modern ChatGPT composer exposes a native submit form and an exact
+    // "Send" button. In an unfocused/minimized tab, an isolated-world click
+    // can leave the draft untouched. Use the observed native form path, with
+    // NO submitter argument, exactly once. Older Send-labelled variants keep
+    // their verified button-click behavior; never try both for one receipt.
+    if(preferButtonClick && site==='chatgpt' && form && type==='submit' &&
+        label==='Send' && typeof form.requestSubmit==='function' &&
+        (!button.form || button.form===form)) {
+      logStep(taskId,'send_activation',{method:'form_request_submit_no_submitter',
+        formPresent:true});
+      form.requestSubmit();
+      return 'form_request_submit_no_submitter';
+    }
     // Queue notifications use the enabled Send control's click path: on some
     // ChatGPT builds the form ignores requestSubmit and strands the draft.
     // Choose exactly one activation path; never replay after a possible send.
@@ -630,6 +980,8 @@
     let insertedByUs = false;
     let stage = 'composer_wait';
     let input=null; // Retained across try/catch for post-failure editor diagnostics.
+    let structuredBefore=null;
+    let structuredReceipt=null;
     const thisTraceId=Date.now().toString(36)+'-'+(++traceSequence).toString(36);
     activeTraceId=thisTraceId;
     logStep(taskId, 'submission_begin', {textLength:String(text ?? '').length,
@@ -710,9 +1062,20 @@
       error.code = 'COMPOSER_DRAFT_MISMATCH';
       throw error;
     }
+    // Apply configured preferences BEFORE typing. A failed/unsupported picker
+    // must not leave a new prompt in the composer or trigger any Send.
+    const selectedModelPreferences=await enforceChatgptModelPreferences(taskId);
+    const afterModel=q(A.input);
+    if(!afterModel || composerText(afterModel)!==previousDraft)
+      throw new Error('Composer changed during model selection; no prompt sent');
+    input=afterModel;
     const userNodesBefore=submissionUserNodes();
     const userBefore = userNodesBefore.length;
     const oldUserNodes=new Set(userNodesBefore);
+    // For existing conversations, capture a PRE-Send authenticated turn count.
+    // It can be unavailable on some accounts; the DOM path remains primary.
+    if(site==='chatgpt' && chatgptConversationRoute())
+      structuredBefore=await authenticatedTurnSnapshot();
     const submissionMarker=submissionMarkerFor(expected,taskId);
     const markerVisibleBefore=Boolean(submissionMarker && userTurnHasMarker(submissionMarker));
     if(markerVisibleBefore) {
@@ -741,7 +1104,11 @@
     stage = 'send_button_wait';
     const sendWaitStarted=Date.now();
     let sendPolls=0,lastSendSignature='',lastEditorSignature='';
-    logStep(taskId,'send_button_wait_begin',{timeoutMs:6500,pollIntervalMs:200});
+    // Parent FIFO notifications may become enabled after a deferred React
+    // update in a background tab. Waiting is side-effect-free; activating
+    // Send must still happen just once, after exact draft verification.
+    const sendWaitTimeoutMs=preferButtonClick && site==='chatgpt' ? 20000 : 6500;
+    logStep(taskId,'send_button_wait_begin',{timeoutMs:sendWaitTimeoutMs,pollIntervalMs:200});
     const button = await waitFor(() => {
       sendPolls++;
       logStep(taskId,'send_button_wait_poll_begin',{poll:sendPolls,
@@ -776,7 +1143,7 @@
       }
       logStep(taskId,'send_button_wait_poll_end',{poll:sendPolls,selected:Boolean(found)});
       return found;
-    },6500,200);
+    },sendWaitTimeoutMs,200);
     logStep(taskId,'send_button_wait_end',{polls:sendPolls,selected:Boolean(button),
       durationMs:Date.now()-sendWaitStarted});
     if (!button) {
@@ -797,40 +1164,43 @@
       originalEditorId:editorIdentity(input),snapshot:composerTraceSnapshot(currentInput,expected)});
     logStep(taskId,'pre_click_validation',{sameComposer:currentInput===input,
       documentReady:document.readyState,accountChanged:chatgptAccountChanged(),
-      matchesTask:composerText(currentInput)===expected,
       composer:composerDiagnostics(text,taskId),buttons:sendButtonDiagnostics(currentInput)});
     const finalPageReady=pageReadyForSubmission();
     const finalAccountChanged=chatgptAccountChanged();
     const tabHidden=document.visibilityState==='hidden';
+    // Isolated-world getters can report the native hidden state even while
+    // the authorized MAIN-world shim reports visible. Never infer authority
+    // from a page event or a locally patched document property.
+    let managedFocusAuthorized=false;
+    if(tabHidden && site==='chatgpt') {
+      try {
+        const verified=await chrome.runtime.sendMessage({type:'verify_managed_page_focus'});
+        managedFocusAuthorized=verified?.ok===true && verified.allowed===true;
+      }catch{}
+    }
     logStep(taskId,'pre_click_page_validation',{pageReady:finalPageReady,
       documentReady:document.readyState,accountChanged:finalAccountChanged,
-      tabHidden});
-    if (!finalPageReady || finalAccountChanged || tabHidden) {
-      logStep(taskId,'pre_click_page_validation_rejected',{reason:tabHidden?'TAB_NOT_VISIBLE':
+      tabHidden,managedFocusAuthorized});
+    if (!finalPageReady || finalAccountChanged || (tabHidden && !managedFocusAuthorized)) {
+      logStep(taskId,'pre_click_page_validation_rejected',{reason:tabHidden&&!managedFocusAuthorized?'TAB_NOT_VISIBLE':
         !finalPageReady?'PAGE_NOT_READY':'ACCOUNT_CHANGED'});
       throw new Error('Chat page changed readiness before submission; no message sent');
     }
-    const parentDraftMatches=parentSetupDraftMatches(currentInput,expected,insertedByUs,taskId);
-    if (!currentInput || currentInput!==input || !parentDraftMatches) {
+    // Do not reject an extension-populated ProseMirror draft because React
+    // changes the DOM's rendered innerText (including newlines/whitespace).
+    // The insertion was already confirmed and the Send button is enabled.
+    // Only reject if the actual editor node has been replaced or detached.
+    if (!currentInput || currentInput!==input || currentInput.isConnected===false) {
       const failureClass=!currentInput?'COMPOSER_MISSING':
-        currentInput!==input?'EDITOR_REPLACED_AFTER_INSERT':
-        whitespaceDiagnostics(composerText(currentInput),expected).collapsedEqual
-          ? 'WHITESPACE_RENDERING_DRIFT':'PROMPT_CONTENT_CHANGED';
+        currentInput!==input?'EDITOR_REPLACED_AFTER_INSERT':'EDITOR_DISCONNECTED';
       logStep(taskId,'pre_click_composer_validation_rejected',{inputPresent:Boolean(currentInput),
-        sameComposer:currentInput===input,draftLength:composerText(currentInput).length,
-        expectedLength:expected.length,whitespace:whitespaceDiagnostics(composerText(currentInput),expected),
+        sameComposer:currentInput===input,
         failureClass,originalEditorId:editorIdentity(input),
         currentEditorId:editorIdentity(currentInput),
         snapshot:composerTraceSnapshot(currentInput,expected)});
       const error=new Error('Chat composer changed before Send; no prompt submitted');
       error.code='COMPOSER_DRAFT_MISMATCH';
       throw error;
-    }
-    if (composerText(currentInput)!==expected) {
-      logStep(taskId,'linebreak_normalization_accepted',{
-        originalNewlines:(expected.match(/\n/g)||[]).length,
-        currentNewlines:(composerText(currentInput).match(/\n/g)||[]).length,
-        exactNewlinesToSpaces:true});
     }
     // No second network-idle gate after inserting the prompt: the page may
     // legitimately start background requests while the enabled Send control
@@ -840,15 +1210,19 @@
       throw new Error('Composer submit control disappeared before click; no prompt sent');
     }
     const buttonEnabledAtClick=buttonEnabled(button);
-    const composerMatchesAtClick=parentSetupDraftMatches(input,expected,insertedByUs,taskId);
     logStep(taskId,'pre_click_controls_validated',{buttonConnected:button.isConnected ?? null,
-      buttonEnabled:buttonEnabledAtClick,composerMatches:composerMatchesAtClick,
-      draftLength:composerText(input).length,expectedLength:expected.length,
+      buttonEnabled:buttonEnabledAtClick,
       testId:button.getAttribute('data-testid'),ariaLabel:button.getAttribute('aria-label')});
-    if (!buttonEnabledAtClick || !composerMatchesAtClick) {
-      logStep(taskId,'pre_click_button_rejected',{reason:!buttonEnabledAtClick?'BUTTON_DISABLED':'DRAFT_CHANGED'});
-      throw new Error('Composer changed or Send became disabled before click; no prompt sent');
+    if (!buttonEnabledAtClick) {
+      logStep(taskId,'pre_click_button_rejected',{reason:'BUTTON_DISABLED'});
+      throw new Error('Send became disabled before click; no prompt sent');
     }
+    // The model can change while React hydrates, attaches the draft, or uploads
+    // files. Re-open the owned picker and verify it immediately before Send,
+    // without changing the selected model or the submitted draft.
+    await verifyChatgptModelPreferences(selectedModelPreferences,taskId);
+    if(q(A.input)!==input || button.isConnected===false || !buttonEnabled(button))
+      throw new Error('ChatGPT composer or Send control changed after model verification');
     stage = 'send_click';
     const startedAtFreshChatRoot=site==='chatgpt' &&
       String(location.pathname || '')==='/';
@@ -872,7 +1246,7 @@
     let confirmationPolls=0,lastConfirmationSignature='';
     logStep(taskId,'submission_confirmation_begin',{timeoutMs:12000,pollIntervalMs:200,
       userTurnsBefore:userBefore});
-    const confirmed = await waitFor(() => {
+    let confirmed = await waitFor(() => {
       confirmationPolls++;
       const currentUserNodes=submissionUserNodes();
       const userTurnCount=currentUserNodes.length;
@@ -947,6 +1321,16 @@
       // actually appeared as a new user turn, not just a page transition.
       return accepted||accountChanged;
     },12000,200);
+    if(!confirmed && !chatgptAccountChanged() && structuredBefore) {
+      const after=await authenticatedTurnSnapshot();
+      if(verifiedNewUserTurn(structuredBefore,after,expected)) {
+        confirmed=true;
+        structuredReceipt=after;
+        logStep(taskId,'submission_confirmation_evidence',{
+          evidenceType:'NEW_AUTHENTICATED_USER_TURN',newUserTurnCount:1,
+          draftCleared:composerText(q(A.input))===''});
+      }
+    }
     logStep(taskId,'submission_confirmation_end',{confirmed:Boolean(confirmed),
       polls:confirmationPolls,durationMs:Date.now()-confirmationStarted,
       userTurnsAfter:userNodes().length,generating:isGenerating(),accountChanged:chatgptAccountChanged()});
@@ -960,6 +1344,9 @@
       error.code = 'SUBMISSION_UNCERTAIN';
       throw error;
     }
+    return {confirmed:true,structuredBefore,structuredReceipt,
+      receiptMarkerVerified:Boolean(structuredReceipt &&
+        submissionMarker && structuredReceipt.lastUserText.includes(submissionMarker))};
     } catch (error) {
       let buttons = [];
       if (stage === 'send_button_wait') {
@@ -1042,12 +1429,17 @@
   // A completed worker result must belong to an actual assistant turn.
   // ChatGPT page-wide text includes transient UI errors and must never be
   // promoted to a successful assistant answer.
-  async function waitForResponse(baselineCount, timeoutMs, promptText, taskId=null) {
+  async function waitForResponse(baselineCount, timeoutMs, promptText, taskId=null,
+      authenticatedBaseline=null) {
     const t0 = Date.now();
     let started = false;
     let lastText = '';
     let stableSince = Date.now();
     let polls=0,lastSignature='';
+    let nextAuthenticatedRead=0;
+    let authenticatedText='';
+    let authenticatedStableSamples=0;
+    const initialRoute=chatgptConversationRoute();
     logStep(taskId,'response_wait_begin',{baselineAssistantTurns:baselineCount,timeoutMs,site});
     const read = () => {
       logStep(taskId,'response_read_begin',{poll:polls,site});
@@ -1087,8 +1479,28 @@
         error.code = 'SUBMISSION_UNCERTAIN';
         throw error;
       }
+      if(site==='chatgpt' && initialRoute &&
+          chatgptConversationRoute()!==initialRoute)
+        throw new Error('ChatGPT conversation changed during response; result unverified');
       const generating = isGenerating();
-      const result = read();
+      let result = read();
+      if(site==='chatgpt' && !result.text && authenticatedBaseline &&
+          Date.now()>=nextAuthenticatedRead) {
+        nextAuthenticatedRead=Date.now()+5000;
+        const snapshot=await authenticatedTurnSnapshot(3000);
+        if(snapshot && snapshot.conversationId===authenticatedBaseline.conversationId &&
+            snapshot.userCount===authenticatedBaseline.userCount+1 &&
+            snapshot.assistantCount===authenticatedBaseline.assistantCount+1 &&
+            typeof snapshot.lastAssistantText==='string' &&
+            snapshot.lastAssistantText.trim()) {
+          const text=snapshot.lastAssistantText.trim();
+          authenticatedStableSamples=text===authenticatedText
+            ? authenticatedStableSamples+1 : 1;
+          authenticatedText=text;
+        }
+      }
+      if(!result.text && authenticatedText)
+        result={mode:'authenticated',text:authenticatedText};
       if (!started && (generating || result.text)) {
         started=true;
         logStep(taskId,'response_generation_started',{poll:polls,mode:result.mode,
@@ -1105,7 +1517,8 @@
           logStep(taskId,'response_content_changed',{poll:polls,mode:result.mode,
             resultLength:result.text.length});
         }
-        const quietNeeded = result.mode === 'dom' ? 3000 : 5000;
+        const quietNeeded = result.mode === 'dom' ? 3000 :
+          result.mode === 'authenticated' ? 10000 : 5000;
         const quietMs=Date.now()-stableSince;
         const signature=[generating,result.mode,result.text.length,Math.floor(quietMs/500)].join(':');
         if(signature!==lastSignature){
@@ -1113,7 +1526,14 @@
             resultLength:result.text.length,quietMs,quietNeeded});
           lastSignature=signature;
         }
-        if (!generating && result.text && quietMs > quietNeeded) {
+        if (!generating && result.text && quietMs > quietNeeded &&
+            (result.mode!=='authenticated' || authenticatedStableSamples>=3)) {
+          // Do not turn a short provider failure notice into a successful
+          // assistant result just because it stopped changing.
+          if(result.text.length<220 &&
+              /^(Something went wrong|There was an error generating|You have reached (the|your) (message|usage) limit|Too many requests|Network error)/i
+                .test(result.text.trim()))
+            throw new Error('ChatGPT reported a generation error; response unverified');
           logStep(taskId,'response_wait_complete',{polls,mode:result.mode,
             resultLength:result.text.length,durationMs:Date.now()-t0});
           return result.text;
@@ -1363,13 +1783,14 @@
     try {
       const baseline = site === 'chatgpt' ? verifiedAssistantNodes().length : assistantNodes().length;
       logStep(taskId, 'task_started', {baselineAssistantTurns:baseline, timeoutMs});
-      await sendPrompt(text, taskId);
+      const submission=await sendPrompt(text, taskId);
       // This ACK confirms the new user turn, not the assistant's answer.
       // Releasing the startup slot here lets other workers initialize and
       // submit while this worker's model response continues independently.
       reportSubmission({ ok: true, submitted: true });
       logStep(taskId, 'submission_acknowledged');
-      const result = await waitForResponse(baseline, timeoutMs || 600000, text,taskId);
+      const result = await waitForResponse(baseline, timeoutMs || 600000, text,taskId,
+        submission?.structuredBefore);
       logStep(taskId, 'assistant_completed', {resultLength:result.length});
       report = { type: 'task_done', taskId, receiptNonce, ok: true, text: result };
     } catch (err) {
@@ -1412,14 +1833,9 @@
     // Require this batch's unique ID in a user-message bubble; otherwise UNCERTAIN.
     const batchMarker = /"batch_id":"([0-9a-f-]{36})"/i.exec(text)?.[1];
     if (!batchMarker) return { ok: false, uncertain: false, error: 'Manager batch ID missing' };
-    const markerVisible = () => {
-      if (userTurnHasMarker(batchMarker)) return true;
-      // UI variants may not expose a user-role selector. A visible chat marker
-      // counts only after it has left the active composer.
-      const inPage = String(document.body?.innerText || '').includes(batchMarker);
-      const stillDraft = composerText(q(A.input)).includes(batchMarker);
-      return inPage && !stillDraft;
-    };
+    // Page-wide text may contain a marker in a draft, menu or historical UI.
+    // Only an actual user turn or a before/after authenticated count is proof.
+    const markerVisible = () => userTurnHasMarker(batchMarker);
     if (markerVisible()) {
       logStep(batchMarker, 'error', {stage:'manager_duplicate',code:'BATCH_ALREADY_VISIBLE'});
       completionReceiptUncertain = true;
@@ -1427,10 +1843,11 @@
     }
     busy = true;
     try {
-      await sendPrompt(text, batchMarker, true);
-      if (!(await waitFor(markerVisible, 12000, 250))) {
-        throw new Error('Manager batch not visible after UI submission');
-      }
+      // sendPrompt has already required a verified new turn (or the guarded
+      // first-conversation route transition). Do not fall back to body text.
+      const submission=await sendPrompt(text, batchMarker, true);
+      if(submission?.confirmed!==true)
+        throw new Error('Manager notification submission not verified');
       logStep(batchMarker, 'manager_batch_visible');
       return { ok: true, submitted: true };
     } catch (error) {
@@ -1512,8 +1929,9 @@
         evidence.matchingDraft?'NOT_READY':'EXACT_DRAFT_REQUIRED'};
     busy=true;
     try {
-      await sendPrompt(text,marker,true);
-      const verified=userTurnHasMarker(marker) && !chatgptAccountChanged();
+      const submission=await sendPrompt(text,marker,true);
+      const verified=(submission?.confirmed===true) &&
+        !chatgptAccountChanged();
       if(verified)completionReceiptUncertain=false;
       return {ok:verified,submitted:verified,uncertain:!verified};
     } catch {
@@ -1535,8 +1953,8 @@
       return {ok:false,uncertain:true,error:'Setup message already visible'};
     busy=true;
     try {
-      await sendPrompt(text,'parent_setup');
-      if (!await waitFor(visibleMarker,12000,250))
+      const submission=await sendPrompt(text,'parent_setup');
+      if (submission?.confirmed!==true)
         throw new Error('Setup message visibility unverified');
       return {ok:true,submitted:true};
     } catch(error) {

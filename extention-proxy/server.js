@@ -22,6 +22,7 @@ import { createIdempotencyLedger } from './idempotency.mjs';
 import { createDurableIdempotencyLedger } from './durable-idempotency.mjs';
 import { normalizeOpenChatTabs, annotateTabPresence } from './tab-presence.mjs';
 import { createDiagnostics, classifyDiagnosticError } from './diagnostics.mjs';
+import { isSupportedDesktopExtensionAction } from './desktop/extension-actions.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 8787);
@@ -3562,6 +3563,7 @@ export const desktopMethods = Object.freeze({
   verify_managed_browser: 'desktop_verify_managed_browser',
   update_readiness: 'desktop_update_readiness',
 });
+export { isSupportedDesktopExtensionAction };
 export async function desktopAction({action, tab_id, browser_session_id, confirmation_nonce,
   decision_id,choice,reason,expected_profile_install_id,expected_browser_product}) {
   if(action==='recover_queue_batch'||action==='focus_queue_manager'){
@@ -3778,25 +3780,30 @@ export function refreshExtensionSettings() {
 // The standalone manual tester mounts its routes only in its own process.
 export { app, httpServer, wss };
 
+// Shared implementation of the REAL utilityProcess IPC entrypoint. This
+// accepts a fake reply port/dispatcher in tests, so forgetting a method on
+// either side of Electron IPC cannot hide behind a Proxy-only method test.
+export async function handleDesktopExtensionActionPacket(packet,port,dispatch=desktopAction) {
+  if(packet?.type!=='desktop_extension_action')return false;
+  const id=packet.request_id;
+  if(!PRIVATE_EVENT_ID.test(id||''))return true;
+  if(!isSupportedDesktopExtensionAction(packet.action)) {
+    port.postMessage({type:'desktop_extension_action_result',request_id:id,
+      ok:false,error:'Unsupported desktop action'});
+    return true;
+  }
+  try {
+    const result=await dispatch(packet);
+    port.postMessage({type:'desktop_extension_action_result',request_id:id,ok:true,result});
+  }catch(error) {
+    port.postMessage({type:'desktop_extension_action_result',request_id:id,ok:false,
+      error:String(error?.message||'Extension action failed')});
+  }
+  return true;
+}
 if (process.parentPort) {
   process.parentPort.on('message', async (event) => {
-    if (event?.data?.type === 'desktop_extension_action') {
-      const id = event.data.request_id;
-      if (!PRIVATE_EVENT_ID.test(id || '')) return;
-      const action = event.data.action;
-      if (!Object.hasOwn(desktopMethods,action) &&
-          !['inspect_root_repair','confirm_root_repair','verify_managed_browser','update_readiness',
-            'list_agent_closures','resolve_agent_closure','recover_queue_batch',
-            'focus_queue_manager'].includes(action)) return;
-      try {
-        const result = await desktopAction(event.data);
-        process.parentPort.postMessage({type:'desktop_extension_action_result',request_id:id,ok:true,result});
-      } catch (error) {
-        process.parentPort.postMessage({type:'desktop_extension_action_result',request_id:id,ok:false,
-          error:String(error?.message || 'Extension action failed')});
-      }
-      return;
-    }
+    if(await handleDesktopExtensionActionPacket(event?.data,process.parentPort))return;
     if (event?.data?.type === 'reload_agent_settings') {
       refreshExtensionSettings();
       process.parentPort.postMessage({ type: 'agent_settings_reloaded', revision: agentSettingsRevision });

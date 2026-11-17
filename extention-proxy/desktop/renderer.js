@@ -9,6 +9,8 @@ let lastCoordinationSnapshot = null;
 // Recovery feedback survives the periodic snapshot render that recreates rows.
 const queueRecoveryFeedback = new Map();
 const queueRecoveryBusy = new Set();
+const completionDecisionBusy = new Set();
+const completionDecisionFeedback = new Map();
 
 function notify(message, isError = false) {
   $('message').textContent = message;
@@ -303,17 +305,79 @@ function renderCoordinationSnapshot(snapshot) {
       const line=document.createElement('div');
       line.className='coordination-row';
       const label=document.createElement('span');
-      label.textContent=`Child tab ${task.tab_id} · task ${task.task_id} · ${task.status} · rechecks continue`;
+      const waiting=task.status==='waiting_for_children';
+      const notificationPending=task.notification_pending===true;
+      const last=task.last_observation;
+      label.textContent=`Child tab ${task.tab_id} · task ${task.task_id} · ${task.status}`+
+        ` · evidence: ${task.completion_evidence||'UNKNOWN'}`+
+        ` · last UI check: ${last?.state||'NOT_OBSERVED'} (${last?.evidence||'NONE'})`+
+        ` · checks: ${task.check_count||0}`+
+        (waiting?' · Own work confirmed; waiting for descendant reviews':
+          notificationPending
+            ? ' · Parent FIFO journal receipt NOT confirmed; same-task reconciliation pending'
+            : ' · periodic refresh/reinspection continues');
       line.append(label);
-      for(const [choice,title] of [['completed','Completed'],['in_progress','In Progress']]){
-        const button=document.createElement('button');
-        button.type='button';
-        button.className='secondary';
-        button.textContent=title;
-        button.addEventListener('click',()=>perform(async()=>{
-          await window.bridge.setCompletionStatus(task.task_id,choice,task.browser_session_id);
-        },'Manual task status recorded. The dashboard will refresh.'));
-        line.append(button);
+      if(task.pending_descendants){
+        const blockers=document.createElement('span');
+        blockers.className='queue-recovery-feedback';
+        const items=(task.pending_descendant_tasks||[]).map((item)=>
+          `tab ${item.tab_id}, task ${item.task_id||'unavailable'}: ${item.status}`);
+        blockers.textContent=' Descendant review blocks final completion: '+
+          (items.length?items.join('; '):'pending dependency; inspect Child tree');
+        line.append(blockers);
+      }
+      const key=`${task.browser_session_id}:${task.task_id}`;
+      if(task.manual_required===true&&!waiting){
+        for(const [choice,title] of [['completed','Completed'],['in_progress','In Progress']]){
+          const button=document.createElement('button');
+          button.type='button';
+          button.className='secondary';
+          button.textContent=title;
+          button.disabled=completionDecisionBusy.has(key);
+          button.addEventListener('click',async()=>{
+            if(completionDecisionBusy.has(key))return;
+            completionDecisionBusy.add(key);
+            for(const child of line.children)
+              if(child.type==='button')child.disabled=true;
+            try{
+              const result=await window.bridge.setCompletionStatus(task.task_id,choice,
+                task.browser_session_id);
+              const accepted=result?.task_id===task.task_id &&
+                (choice==='completed'
+                  ? ['done','waiting_for_children'].includes(result.status)
+                  : ['running','uncertain'].includes(result.status));
+              if(!accepted)
+                throw new Error('No matching task/status acknowledgement was returned');
+              const outcome=result?.pending_descendants
+                ? 'Own work confirmed; still waiting for descendant review. No Parent completion event yet.'
+                : result?.notification_pending
+                  ? 'Own work completed, but Parent FIFO receipt is unconfirmed. Same-task reconciliation is scheduled; do not resubmit the prompt.'
+                : choice==='completed'
+                  ? 'User-confirmed own-work completion recorded; Parent review is still required.'
+                  : 'In Progress recorded; monitoring continues.';
+              completionDecisionFeedback.set(key,{message:outcome,error:false});
+              notify(outcome);
+            }catch(error){
+              const message='Manual completion action uncertain: '+(error?.message||String(error))+
+                '. Recheck the task before retrying; a previous click may have taken effect.';
+              completionDecisionFeedback.set(key,{message,error:true});
+              notify(message,true);
+            }finally{
+              completionDecisionBusy.delete(key);
+              renderCoordinationSnapshot(lastCoordinationSnapshot);
+            }
+          });
+          line.append(button);
+        }
+      }
+      const feedback=completionDecisionFeedback.get(key);
+      if(feedback){
+        const message=document.createElement('span');
+        message.className='queue-recovery-feedback';
+        message.setAttribute('role','status');
+        message.textContent=feedback.message;
+        message.style.color=feedback.error?'#ff98a8':'#a4a4af';
+        line.append(message);
       }
       alerts.append(line);
     }

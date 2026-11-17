@@ -70,6 +70,21 @@ function setup() {
     ready:evalCode('stateReady')};
 }
 
+test('isolated hidden-page focus exception requires trusted managed identity and MAIN verification',async()=>{
+  const h=setup();await h.ready;
+  const sender={id:'test-extension',frameId:0,tab:h.mockTabs.get(101)};
+  const verify=()=>h.sendRuntime({type:'verify_managed_page_focus'},sender);
+  assert.equal((await verify()).allowed,false,'unregistered tabs are never exempt');
+  h.evalCode("managerIncarnations[101]='bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';"+
+    "approvedParents[101]=managerIncarnations[101];");
+  h.ctx.chrome.scripting={executeScript:async()=>[{result:false}]};
+  assert.equal((await verify()).allowed,false,'a disabled shim is not enough');
+  h.ctx.chrome.scripting.executeScript=async()=>[{result:true}];
+  assert.equal((await verify()).allowed,true,'only a verified MAIN-world shim is accepted');
+  const foreign={...sender,id:'different-extension'};
+  assert.equal((await h.sendRuntime({type:'verify_managed_page_focus'},foreign)).allowed,false);
+});
+
 test('a delegated Parent cannot complete until its grandchild result is reviewed',async()=>{
   const h=setup();await h.ready;
   h.evalCode(`
@@ -1288,6 +1303,225 @@ test('D-044 verified UI fallback does not equate idle to completion',async()=>{
   assert.equal(h.evalCode('tasks["'+taskId+'"].status'),'done');
   assert.equal(h.evalCode('tasks["'+taskId+'"].completionEvidence'),'UI_INFERRED');
   assert.deepEqual(reloads,[201,201]);
+});
+
+test('D-042 missed completion callback: task-correlated final reply needs two stable reload observations',async()=>{
+  const h=setup();await h.ready;
+  const taskId='aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const reloads=[];
+  h.ctx.__monitorReloads=reloads;
+  h.ctx.chrome.tabs.reload=async(id)=>{reloads.push(id);};
+  h.ctx.__monitorTranscript='User: <managed_child_setup>assigned task_id '+taskId+
+    '</managed_child_setup>'+String.fromCharCode(10,10)+
+    'Assistant: Final answer: 17 x 19 is 323. The sum from 1 to 50 is 1275.';
+  h.evalCode(`
+    workers=[201];
+    workerIncarnations={201:'44444444-4444-4444-8444-444444444444'};
+    tasks={'${taskId}':{
+      id:'${taskId}',tabId:201,site:'chatgpt',status:'running',
+      owner:'legacy',startedAt:1,submissionConfirmed:true,
+      workerIncarnationId:workerIncarnations[201],
+      monitor:{step:0,nextCheckAt:0,manualRequired:false}}};
+    pageSettling.waitForReady=async()=>({ready:true});
+    setTimeout=(fn)=>{fn();return 1;};
+    proxySettings={completionMonitor:{initialMinutes:5,retryMinutes:[5,3,1],
+      hydrationSeconds:5,continuedMinutes:2}};
+    tabMessage=async(id,msg)=>msg.cmd==='observe_state'
+      ? {ok:true,state:'idle'} : {ok:true,transcript:__monitorTranscript};
+  `);
+  await h.evalCode('inspectDueCompletion')(taskId);
+  assert.equal(h.evalCode('tasks["'+taskId+'"].status'),'running',
+    'one idle page with final-looking text must never complete the task');
+  assert.equal(h.evalCode('tasks["'+taskId+'"].monitor.lastObservation.evidence'),
+    'FIRST_FINAL_RESPONSE');
+  h.evalCode('tasks["'+taskId+'"].monitor.nextCheckAt=0');
+  await h.evalCode('inspectDueCompletion')(taskId);
+  assert.equal(h.evalCode('tasks["'+taskId+'"].status'),'done');
+  assert.equal(h.evalCode('tasks["'+taskId+'"].completionEvidence'),'UI_INFERRED');
+  assert.deepEqual(reloads,[201,201]);
+});
+
+test('D-042 fallback refuses wrong task marker, incomplete reply and a changed response',async()=>{
+  const h=setup();await h.ready;
+  const taskId='aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const task=h.evalCode('({id:"'+taskId+'"})');
+  const final='Assistant: Final answer: verified result 323 and sum of 1 to 50 is 1275.';
+  const sep=String.fromCharCode(10,10);
+  const parser=h.evalCode('monitoredFinalAnswer');
+  assert.equal(parser(task,'User: task not associated with this child'+sep+final),null);
+  assert.equal(parser(task,'User: task '+taskId+
+    sep+'Assistant: Still working, final answer to follow.'),null);
+  assert.match(parser(task,'User: assigned '+taskId+sep+final),/Final answer/);
+  const contextContinuation='User: assigned '+taskId+sep+
+    'Assistant: Need context'+sep+'User: The Phase C token is ORBIT-42'+sep+final;
+  assert.equal(parser(task,contextContinuation),null,
+    'untracked later user text must not become completion evidence');
+  assert.match(parser({...task,contextResponseCount:1},contextContinuation),/Final answer/,
+    'a recorded Parent context response retains the same assigned task');
+});
+
+test('D-042 stable-response verification hashes full answer, not just an identical prefix',async()=>{
+  const h=setup();await h.ready;
+  const taskId='aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  h.ctx.chrome.tabs.reload=async()=>{};
+  h.ctx.__monitorTranscript='User: assigned '+taskId+
+    String.fromCharCode(10,10)+'Assistant: Final answer: '+
+    'A'.repeat(220)+' one.';
+  h.evalCode(`
+    workers=[201];workerIncarnations={201:'44444444-4444-4444-8444-444444444444'};
+    tasks={'${taskId}':{
+      id:'${taskId}',tabId:201,site:'chatgpt',status:'running',
+      owner:'legacy',workerIncarnationId:workerIncarnations[201],
+      monitor:{step:0,nextCheckAt:0,manualRequired:false}}};
+    pageSettling.waitForReady=async()=>({ready:true});
+    setTimeout=(fn)=>{fn();return 1;};
+    proxySettings={completionMonitor:{initialMinutes:5,retryMinutes:[5,3,1],
+      hydrationSeconds:5,continuedMinutes:2}};
+    tabMessage=async(id,msg)=>msg.cmd==='observe_state'?{ok:true,state:'idle'}:
+      {ok:true,transcript:__monitorTranscript};
+  `);
+  await h.evalCode('inspectDueCompletion')(taskId);
+  const firstDigest=h.evalCode('tasks["'+taskId+'"].monitor.finalObservation.signature');
+  assert.match(firstDigest,/^[a-f0-9]{64}$/);
+  assert.equal(firstDigest.includes('AAAA'),false,'do not persist answer text');
+  h.ctx.__monitorTranscript='User: assigned '+taskId+
+    String.fromCharCode(10,10)+'Assistant: Final answer: '+
+    'A'.repeat(220)+' two.';
+  h.evalCode('tasks["'+taskId+'"].monitor.nextCheckAt=0');
+  await h.evalCode('inspectDueCompletion')(taskId);
+  assert.equal(h.evalCode('tasks["'+taskId+'"].status'),'running');
+  assert.notEqual(h.evalCode('tasks["'+taskId+'"].monitor.finalObservation.signature'),firstDigest);
+});
+
+test('D-042 failed intermediate reload invalidates the prior final-response candidate',async()=>{
+  const h=setup();await h.ready;
+  const taskId='aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  h.ctx.chrome.tabs.reload=async()=>{};
+  h.ctx.__monitorTranscript='User: assigned '+taskId+
+    String.fromCharCode(10,10)+'Assistant: Final answer: the result is 323 and the sum is 1275.';
+  h.evalCode(`
+    workers=[201];workerIncarnations={201:'44444444-4444-4444-8444-444444444444'};
+    tasks={'${taskId}':{id:'${taskId}',tabId:201,site:'chatgpt',status:'running',
+      owner:'legacy',workerIncarnationId:workerIncarnations[201],
+      monitor:{step:0,nextCheckAt:0,manualRequired:false}}};
+    pageSettling.waitForReady=async()=>({ready:true});
+    setTimeout=(fn)=>{fn();return 1;};
+    proxySettings={completionMonitor:{initialMinutes:5,retryMinutes:[5,3,1],
+      hydrationSeconds:5,continuedMinutes:2}};
+    tabMessage=async(id,msg)=>msg.cmd==='observe_state'?{ok:true,state:'idle'}:
+      {ok:true,transcript:__monitorTranscript};
+  `);
+  await h.evalCode('inspectDueCompletion')(taskId);
+  assert.equal(h.evalCode('tasks["'+taskId+'"].monitor.lastObservation.evidence'),
+    'FIRST_FINAL_RESPONSE');
+  h.evalCode(`
+    tasks['${taskId}'].monitor.nextCheckAt=0;
+    tabMessage=async()=>{throw Error('read unavailable')};
+  `);
+  await h.evalCode('inspectDueCompletion')(taskId);
+  assert.equal(h.evalCode('tasks["'+taskId+'"].monitor.finalObservation'),null);
+  h.evalCode(`
+    tasks['${taskId}'].monitor.nextCheckAt=0;
+    tabMessage=async(id,msg)=>msg.cmd==='observe_state'?{ok:true,state:'idle'}:
+      {ok:true,transcript:__monitorTranscript};
+  `);
+  await h.evalCode('inspectDueCompletion')(taskId);
+  assert.equal(h.evalCode('tasks["'+taskId+'"].status'),'running');
+  h.evalCode('tasks["'+taskId+'"].monitor.nextCheckAt=0');
+  await h.evalCode('inspectDueCompletion')(taskId);
+  assert.equal(h.evalCode('tasks["'+taskId+'"].status'),'done');
+});
+
+test('D-044 manual completion shows descendant blockers without prematurely notifying Parent',async()=>{
+  const h=setup();await h.ready;
+  const taskId='88888888-8888-4888-8888-888888888888';
+  h.evalCode(`
+    workers=[201,301];workerParents={301:201};
+    workerIncarnations={201:'22222222-2222-4222-8222-222222222222',
+      301:'33333333-3333-4333-8333-333333333333'};
+    tasks={
+      '${taskId}':{id:'${taskId}',tabId:201,site:'chatgpt',
+        status:'running',owner:'legacy',startedAt:1,
+        workerIncarnationId:workerIncarnations[201],
+        monitor:{step:4,nextCheckAt:0,manualRequired:true}},
+      descendant:{id:'descendant',tabId:301,site:'chatgpt',status:'done',
+        startedAt:2,parentReviewed:false}};
+  `);
+  const handle=h.evalCode('handleCall');
+  const initial=await handle('desktop_completion_status',{__trustedDesktopConsent:true});
+  assert.equal(initial.length,1);
+  assert.equal(initial[0].pending_descendants,true);
+  assert.equal(initial[0].pending_descendant_tasks[0].tab_id,301);
+  const confirmation=await handle('desktop_set_manual_completion',{
+    __trustedDesktopConsent:true,task_id:taskId,status:'completed'});
+  assert.equal(confirmation.status,'waiting_for_children');
+  const pending=await handle('desktop_completion_status',{__trustedDesktopConsent:true});
+  assert.equal(pending[0].manual_required,false,'do not offer Completed a second time');
+  assert.equal(pending[0].completion_evidence,'USER_CONFIRMED');
+  assert.equal(pending[0].pending_descendants,true);
+  h.evalCode('tasks.descendant.parentReviewed=true');
+  await h.evalCode('releaseReadyParentTasks()');
+  assert.equal(h.evalCode('tasks["'+taskId+'"].status'),'done');
+  assert.equal((await handle('desktop_completion_status',{__trustedDesktopConsent:true})).length,0);
+});
+
+test('D-039 terminal Child receipt reconciles once with stable task ID, without sending another chat prompt',async()=>{
+  const h=setup();await h.ready;
+  const taskId='88888888-8888-4888-8888-888888888888';
+  h.ctx.WebSocket={OPEN:1};
+  h.evalCode(`
+    privateQueueMode='enabled';
+    workers=[201];
+    workerIncarnations={201:'22222222-2222-4222-8222-222222222222'};
+    tasks={'${taskId}':{
+      id:'${taskId}',tabId:201,site:'chatgpt',status:'done',
+      owner:'credential:44444444-4444-4444-8444-444444444444',
+      workerIncarnationId:workerIncarnations[201],result:'Finished',
+      journalReceiptUncertain:true,startedAt:1,finishedAt:2}};
+    __sent=[];
+    ws={readyState:1,send(json){
+      const message=JSON.parse(json);
+      __sent.push(message);
+      const pending=workerReceiptWaiters.get(message.request_id);
+      clearTimeout(pending.timer);
+      workerReceiptWaiters.delete(message.request_id);
+      pending.resolve({durably_recorded:true});
+    }};
+  `);
+  const handle=h.evalCode('handleCall');
+  const before=await handle('desktop_completion_status',{__trustedDesktopConsent:true});
+  assert.equal(before.length,1,'a done Child with no journal ACK stays visible in Desktop');
+  assert.equal(before[0].notification_pending,true);
+  assert.equal(before[0].manual_required,false);
+  assert.equal(before[0].next_check_at,null,'terminal task no longer needs page reload');
+  await h.evalCode('reconcileTerminalWorkerReceipts')();
+  assert.equal(h.evalCode('__sent.length'),1);
+  assert.equal(h.evalCode('__sent[0].type'),'worker_done');
+  assert.equal(h.evalCode('__sent[0].task_id'),taskId);
+  assert.equal(h.evalCode('tasks["'+taskId+'"].journalReceipt'),true);
+  assert.equal(h.evalCode('tasks["'+taskId+'"].journalReceiptUncertain'),false);
+  await h.evalCode('reconcileTerminalWorkerReceipts')();
+  assert.equal(h.evalCode('__sent.length'),1,'a durable fsync ACK stops retries');
+  assert.equal((await handle('desktop_completion_status',{__trustedDesktopConsent:true})).length,0);
+  assert.equal(h.evalCode('tasks["'+taskId+'"].status'),'done');
+});
+
+test('D-039 receipt reconciliation will not route to a replaced Child incarnation',async()=>{
+  const h=setup();await h.ready;
+  h.ctx.WebSocket={OPEN:1};
+  h.evalCode(`
+    privateQueueMode='enabled';
+    workers=[201];workerIncarnations={201:'22222222-2222-4222-8222-222222222222'};
+    tasks={one:{id:'88888888-8888-4888-8888-888888888888',
+      tabId:201,site:'chatgpt',status:'done',
+      owner:'credential:44444444-4444-4444-8444-444444444444',
+      workerIncarnationId:'99999999-9999-4999-8999-999999999999',result:'Done'}};
+    __sent=[];
+    ws={readyState:1,send(json){__sent.push(json)}};
+  `);
+  await h.evalCode('reconcileTerminalWorkerReceipts')();
+  assert.equal(h.evalCode('__sent.length'),0);
+  assert.equal(h.evalCode('tasks.one.journalReceipt'),undefined);
 });
 
 test('D-026 reconstructs missed Parent closure once after a verified live-tab inventory',async()=>{

@@ -20,6 +20,9 @@ async function refresh(fillFields = false) {
       $('serverUrl').value = state.cfg.serverUrl;
       const prefs=await chrome.storage.local.get('foregroundSubmitEnabled');
       $('foregroundSubmit').checked=prefs?.foregroundSubmitEnabled===true;
+      const model=await chrome.storage.local.get(['chatgptModelLabel','chatgptReasoningEffort']);
+      $('chatgptModelLabel').value=model?.chatgptModelLabel || '';
+      $('chatgptReasoningEffort').value=model?.chatgptReasoningEffort || '';
     }
     $('profileToken').placeholder=state.profileTokenConfigured
       ? 'Connection key saved for this profile (leave blank to keep it)'
@@ -84,6 +87,25 @@ $('foregroundSubmit').addEventListener('change',async()=>{
     input.checked=prefs.foregroundSubmitEnabled===true;
     $('next-step').textContent='Unable to save foreground Send preference.';
   } finally {input.disabled=false;}
+});
+$('saveModelPreferences').addEventListener('click',async()=>{
+  const button=$('saveModelPreferences');
+  const label=$('chatgptModelLabel').value.trim();
+  const effort=$('chatgptReasoningEffort').value;
+  if(label.length>80 || /[\u0000-\u001f\u007f]/.test(label) ||
+      !['','Instant','Medium','High','Extra High','Pro'].includes(effort)){
+    $('next-step').textContent='Invalid model name or thinking effort.';
+    return;
+  }
+  button.disabled=true;
+  try{
+    await chrome.storage.local.set({chatgptModelLabel:label,chatgptReasoningEffort:effort});
+    $('next-step').textContent=label||effort
+      ? 'Model preferences saved. Managed ChatGPT sends will verify these options.'
+      : 'Automatic model selection disabled; ChatGPT settings remain unchanged.';
+  }catch{
+    $('next-step').textContent='Could not save model preferences.';
+  }finally{button.disabled=false;}
 });
 $('pair').addEventListener('click', async () => {
   const button = $('pair');

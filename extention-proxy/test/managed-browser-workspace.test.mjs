@@ -261,7 +261,10 @@ test('Child completion notification cannot take focus from an unfinished worker 
   assert.equal((await worker).submission_confirmed,true);
   await untilStarted(()=>Boolean(managerAck));
   assert.deepEqual(calls.map(c=>c.cmd),['run_prompt','submit_manager_batch']);
-  assert.equal(h.windows.get(1).focused,true,'Parent gets focus only after worker Send');
+  assert.equal(h.windows.get(2).focused,true,
+    'Parent notification must not steal OS focus after the worker Send');
+  assert.equal(h.windows.get(1).focused,false,
+    'queue delivery does not foreground the Parent browser window');
   managerAck({ok:true,submitted:true});
   assert.equal((await notification).submitted,true);
   assert.equal(h.windows.get(2).focused,true,'original browser focus restored');
@@ -286,7 +289,8 @@ test('worker startup waits for a pending Parent completion notification Send',as
     {taskTimeoutMin:1},false,'credential:test');
   await new Promise(resolve=>setTimeout(resolve,30));
   assert.equal(workerAck,undefined,'worker must not steal the Parent notification focus');
-  assert.equal(h.windows.get(1).focused,true);
+  assert.equal(h.windows.get(2).focused,true,
+    'FIFO notification holds its slot without bringing the Parent to foreground');
   managerAck({ok:true,submitted:true});
   assert.equal((await notification).submitted,true);
   await untilStarted(()=>Boolean(workerAck));
@@ -295,6 +299,83 @@ test('worker startup waits for a pending Parent completion notification Send',as
   workerAck({ok:true,submitted:true});
   assert.equal((await worker).submission_confirmed,true);
   assert.equal(h.windows.get(2).focused,true);
+});
+
+test('FIFO notification activates only the Parent tab inside its unfocused browser window',async()=>{
+  const h=harness();await h.ready;
+  optInForegroundFocus(h);
+  const wake=completionWake(h);
+  let mainWorldVerified=0;
+  h.chrome.scripting={executeScript:async(args)=>{
+    assert.equal(args.target.tabId,101);
+    assert.equal(args.world,'MAIN');
+    if(args.func)mainWorldVerified++;
+    return [{result:true}];
+  }};
+  h.tabs.get(101).active=false;
+  h.windows.get(1).state='minimized';
+  const originalFocused=h.windows.get(2).focused;
+  const calls=[];
+  h.chrome.tabs.sendMessage=async(tabId,msg)=>{
+    calls.push({tabId,cmd:msg.cmd});
+    assert.equal(h.tabs.get(101).active,true,
+      'background tab activation must finish before delivery');
+    assert.equal(h.windows.get(2).focused,true,
+      'activating a tab must not change the active OS/browser window');
+    assert.equal(h.windows.get(1).state,'minimized',
+      'manager wake must not restore/minimize the OS window');
+    return {ok:true,submitted:true};
+  };
+  const outcome=await runInContext('handleCall',h.ctx)('wake_manager',wake);
+  assert.equal(outcome.submitted,true);
+  assert.deepEqual(calls.map(c=>c.cmd),['submit_manager_batch']);
+  assert.equal(originalFocused,true);
+  assert.equal(h.windows.get(2).focused,true);
+  assert.equal(h.windows.get(1).focused,false);
+  assert.equal(h.windows.get(1).state,'minimized');
+  assert.equal(mainWorldVerified,1,
+    'Parent MAIN-world managed focus must be re-verified before background Send');
+  assert.equal(h.events.startupSequence.filter(s=>s==='focus:101').length,1);
+  assert.equal(h.events.startupSequence.filter(s=>s==='windowFocus:1').length,0);
+});
+
+test('FIFO notification never changes visible Parent window active tab',async()=>{
+  const h=harness();await h.ready;
+  optInForegroundFocus(h,1);
+  const wake=completionWake(h);
+  h.tabs.get(101).active=false;
+  let sent=0;
+  h.chrome.tabs.sendMessage=async()=>{
+    sent++;
+    assert.equal(h.tabs.get(101).active,false,
+      'do not switch the user away from their active browser tab');
+    return {ok:true,submitted:true};
+  };
+  const outcome=await runInContext('handleCall',h.ctx)('wake_manager',wake);
+  assert.equal(outcome.submitted,true);
+  assert.equal(sent,1);
+  assert.equal(h.windows.get(1).focused,true);
+  assert.equal(h.events.startupSequence.filter(s=>s==='focus:101').length,0);
+});
+
+test('operator Retry exact Parent draft does not foreground the browser',async()=>{
+  const h=harness();await h.ready;
+  optInForegroundFocus(h);
+  const wake=completionWake(h);
+  h.tabs.get(101).active=false;
+  let tries=0;
+  h.chrome.tabs.sendMessage=async(tabId,msg)=>{
+    assert.equal(tabId,101);
+    assert.equal(msg.cmd,'retry_manager_draft');
+    assert.equal(h.windows.get(2).focused,true);
+    tries++;
+    return {ok:true,submitted:true};
+  };
+  const outcome=await runInContext('handleCall',h.ctx)('retry_manager_batch',wake);
+  assert.equal(outcome.submitted,true);
+  assert.equal(tries,1);
+  assert.equal(h.windows.get(2).focused,true);
+  assert.equal(h.events.startupSequence.filter(s=>s==='windowFocus:1').length,0);
 });
 
 test('manual Parent focus and retry are FIFO behind an unfinished worker Send',async()=>{
@@ -572,4 +653,47 @@ test('Edge group becomes visible after tabs.group resolves: wait before updating
   assert.ok(misses >= 4);
   assert.equal(tab.windowId,h.storage.workspaceWindow.windowId);
   assert.equal(h.events.tabCreates,1);
+});
+
+test('opt-in foreground Send restores minimized worker, then minimizes after ACK',async()=>{
+  const h=harness();await h.ready;
+  const tab=await h.create('https://chatgpt.com/',h.first,101);
+  h.register(tab);optInForegroundFocus(h);
+  h.windows.get(tab.windowId).state='minimized';
+  const updates=[];
+  h.chrome.windows.update=async(id,patch)=>{
+    const win=h.windows.get(id);
+    if(!win)throw Error('Window missing');
+    updates.push({id,...patch});
+    if(patch.state){
+      win.state=patch.state;
+      if(patch.state==='minimized')win.focused=false;
+    }
+    if(patch.focused===true){
+      for(const other of h.windows.values())other.focused=false;
+      win.focused=true;
+    }
+    return win;
+  };
+  runInContext('waitReady=async()=>{};confirmTabIdle=async()=>{};'+
+    'issueManagedChildPairing=async()=>"11111111-1111-4111-8111-111111111111";'+
+    'proxySettings={connectorName:"PC1"};proxySettingsRevision=1;wsState="connected";',h.ctx);
+  let receipt;
+  h.chrome.tabs.sendMessage=async(_id,msg)=>{
+    assert.equal(msg.cmd,'run_prompt');
+    assert.equal(h.windows.get(tab.windowId).state,'normal');
+    assert.equal(h.windows.get(tab.windowId).focused,true);
+    return new Promise(resolve=>{receipt=resolve;});
+  };
+  const started=runInContext('startTask',h.ctx)(tab.id,'chatgpt',
+    'Minimized foreground test',0,{taskTimeoutMin:1},false,'credential:test');
+  await untilStarted(()=>Boolean(receipt));
+  assert.equal(h.windows.get(tab.windowId).state,'normal');
+  receipt({ok:true,submitted:true});
+  const result=await started;
+  assert.equal(result.submission_confirmed,true);
+  assert.equal(h.windows.get(tab.windowId).state,'minimized');
+  assert.equal(h.windows.get(2).focused,true);
+  assert.equal(updates.filter(item=>item.id===tab.windowId&&item.state==='normal').length,1);
+  assert.equal(updates.filter(item=>item.id===tab.windowId&&item.state==='minimized').length,1);
 });

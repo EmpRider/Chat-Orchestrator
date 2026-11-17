@@ -734,6 +734,34 @@ function hasUnreviewedDescendants(parentTabId,seen=new Set()) {
     entry.parentTabId===parentTabId && entry.reviewResolved!==true);
 }
 
+// Desktop-only, bounded explanation of the same D-046 dependency gate.
+// Do not expose provider responses or Agent credentials in status alerts.
+function pendingCompletionDescendants(parentTabId) {
+  const pending=[];
+  const visited=new Set([parentTabId]);
+  const walk=(tabId)=>{
+    for(const childId of workers.filter((id)=>workerParents[id]===tabId)){
+      if(visited.has(childId))continue;
+      visited.add(childId);
+      const childTasks=Object.values(tasks).filter((task)=>task.tabId===childId);
+      if(!childTasks.length)pending.push({tab_id:childId,status:'NO_TASK_RECORD'});
+      for(const child of childTasks) {
+        if(!['done','failed'].includes(child.status)||child.parentReviewed!==true)
+          pending.push({tab_id:childId,task_id:child.id,status:child.status,
+            parent_reviewed:child.parentReviewed===true});
+      }
+      walk(childId);
+    }
+  };
+  walk(parentTabId);
+  for(const lost of Object.values(lostWorkers)) {
+    if(lost.reviewResolved===true || !visited.has(lost.parentTabId))continue;
+    pending.push({tab_id:lost.tabId,task_id:lost.taskId||null,
+      status:'RECOVERY_REVIEW_PENDING'});
+  }
+  return pending.slice(0,20);
+}
+
 async function releaseReadyParentTasks() {
   const ready=Object.values(tasks).filter((task)=>
     task.status==='waiting_for_children' && !hasUnreviewedDescendants(task.tabId));
@@ -796,6 +824,30 @@ function scheduleNextCompletionCheck(task,settings,now=Date.now()){
   monitor.nextCheckAt=now+gap*60000;
   monitor.claimedAt=now;
 }
+// D-042 fallback when the content-script completion callback was missed.
+// A final-looking page is not enough: the transcript must contain THIS task's
+// unique setup marker, end with an explicit final-answer cue, and stay the same
+// over two independently reloaded inspections. Otherwise require D-044 manual
+// confirmation instead of guessing from generic website idle.
+function monitoredFinalAnswer(task,transcript) {
+  const parts=String(transcript||'').split(/(?:^|\n\n)(User|Assistant):\s*/);
+  const turns=[];
+  for(let i=1;i<parts.length;i+=2)
+    turns.push({role:parts[i],text:String(parts[i+1]||'').trim()});
+  const last=turns.at(-1);
+  if(last?.role!=='Assistant')return null;
+  const markerIndex=turns.findLastIndex((turn)=>
+    turn.role==='User' && turn.text.includes(task.id));
+  const lastUserIndex=turns.findLastIndex((turn)=>turn.role==='User');
+  if(markerIndex<0||lastUserIndex<markerIndex||lastUserIndex!==turns.length-2 ||
+      (lastUserIndex!==markerIndex && !(task.contextResponseCount>0)))
+    return null;
+  const answer=last.text.replace(/\s+/g,' ').trim();
+  if(answer.length<24 || /\b(?:still working|work in progress|to be continued|waiting for|cannot finish|not completed|incomplete)\b/i.test(answer) ||
+      !/\b(?:final answer|final result|completed task|task completed|here is the result|the result is|the answer is)\b/i.test(answer))
+    return null;
+  return answer;
+}
 async function inspectDueCompletion(taskId){
   if(completionChecksInFlight.has(taskId))return;
   completionChecksInFlight.add(taskId);
@@ -809,24 +861,65 @@ async function inspectDueCompletion(taskId){
     const live=await chrome.tabs.get(task.tabId).catch(()=>null);
     if(!live||!workers.includes(task.tabId) ||
         workerIncarnations[task.tabId]!==task.workerIncarnationId ||
-        siteOfUrl(live.url)!==task.site)return;
+        siteOfUrl(live.url)!==task.site){
+      task.monitor.finalObservation=null;
+      task.monitor.lastObservation={at:Date.now(),state:'UNKNOWN',evidence:'CHILD_TAB_UNVERIFIED'};
+      await saveState();
+      return;
+    }
     const before=safeConversationRoute(live.url);
     if(!before || (task.uiCandidate?.conversationRoute &&
-        task.uiCandidate.conversationRoute!==before))return;
+        task.uiCandidate.conversationRoute!==before)){
+      task.monitor.finalObservation=null;
+      task.monitor.lastObservation={at:Date.now(),state:'UNKNOWN',evidence:'CONVERSATION_UNVERIFIED'};
+      await saveState();
+      return;
+    }
     // Never refresh a detached, closed, replaced or unrelated Agent tab.
     await chrome.tabs.reload(task.tabId);
     await pageSettling.waitForReady(task.tabId,45000);
     await sleep(config.hydrationSeconds*1000);
     const afterTab=await chrome.tabs.get(task.tabId).catch(()=>null);
     if(!afterTab||safeConversationRoute(afterTab.url)!==before ||
-        workerIncarnations[task.tabId]!==task.workerIncarnationId)return;
+        workerIncarnations[task.tabId]!==task.workerIncarnationId){
+      task.monitor.finalObservation=null;
+      task.monitor.lastObservation={at:Date.now(),state:'UNKNOWN',evidence:'RELOADED_TAB_UNVERIFIED'};
+      await saveState();
+      return;
+    }
     const state=await tabMessage(task.tabId,{cmd:'observe_state'});
-    const chat=await tabMessage(task.tabId,{cmd:'read_chat',lastN:2});
+    const chat=await tabMessage(task.tabId,{cmd:'read_chat',lastN:12});
     const normalized=(value)=>String(value||'').replace(/\s+/g,' ').trim();
     const lastAssistant=String(chat?.transcript||'').split(/(?:^|\n\n)Assistant:\s*/).at(-1);
     const signature=normalized(task.uiCandidate?.signature||'');
-    if(state?.ok===true&&state.state==='idle' && chat?.ok===true &&
-        signature.length>=12 && normalized(lastAssistant).includes(signature)){
+    const idle=state?.ok===true&&state.state==='idle'&&chat?.ok===true;
+    const knownCompletion=idle&&signature.length>=12 &&
+      normalized(lastAssistant).includes(signature);
+    const fallback=idle&&!knownCompletion
+      ? monitoredFinalAnswer(task,chat.transcript):null;
+    // Compare the ENTIRE answer, not the first 180 characters; retain only
+    // an opaque digest as operational state (D-067: no transcript archiving).
+    const fallbackDigest=fallback
+      ? Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',
+          new TextEncoder().encode(fallback))),byte=>byte.toString(16).padStart(2,'0')).join('')
+      : null;
+    const previous=task.monitor.finalObservation;
+    const stableFallback=Boolean(fallbackDigest && previous?.taskId===task.id &&
+      previous.route===before && previous.signature===fallbackDigest &&
+      previous.checkIndex<task.monitor.step);
+    task.monitor.finalObservation=fallbackDigest
+      ? {taskId:task.id,route:before,signature:fallbackDigest,
+          checkIndex:task.monitor.step,observedAt:Date.now()}
+      : null;
+    task.monitor.lastObservation={
+      at:Date.now(),state:!state?.ok||!chat?.ok?'UNKNOWN':
+        state.state==='idle'?'IDLE_RESPONSE_UNVERIFIED':'IN_PROGRESS',
+      evidence:knownCompletion?'MATCHED_CALLBACK_SIGNATURE':
+        stableFallback?'TWO_STABLE_FINAL_RESPONSES':
+        fallback?'FIRST_FINAL_RESPONSE':'NONE',
+    };
+    await saveState();
+    if(knownCompletion||stableFallback){
       const current=tasks[taskId];
       if(current===task&&['running','uncertain'].includes(current.status)&&
           current.completionEvidence!=='EXPLICIT_MCP'){
@@ -842,6 +935,12 @@ async function inspectDueCompletion(taskId){
     }
   } catch {
     // A failed reload or unknown UI is not an inferred completion.
+    const task=tasks[taskId];
+    if(task?.monitor && ['running','uncertain'].includes(task.status)) {
+      task.monitor.finalObservation=null;
+      task.monitor.lastObservation={at:Date.now(),state:'UNKNOWN',evidence:'RELOAD_OR_READ_FAILED'};
+      await saveState();
+    }
   } finally {completionChecksInFlight.delete(taskId);}
 }
 async function checkDueCompletions(){
@@ -1405,6 +1504,33 @@ function serializePromptStartup(operation) {
   promptStartupTail = next.catch(() => {});
   return next;
 }
+// Activate a managed Parent tab inside an UNFOCUSED browser window without
+// foregrounding the browser/stealing focus from the user's current PC app.
+// This is tab activation, not OS focus: Chromium may still throttle a
+// minimized window, so submission evidence remains mandatory.
+async function prepareBackgroundManagerTab(tabId,principal) {
+  const tab=await chrome.tabs.get(tabId);
+  if(!tab || siteOfUrl(tab.url)!=='chatgpt' ||
+      principal?.mode!=='profile' || principal?.callerTabId!==tabId ||
+      principal.browserSessionId!==browserSessionId ||
+      principal.sessionIncarnationId!==
+        (workerIncarnations[tabId]||managerIncarnations[tabId]))
+    throw new Error('Parent background activation requires an authenticated ChatGPT manager');
+  if(tab.active!==false || !Number.isSafeInteger(tab.windowId))
+    return {activated:false,reason:'ALREADY_ACTIVE_OR_WINDOW_UNKNOWN'};
+  const window=await chrome.windows.get(tab.windowId);
+  if(!window)return {activated:false,reason:'WINDOW_UNKNOWN'};
+  if(window.focused!==false)
+    return {activated:false,reason:window.focused===true
+      ? 'USER_WORKING_IN_BROWSER' : 'WINDOW_FOCUS_UNKNOWN'};
+  await chrome.tabs.update(tabId,{active:true});
+  const changed=await chrome.tabs.get(tabId);
+  if(changed?.active!==true)
+    throw new Error('Parent tab could not be activated in its background window');
+  extensionDiagnostic('info','manager.background_tab_activated',{
+    tabId,windowId:tab.windowId});
+  return {activated:true,reason:'BACKGROUND_WINDOW'};
+}
 // Opt-in only. A page-facing hasFocus()/visibility shim cannot resume a
 // background Chromium compositor or deliver trusted native user input.
 // Temporarily foreground the dedicated worker window while its first user
@@ -1421,20 +1547,28 @@ async function acquireForegroundSubmitLease(tabId,kind='child') {
   if(!Number.isSafeInteger(tab.windowId))
     throw new Error('Managed worker has no browser window to focus');
   const originalWindow=await chrome.windows.get(tab.windowId);
-  if(!originalWindow || originalWindow.state==='minimized')
-    throw new Error('Open the managed browser window before foreground submission');
+  if(!originalWindow)
+    throw new Error('Managed browser window is unavailable');
+  // The user explicitly opted in to temporary real focus. A minimized
+  // window must be restored for that Send, then minimized again only if
+  // the user has not switched away or changed the active tab in the interim.
+  const originallyMinimized=originalWindow.state==='minimized';
   const previous=await chrome.windows.getLastFocused().catch(()=>null);
   const previousBrowserWindowId=previous?.id??null;
   const previousBrowserWindowWasFocused=previous?.focused===true;
   const activeBefore=await chrome.tabs.query({active:true,windowId:tab.windowId})
     .catch(()=>[]);
   try {
+    if(originallyMinimized)
+      await chrome.windows.update(tab.windowId,{state:'normal'});
     await chrome.windows.update(tab.windowId,{focused:true});
     if(kind==='manager')await chrome.tabs.update(tabId,{active:true});
     const focused=await chrome.windows.get(tab.windowId);
     if(focused?.focused!==true)
       throw new Error('Browser declined real foreground focus; no prompt submitted');
   }catch(error){
+    if(originallyMinimized)
+      await chrome.windows.update(tab.windowId,{state:'minimized'}).catch(()=>{});
     if(previousBrowserWindowWasFocused && previousBrowserWindowId!==tab.windowId)
       await chrome.windows.update(previousBrowserWindowId,{focused:true}).catch(()=>{});
     throw error;
@@ -1451,6 +1585,8 @@ async function acquireForegroundSubmitLease(tabId,kind='child') {
       if(current?.focused!==true)return;
       const active=await chrome.tabs.query({active:true,windowId:tab.windowId});
       if(active?.[0]?.id!==tabId)return;
+      if(originallyMinimized)
+        await chrome.windows.update(tab.windowId,{state:'minimized'});
       if(previousBrowserWindowWasFocused && previousBrowserWindowId!==tab.windowId){
         await chrome.windows.update(previousBrowserWindowId,{focused:true});
       } else if(previousBrowserWindowId===tab.windowId && activeBefore?.[0]?.id!==tabId &&
@@ -2235,13 +2371,25 @@ async function handleCall(method, p = {}) {
       if(p.__trustedDesktopConsent!==true)
         throw new Error('Completion monitoring is a local Desktop-only control');
       return Object.values(tasks).filter((task)=>
-        ['running','uncertain'].includes(task.status) &&
-        task.monitor?.manualRequired===true &&
+        ((['running','uncertain','waiting_for_children'].includes(task.status) &&
+          task.monitor?.manualRequired===true) ||
+          (['done','failed'].includes(task.status) &&
+            task.owner?.startsWith('credential:') && task.journalReceipt!==true)) &&
         workers.includes(task.tabId) &&
         workerIncarnations[task.tabId]===task.workerIncarnationId)
         .map((task)=>({task_id:task.id,tab_id:task.tabId,site:task.site,
           status:task.status,completion_evidence:task.completionEvidence||'UNKNOWN',
-          next_check_at:task.monitor.nextCheckAt,manual_required:true}));
+          next_check_at:['running','uncertain'].includes(task.status)
+            ? task.monitor?.nextCheckAt||null:null,
+          last_observation:task.monitor?.lastObservation||null,
+          check_count:task.monitor?.step||0,
+          pending_descendants:hasUnreviewedDescendants(task.tabId),
+          pending_descendant_tasks:pendingCompletionDescendants(task.tabId),
+          manual_required:['running','uncertain'].includes(task.status) &&
+            task.monitor?.manualRequired===true,
+          notification_pending:['done','failed'].includes(task.status) &&
+            task.owner?.startsWith('credential:') && task.journalReceipt!==true,
+          next_receipt_check_at:task.journalRetryAt||null}));
     }
     case 'desktop_set_manual_completion': {
       if(p.__trustedDesktopConsent!==true ||
@@ -2269,7 +2417,9 @@ async function handleCall(method, p = {}) {
         await saveState();
       }
       return {...summarize(task),completion_evidence:task.completionEvidence||null,
-        pending_descendants:task.status==='waiting_for_children'};
+        pending_descendants:task.status==='waiting_for_children',
+        notification_pending:task.status==='done'&&task.owner?.startsWith('credential:')&&
+          task.journalReceipt!==true};
     }
     case 'desktop_close_managed_browser': {
       // Trusted local desktop IPC only, never exposed to public MCP callers.
@@ -2462,9 +2612,11 @@ async function handleCall(method, p = {}) {
       const retry=method==='retry_manager_batch';
       const clear=method==='clear_skipped_manager_batch';
       if(retry){
-        await chrome.tabs.update(tabId,{active:true});
-        if(Number.isSafeInteger(tab.windowId))
-          await chrome.windows.update(tab.windowId,{focused:true});
+        // Even an explicitly requested draft retry can use the same
+        // background-only Parent path. The UI has a separate "Open tab"
+        // action when the operator actually wants OS focus.
+        await prepareBackgroundManagerTab(tabId,p.__trustedPrincipal);
+        await enableManagedAntiFreeze(tabId);
       }
       const result=await tabMessage(tabId,{cmd:retry?'retry_manager_draft':
         clear?'clear_manager_batch_draft':'inspect_manager_batch',
@@ -2540,9 +2692,20 @@ async function handleCall(method, p = {}) {
         throw new Error('Untrusted Parent conversation URL');
       if (origin && siteOfUrl(managerTab.url)!=='chatgpt')
         throw new Error('Parent provider changed since original delegation');
-      const releaseForeground=siteOfUrl(managerTab.url)==='chatgpt'
-        ? await acquireForegroundSubmitLease(managerTabId,'manager') : null;
-      try {
+      // FIFO delivery must not interrupt unrelated desktop work. Even when
+      // optional foreground focus is enabled for workers, manager queue
+      // notifications use only the already-managed tab in its own browser
+      // window, with no chrome.windows.update({focused:true}) call.
+      if(siteOfUrl(managerTab.url)==='chatgpt')
+        await prepareBackgroundManagerTab(managerTabId,p.__trustedPrincipal);
+      // The Parent may have navigated since pairing. Its early MAIN-world
+      // focus shim starts disabled on EACH new document; verify it again
+      // before a background notification, not after the draft is inserted.
+      if(siteOfUrl(managerTab.url)==='chatgpt'){
+        const verified=await enableManagedAntiFreeze(managerTabId);
+        extensionDiagnostic(verified?'info':'warn','manager.focus_emulation_checked',{
+          tabId:managerTabId,verified});
+      }
       // D-056: when a result belongs to an earlier conversation, immediately
       // restore that conversation even if the currently displayed chat has an
       // unsent draft or is generating. The user explicitly accepted this
@@ -2569,16 +2732,14 @@ async function handleCall(method, p = {}) {
               (workerIncarnations[managerTabId]||managerIncarnations[managerTabId])!==
                 p.__trustedPrincipal.sessionIncarnationId)
             throw new Error('Parent tab changed during origin conversation navigation');
+          const verified=await enableManagedAntiFreeze(managerTabId);
+          extensionDiagnostic(verified?'info':'warn','manager.focus_emulation_checked',{
+            tabId:managerTabId,verified});
           await confirmTabIdle(managerTabId);
         }
         const beforeSend=await chrome.tabs.get(managerTabId);
         if (origin && safeConversationRoute(beforeSend?.url)!==origin)
           throw new Error('Parent navigated away before FIFO delivery');
-        if(releaseForeground){
-          const focusedWindow=await chrome.windows.get(beforeSend.windowId);
-          if(!beforeSend.active || focusedWindow?.focused!==true)
-            throw new Error('Parent lost foreground focus before queue Send; no submission attempted');
-        }
         const response = await tabMessage(managerTabId, { cmd: 'submit_manager_batch', text: batchText });
         managerWakes[p.batch_id].status = response?.ok === true && response.submitted === true
           ? 'submitted' : 'uncertain';
@@ -2589,9 +2750,6 @@ async function handleCall(method, p = {}) {
         managerWakes[p.batch_id].status = 'uncertain';
         await saveState();
         return { batch_id: p.batch_id, submitted: false, uncertain: true };
-      }
-      } finally {
-        if(releaseForeground)await releaseForeground();
       }
       });
     }
@@ -3078,6 +3236,7 @@ let ws = null;
 let wsState = 'disconnected';
 let privateQueueMode = 'unknown'; // server capability handshake, never caller supplied
 const workerReceiptWaiters = new Map();
+const journalReceiptInFlight = new Map();
 const pairingWaiters = new Map();
 let keepTimer = null;
 let reconnectTimer = null;
@@ -3283,10 +3442,13 @@ async function submitPrivateWorkerReceipt(task) {
   if (privateQueueMode === 'disabled')
     throw new Error('Parent notification queue disabled; completion delivery is NOT confirmed');
   if (task.journalReceipt) return true;
+  if(journalReceiptInFlight.has(task.id))
+    return journalReceiptInFlight.get(task.id);
   if (privateQueueMode !== 'enabled' || !ws || ws.readyState !== WebSocket.OPEN ||
       !task.workerIncarnationId || !task.owner.startsWith('credential:')) {
     throw new Error('Private journal transport not ready; outcome UNCERTAIN');
   }
+  const attempt=(async()=>{
   const requestId = crypto.randomUUID();
   const receipt = new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -3304,8 +3466,43 @@ async function submitPrivateWorkerReceipt(task) {
   const response = await receipt;
   if (!response?.durably_recorded) throw new Error('Private queue did not durably acknowledge receipt');
   task.journalReceipt = true;
+  task.journalReceiptUncertain = false;
   await saveState();
   return true;
+  })();
+  journalReceiptInFlight.set(task.id,attempt);
+  try{return await attempt;}
+  finally{journalReceiptInFlight.delete(task.id);}
+}
+
+// D-039/D-042: a terminal task and a durable Parent FIFO notification are
+// distinct operations. Reconcile a missing fsync receipt using the SAME task
+// UUID/idempotency key (never re-run a chat prompt). Recheck live incarnation
+// and throttle to 2 minutes; the Proxy journal rejects changed generations.
+async function reconcileTerminalWorkerReceipts(){
+  await stateReady;
+  if(privateQueueMode!=='enabled'||!ws||ws.readyState!==WebSocket.OPEN)return;
+  const now=Date.now();
+  for(const task of Object.values(tasks)){
+    if(!['done','failed'].includes(task.status) ||
+        !task.owner?.startsWith('credential:')||task.journalReceipt ||
+        journalReceiptInFlight.has(task.id) ||
+        (task.journalRetryAt||0)>now)continue;
+    const tab=await chrome.tabs.get(task.tabId).catch(()=>null);
+    if(!tab||!workers.includes(task.tabId)||
+        workerIncarnations[task.tabId]!==task.workerIncarnationId ||
+        siteOfUrl(tab.url)!==task.site)continue;
+    task.journalRetryAt=now+2*60*1000;
+    await saveState();
+    try{
+      await submitPrivateWorkerReceipt(task);
+    }catch(error){
+      task.journalReceiptUncertain=true;
+      await saveState();
+      extensionDiagnostic('warn','worker.journal_receipt_unverified',{
+        taskId:task.id,tabId:task.tabId,errorType:error?.name||'Error'});
+    }
+  }
 }
 
 function scheduleReconnect() {
@@ -3348,6 +3545,7 @@ chrome.alarms.onAlarm.addListener((a) => {
     for (const item of queuedIndependent) void dispatchQueuedIndependent(item.tabId);
     void releaseReadyParentTasks();
     void checkDueCompletions();
+    void reconcileTerminalWorkerReceipts();
   }
 });
 
@@ -3549,6 +3747,55 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           break;
         }
         sendResponse(managedAgentStatus(sender.tab.id));
+        break;
+      }
+      case 'verify_managed_page_focus': {
+        // MAIN-world shims do not necessarily affect the isolated content
+        // world's native visibility getter. Authorize this exception ONLY
+        // through the extension's trusted, current Parent/Child registry.
+        const tabId=sender.tab?.id;
+        if(sender.id!==chrome.runtime.id || sender.frameId!==0 ||
+            !Number.isSafeInteger(tabId) ||
+            siteOfUrl(sender.tab?.url)!=='chatgpt' ||
+            !managedAgentStatus(tabId).managed) {
+          sendResponse({ok:true,allowed:false});
+          break;
+        }
+        const tab=await chrome.tabs.get(tabId).catch(()=>null);
+        if(siteOfUrl(tab?.url)!=='chatgpt') {
+          sendResponse({ok:true,allowed:false});
+          break;
+        }
+        const focus=await chrome.scripting.executeScript({
+          target:{tabId,allFrames:false},world:'MAIN',
+          func:()=>{
+            const control=document[Symbol.for('chat-orchestrator.managed-focus.v2')];
+            return control?.status?.().enabled===true &&
+              document.visibilityState==='visible' &&
+              document.hidden===false && document.hasFocus()===true;
+          },
+        }).catch(()=>null);
+        sendResponse({ok:true,allowed:focus?.[0]?.result===true});
+        break;
+      }
+      case 'managed_chatgpt_model_preferences': {
+        const tabId=sender.tab?.id;
+        if(sender.id!==chrome.runtime.id || sender.frameId!==0 ||
+            !Number.isSafeInteger(tabId) ||
+            siteOfUrl(sender.tab?.url)!=='chatgpt' ||
+            !managedAgentStatus(tabId).managed) {
+          sendResponse({ok:false});
+          break;
+        }
+        const stored=await chrome.storage.local.get([
+          'chatgptModelLabel','chatgptReasoningEffort']);
+        const model=typeof stored.chatgptModelLabel==='string' &&
+          stored.chatgptModelLabel.length<=80 &&
+          !/[\u0000-\u001f\u007f]/.test(stored.chatgptModelLabel)
+          ? stored.chatgptModelLabel.trim() : '';
+        const effort=['Instant','Medium','High','Extra High','Pro'].includes(stored.chatgptReasoningEffort)
+          ? stored.chatgptReasoningEffort : '';
+        sendResponse({ok:true,model,effort});
         break;
       }
       case 'dismiss_parent_offer': {
@@ -3887,11 +4134,24 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           if(current.incarnation_id!==live.incarnation_id ||
               current.route_hash!==live.route_hash)
             throw new Error('Parent tab changed after user approval');
-          await confirmTabIdle(active.id);
-          extensionDiagnostic('info','parent_setup.idle_verified',{
-            tabId:active.id,phase:'idle_verified'});
-          sent=await tabMessage(active.id,{
-            cmd:'submit_parent_initialization',text:prompt,marker:code});
+          sent=await serializePromptStartup(async()=>{
+            // Parent onboarding can steal focus from a Child's pending Send;
+            // page settling, idle proof and send share the same FIFO.
+            const now=await inspectChatTab(active.id);
+            if(now.incarnation_id!==live.incarnation_id ||
+                now.route_hash!==live.route_hash)
+              throw new Error('Parent tab changed while waiting for Send FIFO');
+            const release=await acquireForegroundSubmitLease(active.id,'manager');
+            try {
+              await confirmTabIdle(active.id);
+              extensionDiagnostic('info','parent_setup.idle_verified',{
+                tabId:active.id,phase:'idle_verified'});
+              return await tabMessage(active.id,{
+                cmd:'submit_parent_initialization',text:prompt,marker:code});
+            } finally {
+              if(release)await release();
+            }
+          });
         } catch(error) {
           extensionDiagnostic('warn','parent_setup.dispatch_error',{
             tabId:active.id,phase:'dispatching',

@@ -12,6 +12,7 @@ import { inspectPrivateJournal, preparePrivateJournal } from './coordination-sto
 import { createDesktopTray, installWindowCloseBehavior, minimizeToTrayPreference } from './tray-lifecycle.mjs';
 import { DEFAULT_AGENT_SETTINGS, normalizeAgentSettings, replaceObsoletePromptSettings, disabledAgentSettings, composeAgentPrompt } from '../agent-settings.mjs';
 import { createDiagnostics } from '../diagnostics.mjs';
+import { isSupportedDesktopExtensionAction } from './extension-actions.mjs';
 import { findInstalledBrowser,managedBrowserLaunchArgs,managedProfilePath,
   normalizeManagedBrowser,normalizeChromiumExecutablePath,
   matchesManagedEnrollment } from './managed-browser.mjs';
@@ -831,10 +832,7 @@ function requireTrustedWindow(event) {
 function desktopExtensionAction(action, tabId, nonce, browserSessionId,decisionId=null,choice=null,
   expectedProfileInstallId=null,expectedBrowserProduct=null,recoveryReason=null) {
   if (!child || phase !== 'running') return Promise.reject(new Error('Start proxy and connect extension first'));
-  if (!['set_orchestrator','diagnose','close_legacy_workers','close_managed_browser','verify_managed_browser','update_readiness',
-      'inspect_root_repair','confirm_root_repair','list_agent_closures','resolve_agent_closure',
-      'list_completion_monitors','set_manual_completion','recover_queue_batch',
-      'focus_queue_manager'].includes(action)) {
+  if (!isSupportedDesktopExtensionAction(action)) {
     return Promise.reject(new Error('Unsupported desktop action'));
   }
   if (!['close_legacy_workers','close_managed_browser','verify_managed_browser','update_readiness',

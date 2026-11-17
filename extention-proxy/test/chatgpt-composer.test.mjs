@@ -8,11 +8,11 @@ const source=readFileSync(new URL('../../extention/content.js',import.meta.url),
 
 function composerHarness({textarea,extraEnabledButton,neverEnableSend=false,
   networkBusyAfterInput=false,nativeSubmitButton=false,syntheticClickIgnored=false,
-  nativeSubmitIgnored=false,
+  nativeSubmitIgnored=false,modernExactSend=false,enableSendAfterMs=0,
   driftAfterInsert=null,renderedUserText=null,userTurnWrapperOnly=false,
   copyUserText=null,hideNewUserTurn=false,existingUserTurn=false,
   routeAfterSubmit=false,generatingAfterSubmit=false,existingConversation=false,
-  modernUserBubbleOnly=false}) {
+  modernUserBubbleOnly=false,hiddenComposer=false,authorizedManagedFocus=false}) {
   let messageHandler;
   let submitted='';
   let primaryClicks=0;
@@ -63,7 +63,8 @@ function composerHarness({textarea,extraEnabledButton,neverEnableSend=false,
     getBoundingClientRect(){return {left:100,top:100,width:32,height:32};},
     contains(node){return node===this;},
     closest(){return null;},
-    getAttribute(name){return name==='data-testid'?'send-button':null;},
+    getAttribute(name){return name==='data-testid'?'send-button':
+      name==='aria-label' && modernExactSend?'Send':null;},
     click(){primaryClicks++;if(!syntheticClickIgnored)markSubmitted();},
   };
   const secondary={
@@ -95,13 +96,14 @@ function composerHarness({textarea,extraEnabledButton,neverEnableSend=false,
   }
   form={querySelectorAll:query,
     requestSubmit(button){
-      assert.equal(button,primary);
+      assert.equal(button,modernExactSend?undefined:primary);
       nativeSubmissions++;
       if(!nativeSubmitIgnored)markSubmitted();
     },
   };
   const document={
     readyState:'complete',
+    visibilityState:hiddenComposer?'hidden':'visible',
     querySelectorAll:query,
     elementFromPoint(x){return x>175?secondary:primary;},
     createRange(){return {selectNodeContents(){}};},
@@ -111,13 +113,19 @@ function composerHarness({textarea,extraEnabledButton,neverEnableSend=false,
       }
       if(command==='insertText'){
         if(textarea)input.value=value;else input.textContent+=value;
-        if(!neverEnableSend)primary.disabled=false;
+        if(!neverEnableSend) {
+          if(enableSendAfterMs>0)setTimeout(()=>{primary.disabled=false;},enableSendAfterMs);
+          else primary.disabled=false;
+        }
         trustedEvents++;
         if(driftAfterInsert && !driftScheduled) {
           driftScheduled=true;
           setTimeout(()=>{
             if(driftAfterInsert==='whitespace' && !textarea)
               input.innerText=input.textContent.replace(/\n/g,' ');
+            if(driftAfterInsert==='extra-rendered-space' && !textarea)
+              input.innerText=input.textContent.replace(/\n/g,' ')
+                .replace('</system_instructions>', ' </system_instructions>');
             if(driftAfterInsert==='mutation' && !textarea)
               input.innerText=input.textContent.replace('Pair ', 'P4ir ');
             if(driftAfterInsert==='replacement' && textarea) {
@@ -145,6 +153,8 @@ function composerHarness({textarea,extraEnabledButton,neverEnableSend=false,
     }
     if(message.type==='managed_agent_status_request')
       return {managed:false}; // Background status read is not network/composer readiness.
+    if(message.type==='verify_managed_page_focus')
+      return {ok:true,allowed:authorizedManagedFocus};
     if(message.type==='composer_send_click') throw new Error('DOM sending must not use CDP transport');
     networkChecks++;
     if(networkBusyAfterInput && trustedEvents>0) {
@@ -403,7 +413,7 @@ test('active composer prefers its exact send control over other enabled send-lik
   assert.equal(info.secondaryClicks,0);
 });
 
-test('disabled composer Send never clicks and clears its own unsent draft', {timeout:12000}, async()=>{
+test('disabled composer Send never clicks and clears its own unsent draft', {timeout:28000}, async()=>{
   const h=composerHarness({textarea:true,extraEnabledButton:false,neverEnableSend:true});
   const result=await h.call(batch());
   assert.equal(result.submitted,undefined);
@@ -440,6 +450,49 @@ test('completion notification clicks the enabled Send arrow when requestSubmit w
   assert.equal(h.info().draft,'');
   assert.equal(h.diagnostics().find((event)=>event.step==='send_activation')?.method,
     'button_click');
+});
+
+test('modern exact Send label uses native form submission without a submitter once', {
+  timeout:10000,
+},async()=>{
+  const h=composerHarness({textarea:false,extraEnabledButton:false,
+    nativeSubmitButton:true,modernExactSend:true,syntheticClickIgnored:true});
+  const text=batch();
+  const result=await h.call(text);
+  assert.equal(result.submitted,true,JSON.stringify(result));
+  assert.equal(h.info().primaryClicks,0,'native submit cannot be followed by a click');
+  assert.equal(h.info().nativeSubmissions,1);
+  assert.equal(h.info().submitted,text);
+  assert.equal(h.diagnostics().find(e=>e.step==='send_activation')?.method,
+    'form_request_submit_no_submitter');
+});
+
+test('an ignored modern native form submit remains UNCERTAIN with no automatic click replay', {
+  timeout:17500,
+},async()=>{
+  const h=composerHarness({textarea:false,extraEnabledButton:false,
+    nativeSubmitButton:true,modernExactSend:true,nativeSubmitIgnored:true,
+    syntheticClickIgnored:true});
+  const text=batch();
+  const result=await h.call(text);
+  assert.equal(result.uncertain,true);
+  assert.equal(h.info().nativeSubmissions,1);
+  assert.equal(h.info().primaryClicks,0,'never replay a possibly accepted form submission');
+  assert.equal(h.info().draft,text,'retain the uncertain draft for explicit reconciliation');
+});
+
+test('FIFO notification waits beyond 6.5s for delayed background React Send control', {
+  timeout:15000,
+},async()=>{
+  const h=composerHarness({textarea:true,extraEnabledButton:false,
+    enableSendAfterMs:7600});
+  const text=batch();
+  const result=await h.call(text);
+  assert.equal(result.submitted,true,JSON.stringify(result));
+  assert.equal(h.info().primaryClicks,1);
+  const waiting=h.diagnostics().find(e=>e.step==='send_button_wait_end');
+  assert.ok(waiting?.durationMs>=6500,'must exceed the old 6.5s timeout');
+  assert.equal(h.info().submitted,text);
 });
 
 test('explicit retry of a retained completion batch activates Send once, never requestSubmit', {
@@ -528,16 +581,13 @@ test('Parent setup sends once when ChatGPT maps exactly two line breaks to space
   assert.equal(result.submitted,true,JSON.stringify(result));
   assert.equal(h.info().primaryClicks,1,'Send is attempted exactly once');
   assert.equal(h.info().submitted,prompt);
-  const accepted=h.diagnostics().find((entry)=>
-    entry.step==='linebreak_normalization_accepted');
-  assert.ok(accepted,'the narrow exception must be observable');
-  assert.equal(accepted.originalNewlines,2);
-  assert.equal(accepted.currentNewlines,0);
-  assert.equal(accepted.exactNewlinesToSpaces,true);
+  assert.ok(h.diagnostics().some((entry)=>
+    entry.step==='composer_state_transition' &&
+    entry.snapshot?.chosen?.whitespaceMatch===true));
   assert.equal(h.diagnostics().some((entry)=>entry.step==='submission_failure_summary'),false);
 });
 
-test('Parent setup still refuses a changed character even when the button is enabled', {
+test('Parent setup trusts its own inserted draft instead of rendered innerText changes', {
   timeout:10000,
 },async()=>{
   const h=composerHarness({textarea:false,extraEnabledButton:false,
@@ -546,13 +596,13 @@ test('Parent setup still refuses a changed character even when the button is ena
   const prompt='<chat_orchestrator_parent_setup>\nPair '+code+
     '\n</chat_orchestrator_parent_setup>';
   const result=await h.callParent(prompt,code);
-  assert.equal(result.uncertain,true);
-  assert.equal(h.info().primaryClicks,0);
-  const failure=h.diagnostics().find((entry)=>entry.step==='submission_failure_summary');
-  assert.equal(failure?.failureClass,'PROMPT_CONTENT_CHANGED');
+  assert.equal(result.submitted,true,JSON.stringify(result));
+  assert.equal(h.info().primaryClicks,1);
+  assert.equal(h.info().submitted,prompt);
+  assert.equal(h.diagnostics().some((entry)=>entry.step==='submission_failure_summary'),false);
 });
 
-test('Child/queue prompts allow only exact linebreak-to-space React normalization', {
+test('Child/queue prompts send after React normalizes linebreaks in the rendered editor', {
   timeout:10000,
 },async()=>{
   const h=composerHarness({textarea:false,extraEnabledButton:false,
@@ -561,19 +611,60 @@ test('Child/queue prompts allow only exact linebreak-to-space React normalizatio
   const result=await h.call(text);
   assert.equal(result.submitted,true,JSON.stringify(result));
   assert.equal(h.info().primaryClicks,1);
-  assert.ok(h.diagnostics().some((entry)=>entry.step==='linebreak_normalization_accepted'));
   assert.equal(h.diagnostics().some((entry)=>entry.step==='submission_failure_summary'),false);
 });
 
-test('Child/queue prompts still refuse any non-whitespace mutation before Send', {
+test('Child/queue prompts do not compare rendered innerText after inserting their own text', {
   timeout:10000,
 },async()=>{
   const h=composerHarness({textarea:false,extraEnabledButton:false,
     driftAfterInsert:'mutation'});
   const text=batch().replace('<queue_batch>','<queue_batch>\nPair ');
   const result=await h.call(text);
+  assert.equal(result.submitted,true,JSON.stringify(result));
+  assert.equal(h.info().primaryClicks,1);
+  assert.equal(h.info().submitted,text);
+  assert.equal(h.diagnostics().some((entry)=>entry.step==='submission_failure_summary'),false);
+});
+
+test('real-world ProseMirror innerText extra space does not block enabled Send', {
+  timeout:10000,
+},async()=>{
+  const h=composerHarness({textarea:false,extraEnabledButton:false,
+    driftAfterInsert:'extra-rendered-space',nativeSubmitButton:true,
+    modernExactSend:true,syntheticClickIgnored:true});
+  const text='<system_instructions>\nTesting FIFO\n</system_instructions>\n'+batch();
+  const result=await h.call(text);
+  assert.equal(result.submitted,true,JSON.stringify(result));
+  assert.equal(h.info().nativeSubmissions,1);
+  assert.equal(h.info().primaryClicks,0);
+  assert.equal(h.info().submitted,text);
+  assert.equal(h.diagnostics().some((entry)=>entry.step==='pre_click_composer_validation_rejected'),false);
+});
+
+test('hidden isolated document sends only with approved managed MAIN-world shim', {
+  timeout:10000,
+},async()=>{
+  const h=composerHarness({textarea:false,extraEnabledButton:false,
+    hiddenComposer:true,authorizedManagedFocus:true});
+  const result=await h.call(batch());
+  assert.equal(result.submitted,true,JSON.stringify(result));
+  assert.equal(h.info().primaryClicks,1);
+  const gate=h.diagnostics().find(event=>event.step==='pre_click_page_validation');
+  assert.equal(gate?.tabHidden,true);
+  assert.equal(gate?.managedFocusAuthorized,true);
+});
+
+test('hidden document without managed focus permission never activates Send', {
+  timeout:10000,
+},async()=>{
+  const h=composerHarness({textarea:false,extraEnabledButton:false,
+    hiddenComposer:true,authorizedManagedFocus:false});
+  const result=await h.call(batch());
   assert.equal(result.submitted,undefined);
   assert.equal(h.info().primaryClicks,0);
-  const failure=h.diagnostics().find((entry)=>entry.step==='submission_failure_summary');
-  assert.equal(failure?.failureClass,'PROMPT_CONTENT_CHANGED');
+  assert.equal(h.info().draft,'');
+  const gate=h.diagnostics().find(event=>event.step==='pre_click_page_validation');
+  assert.equal(gate?.tabHidden,true);
+  assert.equal(gate?.managedFocusAuthorized,false);
 });
