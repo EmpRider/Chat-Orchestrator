@@ -3,7 +3,38 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
-import { preparePrivateJournal, inspectPrivateJournal, PRIVATE_JOURNAL_MAX_BYTES } from '../desktop/coordination-storage.mjs';
+import { preparePrivateJournal, inspectPrivateJournal, acquirePrivateJournalLock, PRIVATE_JOURNAL_MAX_BYTES } from '../desktop/coordination-storage.mjs';
+
+test('lock release checks its own identity and never deletes a replacement owner', async() => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'chat-orch-lock-owner-'));
+  const journal = path.join(root,'coordination.events.journal');
+  const lockPath = journal + '.lock';
+  try {
+    const lock = await acquirePrivateJournalLock(journal);
+    const replacement = {...JSON.parse(fs.readFileSync(lockPath,'utf8')),
+      nonce:'ffffffff-ffff-4fff-8fff-ffffffffffff'};
+    fs.writeFileSync(lockPath,JSON.stringify(replacement));
+    await assert.rejects(lock.release(), {code:'PRIVATE_JOURNAL_OWNER_UNKNOWN'});
+    assert.deepEqual(JSON.parse(fs.readFileSync(lockPath,'utf8')),replacement);
+  } finally { fs.rmSync(root,{recursive:true,force:true}); }
+});
+
+test('foreign-host and interrupted recovery locks remain fail-closed', async() => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'chat-orch-lock-host-'));
+  const journal = path.join(root,'coordination.events.journal');
+  const lockPath = journal + '.lock';
+  const owner = JSON.stringify({version:1,pid:2147483647,hostname:'not-this-host',
+    nonce:'ffffffff-ffff-4fff-8fff-ffffffffffff'});
+  try {
+    fs.writeFileSync(lockPath,owner);
+    await assert.rejects(acquirePrivateJournalLock(journal), {code:'PRIVATE_JOURNAL_OWNER_UNKNOWN'});
+    assert.equal(fs.readFileSync(lockPath,'utf8'),owner);
+    fs.writeFileSync(lockPath+'.recovery','preserve recovery evidence');
+    await assert.rejects(acquirePrivateJournalLock(journal), {code:'PRIVATE_JOURNAL_OWNER_UNKNOWN'});
+    assert.equal(fs.readFileSync(lockPath+'.recovery','utf8'),'preserve recovery evidence');
+    assert.equal(fs.readFileSync(lockPath,'utf8'),owner);
+  } finally { fs.rmSync(root,{recursive:true,force:true}); }
+});
 
 test('private journal provisioning is explicit, fsynced, idempotent and non-truncating', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'chat-orch-prep-'));

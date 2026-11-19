@@ -467,6 +467,24 @@ test('modern exact Send label uses native form submission without a submitter on
     'form_request_submit_no_submitter');
 });
 
+test('hidden Child run_prompt uses modern native form submission without a submitter', {
+  timeout:10000,
+},async()=>{
+  const h=composerHarness({textarea:false,extraEnabledButton:false,
+    nativeSubmitButton:true,modernExactSend:true,syntheticClickIgnored:true,
+    hiddenComposer:true,authorizedManagedFocus:true});
+  const taskId=randomUUID();
+  const text='Reply to task '+taskId;
+  const result=await h.command('run_prompt',{
+    taskId,receiptNonce:randomUUID(),text,timeoutMs:1});
+  assert.equal(result.submitted,true,JSON.stringify(result));
+  assert.equal(h.info().nativeSubmissions,1);
+  assert.equal(h.info().primaryClicks,0);
+  assert.equal(h.info().submitted,text);
+  assert.equal(h.diagnostics().find(e=>e.step==='send_activation')?.method,
+    'form_request_submit_no_submitter');
+});
+
 test('an ignored modern native form submit remains UNCERTAIN with no automatic click replay', {
   timeout:17500,
 },async()=>{

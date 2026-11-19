@@ -23,6 +23,7 @@ import { createDurableIdempotencyLedger } from './durable-idempotency.mjs';
 import { normalizeOpenChatTabs, annotateTabPresence } from './tab-presence.mjs';
 import { createDiagnostics, classifyDiagnosticError } from './diagnostics.mjs';
 import { isSupportedDesktopExtensionAction } from './desktop/extension-actions.mjs';
+import { acquirePrivateJournalLock } from './desktop/coordination-storage.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 8787);
@@ -1104,21 +1105,10 @@ async function openPrivateEventJournal() {
   if (!profileDir || !path.isAbsolute(profileDir))
     throw new Error('Private journal requires the desktop profile directory');
   const journalPath = path.join(profileDir, 'coordination.events.journal');
-  const lockPath = journalPath + '.lock';
   let lock;
   let file;
   try {
-    // No automatic stale-lock recovery: owner liveness needs independent proof.
-    try {
-      lock = await fs.promises.open(lockPath, 'wx', 0o600);
-    } catch (error) {
-      if (error.code === 'EEXIST') {
-        const blocked = new Error('Private journal owner lock exists; verify ownership before recovery');
-        blocked.code = 'PRIVATE_JOURNAL_OWNER_UNKNOWN';
-        throw blocked;
-      }
-      throw error;
-    }
+    lock = await acquirePrivateJournalLock(journalPath);
     // File must be durably provisioned separately. O_APPEND without O_CREAT
     // prevents an unverified new directory entry from receiving a durable ACK.
     file = await fs.promises.open(journalPath, fs.constants.O_RDWR | fs.constants.O_APPEND);
@@ -1440,8 +1430,7 @@ async function openPrivateEventJournal() {
           closePromise = (async () => {
             await serial;
             await file.close();
-            await lock.close();
-            await fs.promises.unlink(lockPath);
+            await lock.release();
           })();
         }
         return closePromise;
@@ -1449,10 +1438,7 @@ async function openPrivateEventJournal() {
     });
   } catch (error) {
     await file?.close().catch(() => {});
-    if (lock) {
-      await lock.close().catch(() => {});
-      await fs.promises.unlink(lockPath).catch(() => {});
-    }
+    if (lock) await lock.release().catch(() => {});
     throw error; // No journal deletion, truncation, or automatic tail replay.
   }
 }
@@ -3822,11 +3808,27 @@ if (process.parentPort) {
 const isMain = process.argv[1] &&
   path.resolve(process.argv[1]).toLowerCase() === fileURLToPath(import.meta.url).toLowerCase();
 if (isMain || process.parentPort) {
-  startServer().catch((error) => {
+  const startup = startServer().catch((error) => {
     console.error('[bridge] startup error:', error.message);
     process.parentPort?.postMessage({ type: 'error', message: error.message });
     process.exitCode = 1;
   });
+  let terminating = false;
+  for (const signal of ['SIGINT','SIGTERM',...(process.platform === 'win32' ? ['SIGBREAK'] : [])]) {
+    process.on(signal, async() => {
+      if (terminating) return;
+      terminating = true;
+      try {
+        await startup;
+        await stopServer();
+        process.parentPort?.postMessage({type:'stopped'});
+      } catch (error) {
+        console.error('[bridge] shutdown failed:', error.message);
+        process.exitCode = 1;
+      }
+      if (!process.parentPort) process.exit(process.exitCode || 0);
+    });
+  }
 }
 
 // Pure read-only test hooks: no enrollment, journal open, side effects or MCP exposure.

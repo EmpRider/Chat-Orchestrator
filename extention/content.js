@@ -804,7 +804,7 @@
     // can leave the draft untouched. Use the observed native form path, with
     // NO submitter argument, exactly once. Older Send-labelled variants keep
     // their verified button-click behavior; never try both for one receipt.
-    if(preferButtonClick && site==='chatgpt' && form && type==='submit' &&
+    if(site==='chatgpt' && form && type==='submit' &&
         label==='Send' && typeof form.requestSubmit==='function' &&
         (!button.form || button.form===form)) {
       logStep(taskId,'send_activation',{method:'form_request_submit_no_submitter',
@@ -1176,6 +1176,12 @@
       try {
         const verified=await chrome.runtime.sendMessage({type:'verify_managed_page_focus'});
         managedFocusAuthorized=verified?.ok===true && verified.allowed===true;
+        // Managed identity authorizes hidden submission independently of
+        // page-facing focus emulation; it does not prove scheduler readiness.
+        if(!managedFocusAuthorized) {
+          const status=await chrome.runtime.sendMessage({type:'managed_agent_status_request'});
+          if(status?.managed===true) managedFocusAuthorized=true;
+        }
       }catch{}
     }
     logStep(taskId,'pre_click_page_validation',{pageReady:finalPageReady,

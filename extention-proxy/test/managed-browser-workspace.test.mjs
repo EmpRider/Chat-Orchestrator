@@ -410,7 +410,8 @@ test('opt-in real foreground holds managed window until sent user-turn ACK, then
   const tab=await h.create('https://chatgpt.com/',h.first,101);
   h.register(tab);
   optInForegroundFocus(h);
-  runInContext('waitReady=async()=>{};confirmTabIdle=async()=>{};'+
+  runInContext('enableManagedAntiFreeze=async()=>true;'+
+    'waitReady=async()=>{};confirmTabIdle=async()=>{};'+
     'issueManagedChildPairing=async()=>"11111111-1111-4111-8111-111111111111";'+
     'proxySettings={connectorName:"PC1"};proxySettingsRevision=1;wsState="connected";',
     h.ctx);
@@ -433,6 +434,30 @@ test('opt-in real foreground holds managed window until sent user-turn ACK, then
   assert.equal(h.windows.get(tab.windowId).focused,false);
   assert.deepEqual(h.events.startupSequence.filter(s=>s.startsWith('windowFocus:')),
     ['windowFocus:'+tab.windowId,'windowFocus:2']);
+});
+
+test('managed hidden Child submits without activating its tab or minimized window',async()=>{
+  const h=harness();await h.ready;
+  const tab=await h.create('https://chatgpt.com/',h.first,101);
+  h.register(tab);
+  Object.assign(h.windows.get(tab.windowId),{state:'minimized',focused:false});
+  runInContext('enableManagedAntiFreeze=async()=>true;waitReady=async()=>{};'+
+    'confirmTabIdle=async()=>{};'+
+    'issueManagedChildPairing=async()=>"11111111-1111-4111-8111-111111111111";'+
+    'proxySettings={connectorName:"PC1"};proxySettingsRevision=1;wsState="connected";',h.ctx);
+  let sends=0;
+  h.chrome.tabs.sendMessage=async(id,msg)=>{
+    assert.equal(id,tab.id);assert.equal(msg.cmd,'run_prompt');
+    assert.equal(h.tabs.get(id).active,false);
+    assert.equal(h.windows.get(tab.windowId).state,'minimized');
+    sends++;return {ok:true,submitted:true};
+  };
+  const result=await runInContext('startTask',h.ctx)(tab.id,'chatgpt',
+    'Background test',0,{taskTimeoutMin:1},false,'credential:test');
+  assert.equal(result.submission_confirmed,true);
+  assert.equal(sends,1);
+  assert.equal(h.events.tabFocuses,0);
+  assert.equal(h.events.startupSequence.some(s=>s.startsWith('windowFocus:')),false);
 });
 
 test('foreground send fails without dispatch if browser cannot focus; no task becomes uncertain',async()=>{
