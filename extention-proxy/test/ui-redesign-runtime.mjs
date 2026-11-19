@@ -20,9 +20,29 @@ async function availablePort() {
   await new Promise((resolve) => server.close(resolve));
   return port;
 }
-const proxyPort = await availablePort();
-const cdpPort = await availablePort();
+async function portIsFree(port) {
+  const server=net.createServer();
+  return new Promise(resolve=>{
+    server.once('error',()=>resolve(false));
+    server.listen(port,'127.0.0.1',()=>server.close(()=>resolve(true)));
+  });
+}
+let proxyPort;
+for(let attempt=0;attempt<20;attempt++) {
+  const candidate=await availablePort();
+  if(candidate<65535 && await portIsFree(candidate+1)){
+    proxyPort=candidate;
+    break;
+  }
+}
+assert.ok(proxyPort,'Cannot find a pair of free ports for the isolated Proxy');
+// Desktop also binds proxyPort+1 for its private/public split. A random CDP
+// port can collide with that second listener even if it differs from PORT.
+let cdpPort = await availablePort();
+for(let attempt=0;attempt<20 && (cdpPort===proxyPort || cdpPort===proxyPort+1);attempt++)
+  cdpPort=await availablePort();
 assert.notEqual(proxyPort, cdpPort);
+assert.notEqual(proxyPort+1,cdpPort,'CDP must not consume the Proxy upstream port');
 const env = {
   ...process.env, CHAT_ORCH_E2E_MODE: '1', CHAT_ORCH_E2E_DATA_DIR: profile,
   CHAT_ORCH_E2E_PORT: String(proxyPort), CHAT_ORCH_E2E_CDP_PORT: String(cdpPort),
@@ -96,15 +116,21 @@ try {
   }
   assert.equal(await evaluate('window.bridge.status().then(s => s.privateCoordinationOptIn)'),
     true, 'new isolated desktop profile must enable FIFO by default');
-  let queueReady = false;
+  let queueReady = false,lastHealth=null,lastHealthError='';
   for (let i = 0; i < 60; i++) {
     try {
       const health = await (await fetch('http://127.0.0.1:' + proxyPort + '/health')).json();
+      lastHealth={storageReady:health.coordination?.storageReady??null,ok:health.ok??null};
       if (health.coordination?.storageReady === true) { queueReady = true; break; }
-    } catch {}
+    } catch(error){lastHealthError=error?.message||String(error);}
     await pause(200);
   }
-  assert.equal(queueReady, true, 'default-enabled FIFO journal was not provisioned at startup');
+  if(!queueReady){
+    const state=await evaluate('window.bridge.status().then(s=>({phase:s.phase,error:s.error,'+
+      'journal:s.journalRecovery,inspection:s.privateJournalInspection,port:s.port}))');
+    assert.fail('Default FIFO journal failed to start in isolated Electron: '+
+      JSON.stringify({lastHealth,lastHealthError,state,stderr}));
+  }
   const results = [];
   await fs.promises.mkdir(output, { recursive: true });
   async function screenshot(name) {
@@ -112,6 +138,9 @@ try {
     await fs.promises.writeFile(path.join(output, 'redesign-' + name + '.png'),
       Buffer.from(capture.data, 'base64'));
   }
+  // First-run onboarding intentionally opens Connections automatically.
+  // Navigate explicitly before validating each individual view.
+  await evaluate('document.querySelector("[data-view=overview]").click()');
   results.push(await check('overview', 'quick-copy-url'));
   await screenshot('overview');
   for (const [name, control] of [

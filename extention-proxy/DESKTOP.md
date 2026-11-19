@@ -616,3 +616,30 @@ incomplete/checksum-invalid event as **manual reconciliation required**.
 The separate runtime session directory is temporary. The persistent journal is
 reopened only after ownership and journal integrity checks succeed; pending or
 uncertain events are not automatically resent or marked acknowledged.
+
+### Guided recovery for an owner-lock startup error
+
+If Desktop reports `Private journal owner lock exists; verify ownership before
+recovery`, open **Connections → Journal recovery** (also accessible from the
+Overview warning). The panel identifies the local owner PID, journal byte size,
+and why recovery is blocked. **Open local journal folder** opens only this
+Desktop profile's directory, not any browser profile or public endpoint.
+
+The **Archive verified stale lock** action is available only when the current
+local lock owner is well-formed, its recorded PID is confirmed absent, no
+interrupted recovery marker exists, and the journal has exactly **zero bytes**.
+The operator must still confirm there is no unfinished Agent work. A native
+confirmation dialog is required, and the trusted Desktop process rechecks the
+exact journal/lock fingerprint, file size, PID absence and exclusive recovery
+marker immediately before moving the old lock to a unique `.reconciled-*`
+filename in the same directory. This action does **not** delete, truncate,
+repair, replay or mark any journal event as processed. After success select
+**Start** to resume the Proxy; a restart is never performed automatically.
+
+When the owner process may be alive, the lock is malformed, the journal contains
+events, or an earlier recovery marker is present, the Archive button remains
+disabled. Close a still-running competing Proxy gracefully or reconcile
+nonempty/unknown queue history before asking for any further manual recovery.
+There is deliberately no bulk-force-unlock or guessed-recipient action.
+The guided UI is in the source/next build; an older installed EXE needs an
+updated build before it can display these controls.

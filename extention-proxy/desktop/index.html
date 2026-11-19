@@ -69,6 +69,11 @@
         <strong id="ngrok-state">Not configured</strong><small id="ngrok-detail">Dedicated domain</small>
       </article>
     </section>
+        <section class="panel" id="journal-recovery-shortcut" hidden aria-label="Journal recovery needed">
+          <h3>Local Proxy needs journal recovery</h3>
+          <p class="help">Your Agent messages have been protected from an unsafe restart. Use the guided review before starting this profile again.</p>
+          <button type="button" class="secondary" data-open-view="connections">Review journal recovery</button>
+        </section>
         <div class="section-intro"><h2>Get started</h2><span>Use these steps in order</span></div>
         <div class="quick-grid">
           <article class="panel quick-card">
@@ -95,6 +100,18 @@
           <h2>Connect your tools</h2>
           <p>Configure the Ngrok tunnel, then use the local WebSocket URL in the extension and the MCP URL in your chat agent.</p>
         </div>
+        <section class="panel" id="journal-recovery-panel" hidden aria-label="Guided private journal recovery">
+          <div class="section-heading"><h2>Journal recovery</h2><span class="hint">ACTION REQUIRED</span></div>
+          <p class="help" id="journal-recovery-explanation" role="status">Checking local journal owner…</p>
+          <p class="help">1. Review the owner status and journal size. If the owner is still running, close the other Proxy normally; do not force-delete its lock.</p>
+          <p class="help">2. If the journal contains events, reconcile unprocessed Child results, Parent notifications and UNCERTAIN deliveries before operator recovery. The app does not guess delivery outcomes.</p>
+          <p class="help">3. Only if the owner has stopped and the journal is empty, confirm and archive the stale lock. Then use Start to restart the Proxy. No messages are replayed.</p>
+          <div class="input-row">
+            <button id="open-journal-folder" class="secondary" type="button">Open local journal folder</button>
+            <button id="recover-empty-journal-lock" class="secondary" type="button" disabled>Archive verified stale lock</button>
+          </div>
+          <p class="help" id="journal-recovery-feedback" role="status">The original journal and owner lock are preserved until a safe action is confirmed.</p>
+        </section>
         <section class="panel" id="onboarding-panel" aria-label="First-run setup guide">
           <div class="section-heading"><h2>First-run setup</h2><span class="hint">ONE TIME PER SELECTED BROWSER</span></div>
           <p class="help">1. Select installed Edge or Chrome below and choose Save &amp; open browser. This uses a separate persistent Chat Orchestrator profile.</p>

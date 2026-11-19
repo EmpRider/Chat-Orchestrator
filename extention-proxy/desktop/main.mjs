@@ -8,7 +8,8 @@ import { fileURLToPath } from 'node:url';
 import { agentConnectorUrl, ISOLATED_NGROK_CONFIG, normalizeNgrokAuthtoken, normalizeNgrokDomain, normalizeProxyPort, normalizeProfileName, PRIVATE_QUEUE_PREFERENCE_SCHEMA, resolvePrivateQueuePreference } from './config.mjs';
 import { createNgrokLogReader } from './ngrok-diagnostics.mjs';
 import { findReusableNgrokTunnel, describeNgrokExit } from './ngrok-reuse.mjs';
-import { inspectPrivateJournal, preparePrivateJournal } from './coordination-storage.mjs';
+import { inspectPrivateJournal, preparePrivateJournal, inspectJournalRecovery,
+  archiveEmptyStaleJournalLock } from './coordination-storage.mjs';
 import { createDesktopTray, installWindowCloseBehavior, minimizeToTrayPreference } from './tray-lifecycle.mjs';
 import { DEFAULT_AGENT_SETTINGS, normalizeAgentSettings, replaceObsoletePromptSettings, disabledAgentSettings, composeAgentPrompt } from '../agent-settings.mjs';
 import { createDiagnostics } from '../diagnostics.mjs';
@@ -183,6 +184,11 @@ function privateJournalInspection() {
   catch { return {present:false,bytes:0,lockPresent:false,ownerVerified:false,
     requiresManualOwnerCheck:true,error:'Journal/lock needs manual inspection'}; }
 }
+function journalRecoveryState() {
+  try { return inspectJournalRecovery(privateCoordinationJournalPath()); }
+  catch { return {canRecover:false,reason:'INSPECTION_FAILED',
+    explanation:'Journal inspection failed. Keep the Proxy stopped and open the profile folder for review.'}; }
+}
 
 function ensureIsolatedNgrokConfig() {
   fs.mkdirSync(dataDir(), { recursive: true });
@@ -204,6 +210,7 @@ function state() {
     privateCoordinationOptIn,
     privateCoordinationJournalPresent: fs.existsSync(privateCoordinationJournalPath()),
     privateJournalInspection: privateJournalInspection(),
+    journalRecovery: journalRecoveryState(),
     privateCoordinationRestartRequired: Boolean(child && runningPrivateCoordination !== privateCoordinationOptIn),
     coordinationSnapshot,
     agentSettingsSyncRevision,
@@ -901,6 +908,37 @@ async function inspectCurrentManagedExtension(){
 }
 
 function registerActions() {
+  ipcMain.handle('bridge:openJournalFolder',async(event)=>{
+    requireTrustedWindow(event);
+    const error=await shell.openPath(dataDir());
+    if(error)throw new Error('Could not open the local profile folder: '+error);
+    return {opened:true};
+  });
+  ipcMain.handle('bridge:recoverEmptyJournalLock',async(event,snapshot)=>{
+    requireTrustedWindow(event);
+    if(child || phase==='starting' || phase==='running' || phase==='stopping' || stopping)
+      throw new Error('Stop the local Proxy fully before attempting journal recovery');
+    const review=journalRecoveryState();
+    if(!review.canRecover || review.snapshot!==snapshot)
+      throw new Error('Journal recovery conditions changed. Review the latest inspection before retrying.');
+    const consent=await dialog.showMessageBox(window,{
+      type:'warning',title:'Recover an empty journal owner lock',
+      message:'Archive this verified stale lock?',
+      detail:'The recorded owner process is not running and this journal is EMPTY (0 bytes). '+
+        'Only continue if you have checked that no unfinished Child/Parent work or '+
+        'unacknowledged message requires reconciliation. The original lock is archived, '+
+        'not deleted. No Agent task is replayed or marked complete.',
+      buttons:['Cancel','Archive stale lock'],defaultId:0,cancelId:0,noLink:true,
+    });
+    if(consent.response!==1)return {archived:false,cancelled:true};
+    if(child || phase==='starting' || phase==='running' || phase==='stopping' || stopping)
+      throw new Error('Proxy state changed during recovery. Nothing was archived.');
+    const result=await archiveEmptyStaleJournalLock(privateCoordinationJournalPath(),snapshot);
+    errorMessage='';
+    if(phase==='error')phase='stopped';
+    publishState();
+    return result;
+  });
   ipcMain.handle('bridge:checkUpdates',(event)=>{
     requireTrustedWindow(event);
     return checkForUpdates();

@@ -8,6 +8,8 @@ contextBridge.exposeInMainWorld('bridge', Object.freeze({
   getDefaultAgentSettings: () => ipcRenderer.invoke('bridge:getDefaultAgentSettings'),
   saveAgentSettings: (settings) => ipcRenderer.invoke('bridge:saveAgentSettings', settings),
   status: () => ipcRenderer.invoke('bridge:status'),
+  openJournalFolder:()=>ipcRenderer.invoke('bridge:openJournalFolder'),
+  recoverEmptyJournalLock:(snapshot)=>ipcRenderer.invoke('bridge:recoverEmptyJournalLock',snapshot),
   listAgentClosures:()=>ipcRenderer.invoke('bridge:listAgentClosures'),
   resolveAgentClosure:(id,choice)=>ipcRenderer.invoke('bridge:resolveAgentClosure',id,choice),
   setCompletionStatus:(taskId,status,browserSessionId)=>

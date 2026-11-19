@@ -87,6 +87,51 @@ test('queue actions expose persistent per-row results and errors across polling 
     call.batch===batchId),true,'buttons use exact original recipient and batch');
 });
 
+test('blocked journal startup provides an actionable guided recovery control',async()=>{
+  const elements=new Map();
+  const element=(id)=>{
+    if(!elements.has(id))elements.set(id,makeNode());
+    return elements.get(id);
+  };
+  const proof='a'.repeat(64),calls=[];
+  const state={phase:'error',ngrokPhase:'stopped',ngrokAuthConfigured:false,
+    error:'Private journal owner lock exists; verify ownership before recovery',
+    ngrokError:'',extensionConnected:false,routeVerified:false,
+    domain:'',publicPath:'/mcp',port:8787,profile:'default',coordinationSnapshot:null,
+    privateCoordinationOptIn:true,
+    privateJournalInspection:{present:true,bytes:0,lockPresent:true,
+      requiresManualOwnerCheck:true},
+    journalRecovery:{reason:'EMPTY_STALE_LOCK',ownerPid:2147483647,
+      canRecover:true,snapshot:proof,explanation:'Owner stopped and journal is empty.'},
+  };
+  const bridge={onState(){},status:async()=>state,
+    openJournalFolder:async()=>{calls.push('open-folder');return {opened:true};},
+    recoverEmptyJournalLock:async(snapshot)=>{
+      calls.push(snapshot);
+      state.phase='stopped';state.error='';
+      state.privateJournalInspection.lockPresent=false;
+      state.privateJournalInspection.requiresManualOwnerCheck=false;
+      state.journalRecovery={canRecover:false,reason:'NO_LOCK',explanation:'No lock'};
+      return {archived:true,archiveName:'coordination.events.journal.lock.reconciled-test'};
+    },
+  };
+  const document={getElementById:element,createElement:makeNode};
+  const window={bridge,addEventListener(){}};
+  const source=readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)),
+    '..','desktop','renderer.js'),'utf8');
+  runInNewContext(source,{document,window,Map,Set});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(element('journal-recovery-panel').hidden,false);
+  assert.equal(element('journal-recovery-shortcut').hidden,false);
+  assert.equal(element('recover-empty-journal-lock').disabled,false);
+  assert.match(element('journal-recovery-explanation').textContent,/Owner stopped/);
+  await element('open-journal-folder').dispatch('click');
+  await element('recover-empty-journal-lock').dispatch('click');
+  assert.deepEqual(calls,['open-folder',proof]);
+  assert.equal(element('journal-recovery-panel').hidden,true);
+  assert.match(element('journal-recovery-feedback').textContent,/Select Start/);
+});
+
 test('D-012 closure warning includes a Child waiting for Parent context',()=>{
   const source=readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)),
     '..','desktop','renderer.js'),'utf8');

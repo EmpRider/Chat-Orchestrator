@@ -6,6 +6,8 @@ let browserSelectionDirty = false;
 let connectorNameDirty = false;
 let showSavedTabHistory = false;
 let lastCoordinationSnapshot = null;
+let journalRecoveryBusy=false;
+let journalRecoveryFeedback='';
 // Recovery feedback survives the periodic snapshot render that recreates rows.
 const queueRecoveryFeedback = new Map();
 const queueRecoveryBusy = new Set();
@@ -109,6 +111,24 @@ function render(state) {
   $('configure-private-coordination').textContent = state.privateCoordinationOptIn
     ? 'Disable private queue on next proxy start' : 'Prepare & enable queue on next proxy start';
   const journal = state.privateJournalInspection;
+  const recovery=state.journalRecovery||{};
+  const recoveryNeeded=state.phase!=='running' &&
+    (journal?.requiresManualOwnerCheck===true ||
+      ['RECOVERY_INTERRUPTED','OWNER_UNVERIFIED','OWNER_MAY_BE_RUNNING',
+        'JOURNAL_NOT_EMPTY','INSPECTION_FAILED'].includes(recovery.reason));
+  $('journal-recovery-panel').hidden=!recoveryNeeded;
+  $('journal-recovery-shortcut').hidden=!recoveryNeeded;
+  $('journal-recovery-explanation').textContent=recoveryNeeded
+    ? (recovery.ownerPid?'Owner PID '+recovery.ownerPid+' · ':'')+
+      'Journal '+(journal?.bytes??'unknown')+' bytes · '+
+      (recovery.explanation||'Inspect this profile before restarting.')
+    : 'No journal ownership recovery required.';
+  $('recover-empty-journal-lock').disabled=journalRecoveryBusy ||
+    !recoveryNeeded || recovery.canRecover!==true;
+  $('journal-recovery-feedback').textContent=journalRecoveryFeedback ||
+    (recovery.canRecover
+      ? 'Empty-journal recovery is available. Confirm no unfinished Agent work before archiving.'
+      : 'Keep this profile stopped until the ownership and delivery status are verified.');
   $('private-journal-inspection').textContent = journal?.error
     ? 'Private journal cannot be inspected safely; keep queue off and reconcile manually.'
     : journal?.lockPresent
@@ -495,6 +515,32 @@ $('configure-private-coordination').addEventListener('click', () => perform(asyn
   render(await window.bridge.configurePrivateCoordination(enabled));
   notify(enabled ? 'Private journal prepared; restart the proxy to activate.' : 'Private queue disabled on next proxy start. Restart to apply.');
 }));
+$('open-journal-folder').addEventListener('click',()=>perform(async()=>{
+  await window.bridge.openJournalFolder();
+  journalRecoveryFeedback='Opened the local profile folder. Keep its journal and lock evidence private.';
+  render(currentState);
+}));
+$('recover-empty-journal-lock').addEventListener('click',async()=>{
+  if(journalRecoveryBusy)return;
+  journalRecoveryBusy=true;
+  const snapshot=currentState?.journalRecovery?.snapshot;
+  $('recover-empty-journal-lock').disabled=true;
+  try {
+    const result=await window.bridge.recoverEmptyJournalLock(snapshot);
+    if(result?.archived){
+      journalRecoveryFeedback='Stale owner lock archived as '+result.archiveName+
+        '. Select Start to resume the local Proxy. No events were replayed.';
+      notify('Empty journal lock archived. Start the local Proxy when ready.');
+    }else journalRecoveryFeedback='Recovery cancelled. No journal files were changed.';
+  }catch(error){
+    journalRecoveryFeedback='Recovery could not proceed: '+(error?.message||String(error));
+    notify(journalRecoveryFeedback,true);
+  }finally{
+    journalRecoveryBusy=false;
+    try {render(await window.bridge.status());}
+    catch(error){notify('Recovery finished but status could not be refreshed: '+error.message,true);}
+  }
+});
 $('minimize-to-tray').addEventListener('change', async () => {
   const enabled = $('minimize-to-tray').checked;
   try {

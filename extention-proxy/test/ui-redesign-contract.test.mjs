@@ -24,7 +24,11 @@ test('redesigned navigation keeps each trusted desktop control and one page per 
     'configure-ngrok', 'proxy-port', 'save-proxy-port', 'tray-behavior-note', 'minimize-to-tray',
     'start', 'stop', 'agent-settings-save', 'agent-prompt-module', 'agent-prompt-text',
     'queue-items', 'agent-seats', 'tool-call-log',
+    'journal-recovery-panel','journal-recovery-shortcut','journal-recovery-explanation',
+    'open-journal-folder','recover-empty-journal-lock','journal-recovery-feedback',
   ]) assert.ok(ids.includes(id), 'trusted control missing: ' + id);
+  assert.match(desktop('preload.cjs'),/bridge:recoverEmptyJournalLock/);
+  assert.match(desktop('main.mjs'),/requireTrustedWindow\(event\);[\s\S]*?archiveEmptyStaleJournalLock/);
   const setupSection=html.match(/<section class="panel" aria-label="One-time browser setup">([\s\S]*?)<\/section>/)?.[1];
   assert.ok(setupSection,'one-time browser setup must remain reachable after onboarding');
   assert.match(setupSection,/id="connector-name"/);
