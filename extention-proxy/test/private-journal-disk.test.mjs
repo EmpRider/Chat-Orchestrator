@@ -40,7 +40,7 @@ async function stop(run) {
   await run.exited;
 }
 
-test('private disk preflight recovers only a verified dead owner after forced termination', {
+test('private disk preflight preserves a crash-stale owner lock until manual reconciliation', {
   timeout: 25000,
 }, async (t) => {
   const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'chat-orch-journal-'));
@@ -58,14 +58,23 @@ test('private disk preflight recovers only a verified dead owner after forced te
   assert.ok(fs.existsSync(lock), 'private single-writer owner lock exists');
   const originalJournal = fs.readFileSync(file);
   await stop(first);
+  const originalLock = fs.readFileSync(lock);
 
   const second = launch(folder);
   t.after(() => stop(second));
-  const restartedPort = await ready(second);
+  assert.equal(await second.exited, 1, 'stale lock must block automatic restart');
+  assert.match(second.output(),/journal owner lock exists|verify ownership before recovery/i);
+  assert.deepEqual(fs.readFileSync(file), originalJournal, 'failed restart must preserve journal');
+  assert.deepEqual(fs.readFileSync(lock), originalLock, 'failed restart must preserve owner evidence');
+  // Simulate an operator explicitly completing reconciliation of this disposable,
+  // empty journal. Production must never delete the lock automatically.
+  assert.equal(originalJournal.length,0);
+  fs.unlinkSync(lock);
+  const third = launch(folder);
+  t.after(() => stop(third));
+  const restartedPort = await ready(third);
   assert.equal((await (await fetch('http://127.0.0.1:' + restartedPort + '/health')).json())
-    .coordination.storageReady, true);
-  assert.deepEqual(fs.readFileSync(file), originalJournal, 'recovery must not modify the journal');
-  assert.ok(fs.existsSync(lock), 'restarted proxy owns a new lock');
+    .coordination.storageReady,true);
 });
 
 test('a live journal owner cannot be displaced by another proxy', {timeout:15000}, async(t) => {
@@ -102,7 +111,7 @@ for (const unknown of ['', 'unknown owner', '{"version":1,"pid":0}',
   });
 }
 
-test('concurrent crash recovery admits only one journal writer', {timeout:20000}, async(t) => {
+test('concurrent startups cannot reclaim an unreviewed crash-stale journal lock', {timeout:20000}, async(t) => {
   const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'chat-orch-recovery-race-'));
   const journal = path.join(folder, 'coordination.events.journal');
   fs.writeFileSync(journal, '');
@@ -113,13 +122,13 @@ test('concurrent crash recovery admits only one journal writer', {timeout:20000}
   });
   await ready(runs[0]);
   await stop(runs[0]);
+  const originalLock=fs.readFileSync(journal+'.lock');
   const contenders = [launch(folder), launch(folder), launch(folder)];
   runs.push(...contenders);
-  const outcomes = await Promise.all(contenders.map(async(run) => {
-    try { await ready(run); return true; } catch { return false; }
-  }));
-  assert.equal(outcomes.filter(Boolean).length, 1, contenders.map(run=>run.output()).join('\n'));
+  const exits=await Promise.all(contenders.map(run=>run.exited));
+  assert.deepEqual(exits,[1,1,1],contenders.map(run=>run.output()).join('\n'));
   assert.equal(fs.statSync(journal).size, 0);
+  assert.deepEqual(fs.readFileSync(journal+'.lock'),originalLock);
 });
 
 test('standalone termination signal drains journal and releases lock', {timeout:15000}, async(t) => {

@@ -24,8 +24,9 @@ async function readLockOwner(lockPath) {
   return {owner,text};
 }
 
-// A PID that still exists (including PID reuse or denied inspection) fails closed.
-// No age-based expiry: an idle/live writer must never lose its lock.
+// The journal may contain unacknowledged FIFO deliveries after a crash. A dead
+// PID alone is NOT permission to reclaim its lock or replay any queued event.
+// Preserve an interrupted recovery marker as evidence for manual reconciliation.
 export async function acquirePrivateJournalLock(journalPath) {
   if (typeof journalPath !== 'string' || !path.isAbsolute(journalPath))
     throw new Error('Private journal requires an absolute user-data path');
@@ -34,34 +35,21 @@ export async function acquirePrivateJournalLock(journalPath) {
   const metadata = JSON.stringify({version:1,pid:process.pid,
     hostname:os.hostname(),nonce:crypto.randomUUID()});
   let handle;
-  let recovery;
   try {
+    const recoveryMarker = await fs.promises.lstat(recoveryPath).then(
+      () => true, (error) => {
+        if (error.code === 'ENOENT') return false;
+        throw error;
+      });
+    if (recoveryMarker) throw ownerUnknown();
     try { handle = await fs.promises.open(lockPath, 'wx', 0o600); }
-    catch (error) {
-      if (error.code !== 'EEXIST') throw error;
-      // Serialize dead-owner reclamation; another contender must not remove
-      // the new writer's lock after examining the previous owner's PID.
-      try { recovery = await fs.promises.open(recoveryPath, 'wx', 0o600); }
-      catch (error) { if (error.code === 'EEXIST') throw ownerUnknown(); throw error; }
-      const {owner,text} = await readLockOwner(lockPath);
-      let dead = false;
-      try { process.kill(owner.pid, 0); }
-      catch (error) { dead = error.code === 'ESRCH'; }
-      if (!dead || (await fs.promises.readFile(lockPath, 'utf8')) !== text) throw ownerUnknown();
-      await fs.promises.unlink(lockPath);
-      handle = await fs.promises.open(lockPath, 'wx', 0o600);
-    }
+    catch (error) { if (error.code === 'EEXIST') throw ownerUnknown(); throw error; }
     await handle.writeFile(metadata, 'utf8');
     await handle.sync();
   } catch (error) {
     // A partially written owner record remains fail-closed for inspection.
     await handle?.close();
     throw error;
-  } finally {
-    if (recovery) {
-      await recovery.close();
-      await fs.promises.unlink(recoveryPath);
-    }
   }
   let released;
   return Object.freeze({
@@ -87,13 +75,15 @@ export function inspectPrivateJournal(journalPath) {
   };
   const file = safeStat(journalPath);
   const lock = safeStat(journalPath + '.lock');
+  const recovery = safeStat(journalPath + '.lock.recovery');
   if (file && (!file.isFile() || file.size > PRIVATE_JOURNAL_MAX_BYTES)) {
     throw new Error('Private journal is not a bounded regular file');
   }
   if (lock && !lock.isFile()) throw new Error('Private owner lock is not a regular file');
+  if (recovery && !recovery.isFile()) throw new Error('Private recovery marker is not a regular file');
   return Object.freeze({present: Boolean(file), bytes: file?.size || 0,
     lockPresent: Boolean(lock), ownerVerified: false,
-    requiresManualOwnerCheck: Boolean(lock)});
+    requiresManualOwnerCheck: Boolean(lock || recovery)});
 }
 
 

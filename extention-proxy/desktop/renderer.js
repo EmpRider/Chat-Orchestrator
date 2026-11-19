@@ -657,10 +657,10 @@ function renderAgentClosureDialog() {
   $('closure-url').textContent=entry.url?
     `Saved conversation: ${entry.url}`:'No verified conversation URL was captured; Accident recovery is held.';
   const descendants=Array.isArray(entry.descendants)?entry.descendants:[];
-  const active=descendants.filter((d)=>
-    ['running','uncertain','waiting_for_children','queued'].includes(d.state));
-  $('closure-warning').textContent=active.length
-    ? `${active.length} descendant Agent(s) may still be working. Their existing browser work continues while you decide. An intentional Yes closes this subtree immediately; Cancel leaves tabs open but unmanaged.`
+  const unresolved=descendants.filter((d)=>
+    ['running','uncertain','waiting_for_children','waiting_for_parent_context','queued'].includes(d.state));
+  $('closure-warning').textContent=unresolved.length
+    ? `${unresolved.length} descendant Agent(s) still have active, queued, or Parent-context-dependent work. Existing browser work continues while you decide. An intentional Yes closes this subtree immediately; Cancel leaves tabs open but unmanaged.`
     : 'No active descendant tasks were observed in the captured closure snapshot.';
   $('closure-descendants').textContent=descendants.length
     ? descendants.map((d)=>`Tab ${d.tabId} · parent ${d.parentTabId} · ${d.title||d.site||'Agent'} · ${d.state}`).join('\n')

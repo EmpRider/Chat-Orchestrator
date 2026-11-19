@@ -36,6 +36,24 @@ test('foreign-host and interrupted recovery locks remain fail-closed', async() =
   } finally { fs.rmSync(root,{recursive:true,force:true}); }
 });
 
+test('well-formed dead-owner and orphan recovery marker never authorize automatic lock removal',async()=>{
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'chat-orch-lock-crash-'));
+  const journal=path.join(root,'coordination.events.journal');
+  const lockPath=journal+'.lock';
+  const original=JSON.stringify({version:1,pid:2147483647,
+    hostname:os.hostname(),nonce:'ffffffff-ffff-4fff-8fff-ffffffffffff'});
+  try {
+    fs.writeFileSync(lockPath,original);
+    await assert.rejects(acquirePrivateJournalLock(journal),{code:'PRIVATE_JOURNAL_OWNER_UNKNOWN'});
+    assert.equal(fs.readFileSync(lockPath,'utf8'),original);
+    fs.unlinkSync(lockPath);
+    fs.writeFileSync(lockPath+'.recovery','interrupted recovery marker');
+    await assert.rejects(acquirePrivateJournalLock(journal),{code:'PRIVATE_JOURNAL_OWNER_UNKNOWN'});
+    assert.equal(fs.existsSync(lockPath),false);
+    assert.equal(fs.readFileSync(lockPath+'.recovery','utf8'),'interrupted recovery marker');
+  } finally { fs.rmSync(root,{recursive:true,force:true}); }
+});
+
 test('private journal provisioning is explicit, fsynced, idempotent and non-truncating', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'chat-orch-prep-'));
   const file = path.join(root, 'profile', 'coordination.events.journal');
@@ -90,6 +108,10 @@ test('read-only journal inspector flags unknown owner locks without mutating evi
     assert.equal(fs.readFileSync(lock,'utf8'), 'unverified owner');
     fs.unlinkSync(lock);
     assert.equal(inspectPrivateJournal(file).lockPresent, false);
+    fs.writeFileSync(lock+'.recovery','interrupted recovery evidence');
+    assert.equal(inspectPrivateJournal(file).requiresManualOwnerCheck,true);
+    assert.equal(inspectPrivateJournal(file).lockPresent,false);
+    fs.unlinkSync(lock+'.recovery');
     fs.mkdirSync(lock);
     assert.throws(() => inspectPrivateJournal(file), /not a regular file/);
     assert.equal(fs.readFileSync(file,'utf8'), before);

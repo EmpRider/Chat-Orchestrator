@@ -1602,10 +1602,18 @@ async function acquireForegroundSubmitLease(tabId,kind='child') {
     }
   };
 }
-async function focusWorkerForStartup(tabId) {
+async function focusWorkerForStartup(tabId, allowBackground=false) {
   const tab = await chrome.tabs.get(tabId);
   if (!tab || !ownedWorker(tabId, workerOwners[tabId]))
     throw new Error('Worker tab is unavailable or no longer owned');
+  // Do not switch the active tab for routine background work if this exact
+  // managed ChatGPT document has a verified MAIN-world anti-freeze shim.
+  // Explicit opt-in real foreground submission still uses normal activation.
+  if(allowBackground && siteOfUrl(tab.url)==='chatgpt' &&
+      await enableManagedAntiFreeze(tabId)) {
+    extensionDiagnostic('info','worker.startup_background_ready',{tabId});
+    return;
+  }
   // Edge briefly locks tab edits while settling a freshly created group.
   // Only retry that transient failure; never create another worker tab.
   for (let attempt = 1; attempt <= 5; attempt++) {
@@ -1656,7 +1664,7 @@ async function startTask(tabId, site, text, waitSecs, cfg, autoClose = false, ow
     try {
     console.info('[chat-orch:background]', {step:'worker_focus', tabId, site});
     try {
-      await focusWorkerForStartup(tabId);
+      await focusWorkerForStartup(tabId,!releaseForeground);
       extensionDiagnostic('info','worker.startup_focus_complete',{tabId,site});
     } catch (error) {
       console.warn('[chat-orch:background]',{step:'worker_startup_blocked',tabId,site,

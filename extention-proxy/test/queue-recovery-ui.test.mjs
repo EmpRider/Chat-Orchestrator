@@ -87,6 +87,35 @@ test('queue actions expose persistent per-row results and errors across polling 
     call.batch===batchId),true,'buttons use exact original recipient and batch');
 });
 
+test('D-012 closure warning includes a Child waiting for Parent context',()=>{
+  const source=readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)),
+    '..','desktop','renderer.js'),'utf8');
+  const begin=source.indexOf('const closureFirstShown=');
+  const end=source.indexOf('async function refreshAgentClosures()');
+  assert.ok(begin>=0 && end>begin,'closure renderer must be present');
+  const elements=new Map();
+  const document={getElementById(id){
+    if(!elements.has(id))elements.set(id,makeNode());
+    return elements.get(id);
+  }};
+  const context={document,Map,Date};
+  runInNewContext('const $=(id)=>document.getElementById(id);'+
+    'const currentState={phase:"running",extensionConnected:true};'+
+    source.slice(begin,end),context);
+  runInNewContext(`closureSnapshot=[{
+    id:'pending-parent',status:'pending',kind:'parent',title:'Parent Agent',
+    oldTabId:101,url:'https://chatgpt.com/c/saved',createdAt:Date.now()-10000,
+    descendants:[
+      {tabId:201,parentTabId:101,title:'Request Run Token',state:'waiting_for_parent_context'},
+      {tabId:202,parentTabId:101,title:'MCP Task Setup',state:'done'}
+    ]}];renderAgentClosureDialog();`,context);
+  const warning=document.getElementById('closure-warning').textContent;
+  assert.match(warning,/1 descendant Agent\(s\).*Parent-context-dependent work/);
+  assert.doesNotMatch(warning,/No active descendant tasks/);
+  assert.match(document.getElementById('closure-descendants').textContent,
+    /waiting_for_parent_context/);
+});
+
 test('D-044 manual status UI displays evidence and descendants, serializes clicks and preserves waiting state',async()=>{
   const elements=new Map();
   const element=(id)=>{

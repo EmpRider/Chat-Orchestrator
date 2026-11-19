@@ -586,9 +586,17 @@ journal and lock files, verify no process is using this specific profile,
 and reconcile unacknowledged or uncertain queue operations before an
 operator-controlled recovery. Never run an automated stale-lock deletion.
 
-The internal event journal is **enabled by default**. Desktop startup creates it in a fresh temporary directory for this run; saved profile settings and credentials remain available across launches. On normal exit the runtime directory is removed. A crashed run may leave its temporary directory behind; the next launch still starts with a fresh worker queue. The desktop Coordination
-panel shows a read-only journal inspection (presence, byte size and whether an
-owner lock exists). A lock's presence **does not prove its writer is alive**.
+The internal event journal is **enabled by default**. Desktop provisions
+`coordination.events.journal` in the **persistent application profile directory**
+(the default Windows profile is under `%APPDATA%\Chat Orchestrator`; named profiles
+use `%APPDATA%\Chat Orchestrator Profiles\<profile>`). The Proxy receives that
+directory via `CHAT_ORCH_JOURNAL_DIR`; its separate temporary session directory
+does not own the journal. On clean exit, only the verified owner lock is removed;
+the journal remains for subsequent verified processing. A crashed run may leave
+a stale owner lock. The next start **must not** reclaim that lock from PID evidence
+alone or treat past sends as delivered. The desktop Coordination panel shows a
+read-only journal inspection (presence, byte size and whether an owner lock
+exists). A lock's presence **does not prove its writer is alive**.
 After a crash or interrupted shutdown, treat any remaining `.lock` file or
 incomplete/checksum-invalid event as **manual reconciliation required**.
 
@@ -605,5 +613,6 @@ incomplete/checksum-invalid event as **manual reconciliation required**.
    ambiguous chat submissions, or close workers**. Leave this profile stopped
    if the evidence is incomplete; use a distinct profile for other work.
 
-Each run uses a separate temporary journal path. Existing user-data files are
-left untouched; no cross-run queue recovery is attempted.
+The separate runtime session directory is temporary. The persistent journal is
+reopened only after ownership and journal integrity checks succeed; pending or
+uncertain events are not automatically resent or marked acknowledged.
