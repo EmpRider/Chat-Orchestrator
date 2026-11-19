@@ -1,5 +1,6 @@
 # Local workspace state and diagnostics
 .serena/
+.claude/
 test-output/
 *.log
 *.tmp
