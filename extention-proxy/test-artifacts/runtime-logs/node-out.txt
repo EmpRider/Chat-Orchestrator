@@ -1,0 +1,5 @@
+Chat Orchestrator MCP server listening on http://127.0.0.1:8787
+  Extension bridge: ws://localhost:8787/bridge
+  MCP endpoints: /mcp (Bearer), /mcp/agent (URL token)
+[bridge] extension session registered
+[bridge] extension session registered

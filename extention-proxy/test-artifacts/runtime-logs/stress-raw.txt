@@ -1,0 +1,33 @@
+﻿✔ STRESS-01 concurrent spawn fan-out is serialised, no duplicate tabs (521.6704ms)
+✖ STRESS-02 FIFO flood: 12 child results delivered then ACKed in order (763.89ms)
+✔ STRESS-03 ACK with wrong event set is refused; queue stays intact (489.207ms)
+✔ STRESS-04 idempotency: same key replays identical result, no double side effect (436.0606ms)
+✔ STRESS-05 concurrent independent parents stay isolated (472.967ms)
+ℹ tests 5
+ℹ suites 0
+ℹ pass 4
+ℹ fail 1
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 2972.5443
+
+✖ failing tests:
+
+test at test\stress-concurrency-flood.test.mjs:142:1
+✖ STRESS-02 FIFO flood: 12 child results delivered then ACKed in order (763.89ms)
+  AssertionError [ERR_ASSERTION]: all flooded events reach PROCESSED
+  
+  12 !== 0
+  
+      at TestContext.<anonymous> (file:///D:/Chat-Orchestrator/extention-proxy/test/stress-concurrency-flood.test.mjs:176:10)
+      at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+      at async Test.run (node:internal/test_runner/test:1409:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:974:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: 12,
+    expected: 0,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
