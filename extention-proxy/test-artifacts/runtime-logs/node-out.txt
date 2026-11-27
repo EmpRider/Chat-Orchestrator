@@ -3,3 +3,4 @@ Chat Orchestrator MCP server listening on http://127.0.0.1:8787
   MCP endpoints: /mcp (Bearer), /mcp/agent (URL token)
 [bridge] extension session registered
 [bridge] extension session registered
+[bridge] extension session registered
