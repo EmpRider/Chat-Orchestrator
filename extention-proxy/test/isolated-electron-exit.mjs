@@ -2,8 +2,8 @@
 import WebSocket from 'ws';
 const base = 'http://127.0.0.1:9339';
 const pages = await (await fetch(base + '/json/list')).json();
-if (!pages.some((t) => t.type === 'page' &&
-  t.url.startsWith('file:///D:/web-chat-automation/extention-proxy/desktop/index.html'))) {
+const desktopUrl = new URL('../desktop/index.html', import.meta.url).href.toLowerCase();
+if (!pages.some((t) => t.type === 'page' && t.url.toLowerCase().startsWith(desktopUrl))) {
   throw new Error('Unexpected CDP target; refusing to close a non-test Electron app');
 }
 const version = await (await fetch(base + '/json/version')).json();

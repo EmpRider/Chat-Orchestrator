@@ -1964,6 +1964,10 @@
         throw new Error('Setup message visibility unverified');
       return {ok:true,submitted:true};
     } catch(error) {
+      // A reformatted sent turn can fail full-text matching. Its fresh private
+      // marker proves submission, not pairing; never resend or log that marker.
+      if (visibleMarker() && !chatgptAccountChanged())
+        return {ok:true,submitted:true};
       logStep('parent_setup','parent_setup_submission_uncertain',{
         errorCode:error?.code || 'UNCLASSIFIED',
         draftStillPresent:composerText(q(A.input))===normalizePrompt(text),

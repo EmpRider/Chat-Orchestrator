@@ -30,7 +30,7 @@ const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || '127.0.0.1';
 const EXTENSION_PROFILE_TOKEN=process.env.CHAT_ORCH_EXTENSION_PROFILE_TOKEN || '';
 if(EXTENSION_PROFILE_TOKEN && !/^[a-f0-9]{64}$/i.test(EXTENSION_PROFILE_TOKEN))
-  throw new Error('Invalid local profile connection secret; refuse to start');
+  throw new Error('Invalid extension profile token');
 const PUBLIC_PORT=process.env.CHAT_ORCH_PUBLIC_PORT == null
   ? null:Number(process.env.CHAT_ORCH_PUBLIC_PORT);
 const PUBLIC_MCP_TOKEN=process.env.CHAT_ORCH_PUBLIC_MCP_TOKEN || '';
@@ -148,6 +148,11 @@ function profilePrincipalFromExtension(a) {
   if (!socket || socket.readyState !== 1 ||
       socket.connectionGeneration !== a.connection_generation)
     throw new Error('Attesting browser session changed during request');
+  // Fail closed: when a profile token is configured, only a socket that proved it
+  // holds that token may act as a profile manager. A standalone/no-token proxy
+  // (tests, local dev) keeps its existing handshake-only trust.
+  if (EXTENSION_PROFILE_TOKEN && socket.profileAuthenticated !== true)
+    throw new Error('Browser session did not authenticate the profile token');
   return Object.freeze({
     mode: 'profile', principalId:credentialId,credentialId,
     workspaceId: 'local-profile', projectId: 'local-profile',
@@ -1019,8 +1024,40 @@ function reducePrivateQueueEvents(events, recovering = false) {
         }));
       }
     }
+    // A wake batch is all-or-nothing. The journal format cannot enforce it (a
+    // partial ACK is structurally valid bytes), so the invariant lives here:
+    // if any member of a leased batch is not PROCESSED, no member may be
+    // honoured as PROCESSED. Otherwise a mid-loop ACK failure leaves a batch
+    // that is half-consumed and half-undeliverable, and neither half can be
+    // reconciled as a unit.
+    const batches = new Map();
+    for (const [key, item] of reduced.byRef) {
+      if (!item.leaseNonce || item.phase === 'SKIPPED' ||
+          item.phase === 'SAGA_CONFIRMED') continue;
+      const batchKey = item.recipientKey + '#' + item.leaseNonce;
+      const members = batches.get(batchKey);
+      if (members) members.push([key, item]);
+      else batches.set(batchKey, [[key, item]]);
+    }
+    for (const members of batches.values()) {
+      if (members.length < 2 ||
+          !members.some(([, item]) => item.phase !== 'PROCESSED')) continue;
+      for (const [key, item] of members) {
+        if (item.phase !== 'PROCESSED') continue;
+        reduced.byRef.set(key, Object.freeze({
+          ...item, phase: 'UNCERTAIN', previousPhase: 'PROCESSED',
+          recovered: true, recoveryClass: 'PARTIAL_BATCH_ACK_UNVERIFIED',
+        }));
+      }
+    }
   }
   return reduced;
+}
+
+// How long an unACKed DELIVERED head must sit before it is reported as blocked.
+function queueBlockedAgeSeconds() {
+  const override = Number(process.env.CHAT_ORCH_QUEUE_BLOCKED_SECONDS);
+  return Number.isFinite(override) && override >= 0 ? override : 180;
 }
 
 // Local desktop diagnostics across every durable scope, including managers not
@@ -2393,6 +2430,94 @@ async function recoverPrivateManagerBatch(principal,batchId,action,reason='') {
   } finally {privateRecoveryInFlight.delete(active.credentialId);}
 }
 
+// Automatic recovery for a DELIVERED batch no one ACKed. It is deliberately
+// staged and one-shot per tick: recoverPrivateManagerBatch() takes the
+// per-manager recovery lock, and acknowledgePrivateBatch() refuses while that
+// lock is held. Running every strategy in one pass would block a legitimate
+// Parent ACK for up to (recheck + 45s retry + 20s reload) on every tick. One
+// bounded step per cooldown window keeps the lock hold short.
+const autoReconcileState = new Map(); // batchId -> {at, stage}
+const AUTO_RECONCILE_MIN_AGE_MS = 15000;
+const AUTO_RECONCILE_COOLDOWN_MS = 45000;
+const AUTO_RECONCILE_MAX_STAGE = 3;
+let autoReconcileInFlight = false;
+
+async function autoReconcileStuckDeliveredBatches() {
+  if (autoReconcileInFlight || !privateCoordinationEnabled || !privateJournal ||
+      !bridgeConnected()) return;
+  autoReconcileInFlight = true;
+  try {
+    const now = Date.now();
+    // Drop finished batches so the Map cannot grow for the process lifetime.
+    for (const [id, entry] of autoReconcileState)
+      if (now - entry.at > 10 * AUTO_RECONCILE_COOLDOWN_MS) autoReconcileState.delete(id);
+    for (const principal of [...activePrivateManagers.values()]) {
+      // Never race a human recovery or an in-flight dispatch.
+      if (privateRecoveryInFlight.has(principal.credentialId) ||
+          privateDispatching.has(principal.credentialId)) continue;
+      let scope, state;
+      try {
+        scope = privateManagerScope(principal);
+        state = privateJournal.queueState(principal, scope);
+      } catch { continue; }
+      const head = state.find((item) => !PRIVATE_QUEUE_TERMINAL.has(item.phase));
+      if (!head || head.phase !== 'DELIVERED' || !head.leaseNonce) continue;
+      const batchId = head.leaseNonce;
+      const prior = autoReconcileState.get(batchId);
+      if (prior && now - prior.at < AUTO_RECONCILE_COOLDOWN_MS) continue;
+      // An unreadable timestamp means "age unknown", not "already handled".
+      let age = null;
+      try {
+        const recorded = privateJournal.replay(principal, scope)
+          .filter((e) => e.ref === head.ref);
+        const at = Date.parse(recorded.at(-1)?.recordedAt || '');
+        if (Number.isFinite(at)) age = Math.max(0, now - at);
+      } catch { continue; }
+      if (age !== null && age < AUTO_RECONCILE_MIN_AGE_MS) continue;
+      const stage = prior?.stage || 1;
+      autoReconcileState.set(batchId, {at: now, stage: Math.min(stage + 1, AUTO_RECONCILE_MAX_STAGE)});
+      let resolved = false;
+      if (stage === 1) {
+        // Read-only DOM check: is the batch marker already in a user turn?
+        try { resolved = (await recoverPrivateManagerBatch(principal, batchId, 'recheck'))?.verified === true; }
+        catch { resolved = false; }
+      } else if (stage === 2) {
+        // Resubmit only the exact unsent draft; recoverPrivateManagerBatch
+        // re-verifies matchingDraft/account/generation before any send.
+        try {
+          const r = await recoverPrivateManagerBatch(principal, batchId, 'retry_draft');
+          resolved = r?.submitted === true || r?.verified === true;
+        } catch { resolved = false; }
+      } else {
+        // Force a re-render (the turn may be virtualized out of the DOM),
+        // then recheck. reload_manager_tab only reports success on a real
+        // 'complete' event, never on its timeout.
+        try {
+          const reloaded = await callExtension('reload_manager_tab', {
+            __trustedPrincipal: principal, __sessionBrowserId: principal.browserSessionId,
+            manager_tab_id: principal.callerTabId,
+          }, 20000);
+          if (reloaded?.reloaded === true) {
+            await new Promise((res) => setTimeout(res, 2500));
+            resolved = (await recoverPrivateManagerBatch(principal, batchId, 'recheck'))?.verified === true;
+          }
+        } catch { resolved = false; }
+      }
+      if (resolved) {
+        autoReconcileState.delete(batchId);
+        continue;
+      }
+      // Automatic options exhausted. Name it for the operator; never auto-skip,
+      // because a skip discards the only durable copy of a Child's result.
+      if (stage >= AUTO_RECONCILE_MAX_STAGE) {
+        diagnostics.warn('auto_reconcile.manual_required', {
+          callerTabId: principal.callerTabId, batchId,
+        });
+      }
+    }
+  } finally { autoReconcileInFlight = false; }
+}
+
 async function pumpOnePrivateManager(principal) {
   if (!privateCoordinationEnabled || !privateJournal ||
       !armedPrivateDelivery.has(principal.credentialId) ||
@@ -2551,10 +2676,16 @@ async function acknowledgePrivateBatch(principal, batchId, eventIds) {
   const recorded = privateJournal.replay(active, managerScope);
   const originals = new Map(recorded.filter((event) => event.payload.phase === 'QUEUED')
     .map((event) => [event.id, event]));
-  for (const item of items) {
+  // Resolve every member before appending any: a throw inside the append loop
+  // would leave the batch half-PROCESSED on disk. The journal format cannot
+  // prevent that, so refuse the whole batch up front instead.
+  const batchScopes = items.map((item) => {
     const original = originals.get(item.ref);
     if (!original) throw new Error('Missing immutable batch source');
-    const scope = privateRecordedScope(active, original);
+    return privateRecordedScope(active, original);
+  });
+  for (const [index, item] of items.entries()) {
+    const scope = batchScopes[index];
     await privateJournal.append(active, scope, 'queue.transition', {
       phase: 'PROCESSED', ref: item.ref,
       leaseGeneration: item.leaseGeneration, leaseNonce: batchId,
@@ -2646,8 +2777,19 @@ function forward(method, principal) {
           })
             .map(t=>({...t,parent_tab_id:tabRegistry.get(t.tab_id,caller.browserSessionId)?.parentTabId ?? null,
               root_tab_id:tabRegistry.get(t.tab_id,caller.browserSessionId)?.rootTabId ?? null}));
-        } else result = await callExtension(method,{...args,__trustedPrincipal:caller,
-          __sessionBrowserId:caller.browserSessionId});
+        } else {
+          // Child-bound follow-ups carry the same operating contract as spawn_worker.
+          // A bare message lets the Child answer inline and never call complete_task,
+          // so the Parent is never notified and the task hangs in RUNNING forever.
+          // 'delegation' is the only operation whose modules state the complete_task
+          // contract; 'task' alone leaves the Child with no completion call to make.
+          const forwarded = method === 'send_to_tab'
+            ? {...args, text:composeAgentPrompt(agentSettings,
+                {kind:'task', operation:'delegation', task:args.text})}
+            : args;
+          result = await callExtension(method,{...forwarded,__trustedPrincipal:caller,
+            __sessionBrowserId:caller.browserSessionId});
+        }
       }
       recordToolActivity(caller, method, true, startedAt);
       diagnostics.info('mcp.call_completed',{traceId,method,callerTabId:args?.caller_tab_id,
@@ -3050,7 +3192,29 @@ function buildServer(principal) {
       try {
         const active = registeredPrivateManager(await resolveCaller(args));
         const scope = privateManagerScope(active);
-        return textResult({ events: privateJournal.queueState(active, scope) });
+        const events = privateJournal.queueState(active, scope);
+        // A DELIVERED head is not locked, it is merely never retried — but the
+        // pump stops at it, so the Parent's whole queue is frozen and nothing
+        // says so. Name it, and name the fix (re-send the ACK), instead of
+        // letting the Parent wait forever.
+        const head = events.find((item) => !PRIVATE_QUEUE_TERMINAL.has(item.phase));
+        let queueBlocked = null;
+        if (head?.phase === 'DELIVERED') {
+          const recorded = privateJournal.replay(active, scope)
+            .filter((event) => event.ref === head.ref)
+            .sort((a, b) => a.seq - b.seq);
+          const deliveredAt = Date.parse(recorded.at(-1)?.recordedAt || '');
+          const age = Number.isFinite(deliveredAt)
+            ? Math.max(0, Math.round((Date.now() - deliveredAt) / 1000)) : null;
+          if (age !== null && age >= queueBlockedAgeSeconds()) {
+            queueBlocked = { ref: head.ref, phase: head.phase, age_seconds: age,
+              lease_nonce: head.leaseNonce,
+              action: 'Re-send coordination_ack_batch for this ref; a previous ACK did not complete.' };
+          }
+        }
+        return textResult(queueBlocked
+          ? { events, queue_blocked: queueBlocked, queue_depth: events.length }
+          : { events });
       } catch (error) { return errorResult(error); }
     });
     server.registerTool('coordination_incarnation_conflicts', {
@@ -3213,6 +3377,7 @@ export async function inspectDashboard() {
 }
 async function publishPrivateDashboard() {
   if (!process.parentPort || dashboardRefreshInFlight) return;
+  await autoReconcileStuckDeliveredBatches();
   const snapshot = await inspectDashboard();
   if (!httpServer.listening) return;
   try {
@@ -3281,17 +3446,19 @@ function validAgentUrlToken(req) {
 function requireAgentUrlToken(req,res,next){
   res.set('Cache-Control','no-store');
   res.set('Referrer-Policy','no-referrer');
-  if(!validAgentUrlToken(req))
+  if(!validAgentUrlToken(req)) {
+    if(publicRateLimited(req,res)) return;
     return res.status(401).json({
       jsonrpc:'2.0',error:{code:-32001,message:'MCP URL authentication required'},id:null,
     });
+  }
   next();
 }
 app.use('/mcp/agent',requireAgentUrlToken);
 app.post('/mcp/agent/:token',attachProfile,mcpHandler);
 
 const methodNotAllowed = (_req, res) =>
-  res.status(405).json({
+  res.status(405).set('Allow', 'POST').json({
     jsonrpc: '2.0',
     error: { code: -32000, message: 'Method not allowed (stateless server: use POST).' },
     id: null,
@@ -3306,6 +3473,22 @@ const httpServer = http.createServer(app);
 // upgrade handler and exposes only /health, /mcp and /mcp/agent,
 // never /bridge or desktop
 // administration endpoints, even if ngrok rewrites Host/Origin headers.
+const publicAuthFailures=new Map();
+function publicRateLimited(req,res) {
+  const ip=req.ip || req.socket?.remoteAddress || 'unknown';
+  const now=Date.now();
+  const windowMs=60000;
+  const maxFailures=20;
+  const entry=publicAuthFailures.get(ip)||{count:0,windowStart:now};
+  if(now-entry.windowStart>windowMs){entry.count=0;entry.windowStart=now;}
+  entry.count++;
+  publicAuthFailures.set(ip,entry);
+  if(entry.count>maxFailures){
+    res.status(429).json({jsonrpc:'2.0',error:{code:-32029,message:'Too many authentication failures'},id:null});
+    return true;
+  }
+  return false;
+}
 const publicApp=express();
 publicApp.use((req,res,next)=>{
   if(req.path==='/health')return app(req,res,next);
@@ -3322,6 +3505,7 @@ publicApp.use((req,res,next)=>{
       ? Buffer.from(authorization.slice(7),'hex') : Buffer.alloc(32);
     const expected=Buffer.from(PUBLIC_MCP_TOKEN,'hex');
     if(!crypto.timingSafeEqual(supplied,expected) || !wellFormed) {
+      if(publicRateLimited(req,res)) return;
       res.set('WWW-Authenticate','Bearer realm="chat-orchestrator-mcp"');
       return res.status(401).json({
         jsonrpc:'2.0',error:{code:-32001,message:'MCP transport authentication required'},id:null,
@@ -3835,5 +4019,5 @@ if (isMain || process.parentPort) {
 export const privateJournalTestHooks = Object.freeze({
   privateJournalFrame, replayPrivateJournal, reducePrivateQueueEvents,
   privateQueueDiagnosticCounts, privateReadinessState,
-  privateRecipientPredecessors, privateScopeKey,
+  privateRecipientPredecessors, privateScopeKey, privateQueueSummary,
 });

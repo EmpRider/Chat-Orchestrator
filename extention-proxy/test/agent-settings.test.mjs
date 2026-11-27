@@ -131,6 +131,42 @@ test('previous saved prompt defaults upgrade without overwriting custom action p
   assert.equal(custom.promptModules.delegation,'Custom delegated action.');
   assert.equal(custom.promptModules.child_result,'Custom child completion action.');
 });
+test('D-F child_result instructs review_task, the only gate that clears waiting_for_children',()=>{  const cfg=normalizeAgentSettings({});
+  const batch='22222222-2222-4222-8222-222222222222';
+  const q=composeAgentPrompt(cfg,{kind:'queue',batchId:batch,events:[{
+    type:'CHILD_RESULT',event_id:'e1',task_id:'33333333-3333-4333-8333-333333333333',
+    worker_tab_id:201,summary:'child finished'}]});
+  // A batch ACK never sets task.parentReviewed; only review_task does. Without
+  // this instruction a mid-tree agent ACKs, idles and stalls its own parent.
+  assert.match(q,/review_task/,'CHILD_RESULT guidance must name review_task');
+  assert.match(q,/waiting_for_children/,'the stall consequence must be stated');
+  assert.match(q,/task_id/);
+  // Reviewed Children left open hold a worker slot; the slot check is
+  // workers.length >= maxWorkers (background.js:972). Without this instruction
+  // a Parent reviews, idles, and eventually cannot spawn.
+  assert.match(q,/close_worker/,'reviewed Children must be closed to free the worker slot');
+  assert.match(q,/SUB_AGENT_LIMIT_REACHED/,'the slot-exhaustion consequence must be stated');
+});
+
+test('earlier saved child_result default upgrades to the review_task contract',()=>{
+  const v3=[
+    'For each CHILD_RESULT, inspect the preview and immutable full_report_ref. If preview_truncated is true, use coordination_get_report before ACK. Review the actual result and, if incomplete, assign a fixing task to the same child via send_to_tab. After reviewing each CHILD_RESULT, call review_task with tab_id set to that worker_tab_id and task_id set to that task_id; a descendant left unreviewed keeps your own task in waiting_for_children. Saga IDs are optional tracking references, not worker identities or closure gates.',
+    'Process and acknowledge the delivered queue batch only after actual review. If other children or grandchildren are still working, finish the current assistant response and return to idle; the orchestrator will notify you of later completions. Do not repeatedly poll get_result or task-status tools for remaining descendants.',
+    'After all required descendants have been reviewed, finalize dependent work. A yielded response is not proof that an unfinished task is complete.',
+  ].join('\n');
+  const v2=v3.split('\n')[0]
+    .replace(' After reviewing each CHILD_RESULT, call review_task with tab_id set to that worker_tab_id and task_id set to that task_id; a descendant left unreviewed keeps your own task in waiting_for_children.','')+'\n'+
+    v3.split('\n').slice(1).join('\n');
+  // Both the V2 (review_task, no close_worker) and V3 (pre-change) saved
+  // defaults must upgrade; otherwise an already-saved profile keeps the old
+  // text and never learns to close reviewed Children.
+  for (const saved of [v2,v3]) {
+    const upgraded=normalizeAgentSettings({promptModules:{child_result:saved}});
+    assert.equal(upgraded.promptModules.child_result,DEFAULT_AGENT_SETTINGS.promptModules.child_result);
+    assert.match(upgraded.promptModules.child_result,/review_task/);
+    assert.match(upgraded.promptModules.child_result,/close_worker/);
+  }
+});
 test('queue prompts include only pertinent modules, not unrelated tools',()=>{
  const cfg=normalizeAgentSettings({});
  const batch='11111111-1111-4111-8111-111111111111';

@@ -1,10 +1,12 @@
 // Stop only the explicitly isolated test desktop via its loopback DevTools port.
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
 const targets = await (await fetch('http://127.0.0.1:9339/json/list')).json();
+const desktopUrl = new URL('../desktop/index.html', import.meta.url).href.toLowerCase();
 const target = targets.find((x) => x.type === 'page' &&
-  x.url.startsWith('file:///D:/web-chat-automation/extention-proxy/desktop/index.html'));
+  x.url.toLowerCase().startsWith(desktopUrl));
 assert.ok(target, 'Test-only desktop page not found. Refusing to target unknown app.');
 const ws = new WebSocket(target.webSocketDebuggerUrl);
 await new Promise((res, rej) => { ws.once('open', res); ws.once('error', rej); });
@@ -33,7 +35,7 @@ for (let i = 0; i < 70; i++) {
   await new Promise((resolve) => setTimeout(resolve, 150));
 }
 assert.equal((await evaluate('window.bridge.status()')).phase, 'stopped');
-const lock = 'D:/web-chat-automation/test-output/p0-ui-profile/coordination.events.journal.lock';
+const lock = fileURLToPath(new URL('../test-output/p0-ui-profile/coordination.events.journal.lock', import.meta.url));
 const exists = await fs.stat(lock).then(() => true).catch((e) =>
   e.code === 'ENOENT' ? false : Promise.reject(e));
 assert.equal(exists, false, 'Isolated journal lock survived graceful stop');

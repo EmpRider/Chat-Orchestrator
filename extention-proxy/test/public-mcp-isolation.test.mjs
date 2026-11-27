@@ -100,6 +100,8 @@ test('desktop ngrok upstream serves MCP but cannot expose local extension bridge
   assert.equal(noUrlToken.status,401,'agent URL endpoint must not silently fall back to Bearer');
   const withTokenGet=await fetch(base+'/mcp/agent/'+transportKey);
   assert.equal(withTokenGet.status,405,'stateless Streamable HTTP transport remains POST-only');
+  // RFC 9110 §15.5.6: a 405 MUST advertise the methods that are allowed.
+  assert.match(withTokenGet.headers.get('allow')||'',/\bPOST\b/, '405 must send Allow: POST');
   const withoutTokenGet=await fetch(base+'/mcp/agent');
   assert.equal(withoutTokenGet.status,401);
   for(const inaccessible of ['/mcp/agent/debug?token='+transportKey,

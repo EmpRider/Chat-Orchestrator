@@ -31,3 +31,17 @@ dist/
 # OS metadata
 .DS_Store
 Thumbs.db
+graphify-out/.graphify_ast.json
+graphify-out/.graphify_chunk_02.json
+graphify-out/.graphify_chunk_03.json
+graphify-out/.graphify_detect.json
+graphify-out/.graphify_python
+graphify-out/.graphify_root
+graphify-out/.graphify_uncached.txt
+graphify-out/cache/stat-index.json
+graphify-out/cache/ast/v0.9.112-s48-gd93bdf18e146/1ca347a2f46c04bafecc9c9f1a949915b0375dfa0773ee94ad5becf8514e8131.json
+graphify-out/cache/ast/v0.9.112-s48-gd93bdf18e146/18d21b0ccaec55c74d5ce655bd802cf8aa65a0b1337561f126841172464ba7b2.json
+graphify-out/cache/ast/v0.9.112-s48-gd93bdf18e146/20f36bbe5dbbd283df2b21d0ed169a3b0543b66a14ad7cf14a4ec1a1e0c24abb.json
+graphify-out/cache/ast/v0.9.112-s48-gd93bdf18e146/a3634223ce50acbeb6bfcb4de33a5885cfb24767f3a6b896635883a6192e73fd.json
+graphify-out/cache/ast/v0.9.112-s48-gd93bdf18e146/aee801f8180e783fc3f013a830ac910a12c59fb56ab5d91899eb78f6bf4f3d3a.json
+extention/graphify-out/cache/stat-index.json

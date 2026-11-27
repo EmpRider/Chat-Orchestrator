@@ -1,0 +1,1878 @@
+[
+  {
+    "id": "E2E-START-001",
+    "priority": "P0",
+    "category": "startup",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-START-002",
+    "priority": "P0",
+    "category": "startup",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-START-003",
+    "priority": "P2",
+    "category": "startup",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-START-004",
+    "priority": "P0",
+    "category": "startup",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-START-005",
+    "priority": "P0",
+    "category": "startup",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-START-006",
+    "priority": "P0",
+    "category": "startup",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-START-007",
+    "priority": "P0",
+    "category": "startup",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-START-008",
+    "priority": "P2",
+    "category": "startup",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-START-009",
+    "priority": "P0",
+    "category": "startup",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-START-010",
+    "priority": "P2",
+    "category": "startup",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-MCP-001",
+    "priority": "P0",
+    "category": "mcp_connection",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-MCP-002",
+    "priority": "P0",
+    "category": "mcp_connection",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-MCP-003",
+    "priority": "P0",
+    "category": "mcp_connection",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-MCP-004",
+    "priority": "P0",
+    "category": "mcp_connection",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-MCP-005",
+    "priority": "P0",
+    "category": "mcp_connection",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-MCP-006",
+    "priority": "P0",
+    "category": "mcp_connection",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-MCP-007",
+    "priority": "P0",
+    "category": "mcp_connection",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-MCP-008",
+    "priority": "P0",
+    "category": "mcp_connection",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-MCP-009",
+    "priority": "P0",
+    "category": "mcp_connection",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-MCP-010",
+    "priority": "P0",
+    "category": "mcp_connection",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-MCP-011",
+    "priority": "P0",
+    "category": "mcp_connection",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-MCP-012",
+    "priority": "P0",
+    "category": "mcp_connection",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-NGROK-001",
+    "priority": "P1",
+    "category": "ngrok",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-NGROK-002",
+    "priority": "P2",
+    "category": "ngrok",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-NGROK-003",
+    "priority": "P2",
+    "category": "ngrok",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-NGROK-004",
+    "priority": "P2",
+    "category": "ngrok",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-NGROK-005",
+    "priority": "P1",
+    "category": "ngrok",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-NGROK-006",
+    "priority": "P2",
+    "category": "ngrok",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-NGROK-007",
+    "priority": "P2",
+    "category": "ngrok",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-NGROK-008",
+    "priority": "P2",
+    "category": "ngrok",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-EXT-001",
+    "priority": "P0",
+    "category": "extension_init",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-EXT-002",
+    "priority": "P1",
+    "category": "extension_init",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-EXT-003",
+    "priority": "P2",
+    "category": "extension_init",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-EXT-004",
+    "priority": "P1",
+    "category": "extension_init",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-EXT-005",
+    "priority": "P2",
+    "category": "extension_init",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-EXT-006",
+    "priority": "P1",
+    "category": "extension_init",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-EXT-007",
+    "priority": "P2",
+    "category": "extension_init",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-EXT-008",
+    "priority": "P1",
+    "category": "extension_init",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-EXT-009",
+    "priority": "P0",
+    "category": "extension_init",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-EXT-010",
+    "priority": "P1",
+    "category": "extension_init",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-EXT-011",
+    "priority": "P1",
+    "category": "extension_init",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-EXT-012",
+    "priority": "P2",
+    "category": "extension_init",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-PARENT-001",
+    "priority": "P0",
+    "category": "parent_registration",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-PARENT-002",
+    "priority": "P0",
+    "category": "parent_registration",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-PARENT-003",
+    "priority": "P0",
+    "category": "parent_registration",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-PARENT-004",
+    "priority": "P0",
+    "category": "parent_registration",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-PARENT-005",
+    "priority": "P0",
+    "category": "parent_registration",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-PARENT-006",
+    "priority": "P0",
+    "category": "parent_registration",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-PARENT-007",
+    "priority": "P2",
+    "category": "parent_registration",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-PARENT-008",
+    "priority": "P0",
+    "category": "parent_registration",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-PARENT-009",
+    "priority": "P0",
+    "category": "parent_registration",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-PARENT-010",
+    "priority": "P0",
+    "category": "parent_registration",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-PARENT-011",
+    "priority": "P0",
+    "category": "parent_registration",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-PARENT-012",
+    "priority": "P2",
+    "category": "parent_registration",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-CHILD-001",
+    "priority": "P0",
+    "category": "child_creation",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-CHILD-002",
+    "priority": "P0",
+    "category": "child_creation",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-CHILD-003",
+    "priority": "P0",
+    "category": "child_creation",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-CHILD-004",
+    "priority": "P0",
+    "category": "child_creation",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-CHILD-005",
+    "priority": "P0",
+    "category": "child_creation",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-CHILD-006",
+    "priority": "P0",
+    "category": "child_creation",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-CHILD-007",
+    "priority": "P0",
+    "category": "child_creation",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-CHILD-008",
+    "priority": "P0",
+    "category": "child_creation",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-CHILD-009",
+    "priority": "P0",
+    "category": "child_creation",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-CHILD-010",
+    "priority": "P0",
+    "category": "child_creation",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-CHILD-011",
+    "priority": "P0",
+    "category": "child_creation",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-CHILD-012",
+    "priority": "P0",
+    "category": "child_creation",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-PAIR-001",
+    "priority": "P0",
+    "category": "pairing",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-PAIR-002",
+    "priority": "P0",
+    "category": "pairing",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-PAIR-003",
+    "priority": "P0",
+    "category": "pairing",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-PAIR-004",
+    "priority": "P0",
+    "category": "pairing",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-PAIR-005",
+    "priority": "P0",
+    "category": "pairing",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-PAIR-006",
+    "priority": "P0",
+    "category": "pairing",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-PAIR-007",
+    "priority": "P0",
+    "category": "pairing",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-PAIR-008",
+    "priority": "P0",
+    "category": "pairing",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-PAIR-009",
+    "priority": "P0",
+    "category": "pairing",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-PAIR-010",
+    "priority": "P0",
+    "category": "pairing",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-PAIR-011",
+    "priority": "P0",
+    "category": "pairing",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-PAIR-012",
+    "priority": "P0",
+    "category": "pairing",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-PAIR-013",
+    "priority": "P2",
+    "category": "pairing",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-PAIR-014",
+    "priority": "P0",
+    "category": "pairing",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-PROMPT-001",
+    "priority": "P0",
+    "category": "prompt_submission",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-PROMPT-002",
+    "priority": "P0",
+    "category": "prompt_submission",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-PROMPT-003",
+    "priority": "P0",
+    "category": "prompt_submission",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-PROMPT-004",
+    "priority": "P0",
+    "category": "prompt_submission",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-PROMPT-005",
+    "priority": "P0",
+    "category": "prompt_submission",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-PROMPT-006",
+    "priority": "P2",
+    "category": "prompt_submission",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-PROMPT-007",
+    "priority": "P2",
+    "category": "prompt_submission",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-PROMPT-008",
+    "priority": "P0",
+    "category": "prompt_submission",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-PROMPT-009",
+    "priority": "P0",
+    "category": "prompt_submission",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-PROMPT-010",
+    "priority": "P2",
+    "category": "prompt_submission",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-PROMPT-011",
+    "priority": "P0",
+    "category": "prompt_submission",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-PROMPT-012",
+    "priority": "P2",
+    "category": "prompt_submission",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-READ-001",
+    "priority": "P0",
+    "category": "response_reading",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-READ-002",
+    "priority": "P0",
+    "category": "response_reading",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-READ-003",
+    "priority": "P2",
+    "category": "response_reading",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-READ-004",
+    "priority": "P2",
+    "category": "response_reading",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-READ-005",
+    "priority": "P0",
+    "category": "response_reading",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-READ-006",
+    "priority": "P0",
+    "category": "response_reading",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-READ-007",
+    "priority": "P2",
+    "category": "response_reading",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-READ-008",
+    "priority": "P2",
+    "category": "response_reading",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-READ-009",
+    "priority": "P0",
+    "category": "response_reading",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-READ-010",
+    "priority": "P2",
+    "category": "response_reading",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-COMP-001",
+    "priority": "P0",
+    "category": "completion",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-COMP-002",
+    "priority": "P0",
+    "category": "completion",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-COMP-003",
+    "priority": "P0",
+    "category": "completion",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-COMP-004",
+    "priority": "P0",
+    "category": "completion",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-COMP-005",
+    "priority": "P0",
+    "category": "completion",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-COMP-006",
+    "priority": "P0",
+    "category": "completion",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-COMP-007",
+    "priority": "P0",
+    "category": "completion",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-COMP-008",
+    "priority": "P1",
+    "category": "completion",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-COMP-009",
+    "priority": "P1",
+    "category": "completion",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-COMP-010",
+    "priority": "P2",
+    "category": "completion",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-COMP-011",
+    "priority": "P2",
+    "category": "completion",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-COMP-012",
+    "priority": "P2",
+    "category": "completion",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-EVT-001",
+    "priority": "P0",
+    "category": "event_queues",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-EVT-002",
+    "priority": "P0",
+    "category": "event_queues",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-EVT-003",
+    "priority": "P0",
+    "category": "event_queues",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-EVT-004",
+    "priority": "P1",
+    "category": "event_queues",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-EVT-005",
+    "priority": "P0",
+    "category": "event_queues",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-EVT-006",
+    "priority": "P1",
+    "category": "event_queues",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-EVT-007",
+    "priority": "P0",
+    "category": "event_queues",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-EVT-008",
+    "priority": "P0",
+    "category": "event_queues",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-EVT-009",
+    "priority": "P1",
+    "category": "event_queues",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-EVT-010",
+    "priority": "P1",
+    "category": "event_queues",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-EVT-011",
+    "priority": "P2",
+    "category": "event_queues",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-EVT-012",
+    "priority": "P1",
+    "category": "event_queues",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-EVT-013",
+    "priority": "P1",
+    "category": "event_queues",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-EVT-014",
+    "priority": "P1",
+    "category": "event_queues",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-FIFO-001",
+    "priority": "P0",
+    "category": "fifo_acks",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-FIFO-002",
+    "priority": "P1",
+    "category": "fifo_acks",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-FIFO-003",
+    "priority": "P1",
+    "category": "fifo_acks",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-FIFO-004",
+    "priority": "P0",
+    "category": "fifo_acks",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-FIFO-005",
+    "priority": "P0",
+    "category": "fifo_acks",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-FIFO-006",
+    "priority": "P2",
+    "category": "fifo_acks",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-FIFO-007",
+    "priority": "P0",
+    "category": "fifo_acks",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-FIFO-008",
+    "priority": "P0",
+    "category": "fifo_acks",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-FIFO-009",
+    "priority": "P1",
+    "category": "fifo_acks",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-FIFO-010",
+    "priority": "P1",
+    "category": "fifo_acks",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-FIFO-011",
+    "priority": "P2",
+    "category": "fifo_acks",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-FIFO-012",
+    "priority": "P2",
+    "category": "fifo_acks",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-SESS-001",
+    "priority": "P1",
+    "category": "session_incarnation",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-SESS-002",
+    "priority": "P1",
+    "category": "session_incarnation",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-SESS-003",
+    "priority": "P1",
+    "category": "session_incarnation",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-SESS-004",
+    "priority": "P0",
+    "category": "session_incarnation",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-SESS-005",
+    "priority": "P0",
+    "category": "session_incarnation",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-SESS-006",
+    "priority": "P2",
+    "category": "session_incarnation",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-SESS-007",
+    "priority": "P2",
+    "category": "session_incarnation",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-SESS-008",
+    "priority": "P1",
+    "category": "session_incarnation",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-SESS-009",
+    "priority": "P1",
+    "category": "session_incarnation",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-SESS-010",
+    "priority": "P1",
+    "category": "session_incarnation",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-SESS-011",
+    "priority": "P2",
+    "category": "session_incarnation",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-SESS-012",
+    "priority": "P1",
+    "category": "session_incarnation",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-NEST-001",
+    "priority": "P0",
+    "category": "nested_delegation",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-NEST-002",
+    "priority": "P0",
+    "category": "nested_delegation",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-NEST-003",
+    "priority": "P0",
+    "category": "nested_delegation",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-NEST-004",
+    "priority": "P0",
+    "category": "nested_delegation",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-NEST-005",
+    "priority": "P1",
+    "category": "nested_delegation",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-NEST-006",
+    "priority": "P1",
+    "category": "nested_delegation",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-NEST-007",
+    "priority": "P1",
+    "category": "nested_delegation",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-NEST-008",
+    "priority": "P2",
+    "category": "nested_delegation",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-NEST-009",
+    "priority": "P2",
+    "category": "nested_delegation",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-NEST-010",
+    "priority": "P2",
+    "category": "nested_delegation",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-MULTI-001",
+    "priority": "P1",
+    "category": "multi_parent",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-MULTI-002",
+    "priority": "P0",
+    "category": "multi_parent",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-MULTI-003",
+    "priority": "P0",
+    "category": "multi_parent",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-MULTI-004",
+    "priority": "P0",
+    "category": "multi_parent",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-MULTI-005",
+    "priority": "P1",
+    "category": "multi_parent",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-MULTI-006",
+    "priority": "P1",
+    "category": "multi_parent",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-MULTI-007",
+    "priority": "P0",
+    "category": "multi_parent",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-MULTI-008",
+    "priority": "P2",
+    "category": "multi_parent",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-CONC-001",
+    "priority": "P1",
+    "category": "concurrency",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-CONC-002",
+    "priority": "P2",
+    "category": "concurrency",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-CONC-003",
+    "priority": "P1",
+    "category": "concurrency",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-CONC-004",
+    "priority": "P2",
+    "category": "concurrency",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-CONC-005",
+    "priority": "P2",
+    "category": "concurrency",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-CONC-006",
+    "priority": "P2",
+    "category": "concurrency",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-CONC-007",
+    "priority": "P2",
+    "category": "concurrency",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-CONC-008",
+    "priority": "P1",
+    "category": "concurrency",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-CONC-009",
+    "priority": "P1",
+    "category": "concurrency",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-CONC-010",
+    "priority": "P2",
+    "category": "concurrency",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-CONC-011",
+    "priority": "P2",
+    "category": "concurrency",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-CONC-012",
+    "priority": "P2",
+    "category": "concurrency",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-REFRESH-001",
+    "priority": "P0",
+    "category": "browser_refresh_closure",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-REFRESH-002",
+    "priority": "P1",
+    "category": "browser_refresh_closure",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-REFRESH-003",
+    "priority": "P0",
+    "category": "browser_refresh_closure",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-REFRESH-004",
+    "priority": "P0",
+    "category": "browser_refresh_closure",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-REFRESH-005",
+    "priority": "P0",
+    "category": "browser_refresh_closure",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-REFRESH-006",
+    "priority": "P0",
+    "category": "browser_refresh_closure",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-REFRESH-007",
+    "priority": "P0",
+    "category": "browser_refresh_closure",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-REFRESH-008",
+    "priority": "P1",
+    "category": "browser_refresh_closure",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-REFRESH-009",
+    "priority": "P1",
+    "category": "browser_refresh_closure",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-REFRESH-010",
+    "priority": "P1",
+    "category": "browser_refresh_closure",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-PROXY-001",
+    "priority": "P0",
+    "category": "proxy_restart",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-PROXY-002",
+    "priority": "P0",
+    "category": "proxy_restart",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-PROXY-003",
+    "priority": "P0",
+    "category": "proxy_restart",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-PROXY-004",
+    "priority": "P0",
+    "category": "proxy_restart",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-PROXY-005",
+    "priority": "P1",
+    "category": "proxy_restart",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-PROXY-006",
+    "priority": "P0",
+    "category": "proxy_restart",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-PROXY-007",
+    "priority": "P1",
+    "category": "proxy_restart",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-PROXY-008",
+    "priority": "P1",
+    "category": "proxy_restart",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-PROXY-009",
+    "priority": "P1",
+    "category": "proxy_restart",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-PROXY-010",
+    "priority": "P0",
+    "category": "proxy_restart",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-PROXY-011",
+    "priority": "P0",
+    "category": "proxy_restart",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-PROXY-012",
+    "priority": "P2",
+    "category": "proxy_restart",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-EXTRELOAD-001",
+    "priority": "P2",
+    "category": "extension_reload",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-EXTRELOAD-002",
+    "priority": "P1",
+    "category": "extension_reload",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-EXTRELOAD-003",
+    "priority": "P1",
+    "category": "extension_reload",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-EXTRELOAD-004",
+    "priority": "P1",
+    "category": "extension_reload",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-EXTRELOAD-005",
+    "priority": "P2",
+    "category": "extension_reload",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-EXTRELOAD-006",
+    "priority": "P2",
+    "category": "extension_reload",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-EXTRELOAD-007",
+    "priority": "P2",
+    "category": "extension_reload",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-EXTRELOAD-008",
+    "priority": "P2",
+    "category": "extension_reload",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-REC-001",
+    "priority": "P0",
+    "category": "recovery",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-REC-002",
+    "priority": "P0",
+    "category": "recovery",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-REC-003",
+    "priority": "P1",
+    "category": "recovery",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-REC-004",
+    "priority": "P2",
+    "category": "recovery",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-REC-005",
+    "priority": "P1",
+    "category": "recovery",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-REC-006",
+    "priority": "P1",
+    "category": "recovery",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-REC-007",
+    "priority": "P1",
+    "category": "recovery",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-REC-008",
+    "priority": "P1",
+    "category": "recovery",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-REC-009",
+    "priority": "P1",
+    "category": "recovery",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-REC-010",
+    "priority": "P1",
+    "category": "recovery",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-REC-011",
+    "priority": "P2",
+    "category": "recovery",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-REC-012",
+    "priority": "P2",
+    "category": "recovery",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-LOCK-001",
+    "priority": "P1",
+    "category": "locks",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-LOCK-002",
+    "priority": "P2",
+    "category": "locks",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-LOCK-003",
+    "priority": "P1",
+    "category": "locks",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-LOCK-004",
+    "priority": "P1",
+    "category": "locks",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-LOCK-005",
+    "priority": "P2",
+    "category": "locks",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-LOCK-006",
+    "priority": "P2",
+    "category": "locks",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-LOCK-007",
+    "priority": "P0",
+    "category": "locks",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-LOCK-008",
+    "priority": "P0",
+    "category": "locks",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-UI-001",
+    "priority": "P1",
+    "category": "ui",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-UI-002",
+    "priority": "P1",
+    "category": "ui",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-UI-003",
+    "priority": "P2",
+    "category": "ui",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-UI-004",
+    "priority": "P2",
+    "category": "ui",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-UI-005",
+    "priority": "P2",
+    "category": "ui",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-UI-006",
+    "priority": "P1",
+    "category": "ui",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-UI-007",
+    "priority": "P2",
+    "category": "ui",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-UI-008",
+    "priority": "P2",
+    "category": "ui",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-UI-009",
+    "priority": "P2",
+    "category": "ui",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-UI-010",
+    "priority": "P2",
+    "category": "ui",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-SEC-001",
+    "priority": "P0",
+    "category": "security",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-SEC-002",
+    "priority": "P0",
+    "category": "security",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-SEC-003",
+    "priority": "P0",
+    "category": "security",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-SEC-004",
+    "priority": "P0",
+    "category": "security",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-SEC-005",
+    "priority": "P2",
+    "category": "security",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-SEC-006",
+    "priority": "P1",
+    "category": "security",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-SEC-007",
+    "priority": "P2",
+    "category": "security",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-SEC-008",
+    "priority": "P1",
+    "category": "security",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-SEC-009",
+    "priority": "P0",
+    "category": "security",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-SEC-010",
+    "priority": "P0",
+    "category": "security",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-SEC-011",
+    "priority": "P0",
+    "category": "security",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-SEC-012",
+    "priority": "P1",
+    "category": "security",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-CLEAN-001",
+    "priority": "P0",
+    "category": "cleanup",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-CLEAN-002",
+    "priority": "P0",
+    "category": "cleanup",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-CLEAN-003",
+    "priority": "P1",
+    "category": "cleanup",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-CLEAN-004",
+    "priority": "P1",
+    "category": "cleanup",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-CLEAN-005",
+    "priority": "P2",
+    "category": "cleanup",
+    "execution_mode": "manual_operator",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-CLEAN-006",
+    "priority": "P2",
+    "category": "cleanup",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-CLEAN-007",
+    "priority": "P2",
+    "category": "cleanup",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-CLEAN-008",
+    "priority": "P0",
+    "category": "cleanup",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-PERF-001",
+    "priority": "P2",
+    "category": "performance",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-PERF-002",
+    "priority": "P2",
+    "category": "performance",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-PERF-003",
+    "priority": "P2",
+    "category": "performance",
+    "execution_mode": "automated",
+    "automation_status": "not_automated"
+  },
+  {
+    "id": "E2E-PERF-004",
+    "priority": "P2",
+    "category": "performance",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-PERF-005",
+    "priority": "P2",
+    "category": "performance",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  },
+  {
+    "id": "E2E-PERF-006",
+    "priority": "P2",
+    "category": "performance",
+    "execution_mode": "automated",
+    "automation_status": "automated"
+  }
+]

@@ -3,8 +3,9 @@ import assert from 'node:assert/strict';
 import WebSocket from 'ws';
 const base = 'http://127.0.0.1:9339';
 const targets = await (await fetch(base + '/json/list')).json();
+const desktopUrl = new URL('../desktop/index.html', import.meta.url).href.toLowerCase();
 const target = targets.find((t) => t.type === 'page' &&
-  t.url.startsWith('file:///D:/web-chat-automation/extention-proxy/desktop/index.html'));
+  t.url.toLowerCase().startsWith(desktopUrl));
 assert.ok(target, 'Expected isolated desktop, refusing any other CDP target');
 const ws = new WebSocket(target.webSocketDebuggerUrl);
 await new Promise((res, rej) => { ws.once('open', res); ws.once('error', rej); });

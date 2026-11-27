@@ -19,6 +19,7 @@ const SAFE_FIELDS = new Set([
   'success','reused','wasFocused','wasActive','forceKilled',
   'acknowledged','socketGeneration','groupMemberCount','sessionMatch',
   'incarnationMatch','siteMatch','managedWorkerMatch','level','build',
+  'evidenceType','proofType','verified',
 ]);
 const SAFE_ENUM = /^[a-zA-Z][a-zA-Z0-9_.:-]{0,95}$/;
 const SAFE_LEVELS = new Set(['debug','info','warn','error']);

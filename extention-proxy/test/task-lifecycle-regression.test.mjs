@@ -1239,6 +1239,27 @@ test('D-044 monitor uses the approved decreasing 5/3/1 minute intervals then con
   assert.equal(h.evalCode('tasks.monitoring.monitor.manualRequired'),true);
 });
 
+test('running task past the monitor retries never promises a notification that cannot arrive',async()=>{
+  const h=setup();await h.ready;
+  const taskId='99999999-9999-4999-8999-999999999999';
+  h.evalCode(`
+    workers=[201];workerIncarnations={201:'33333333-3333-4333-8333-333333333333'};
+    tasks={'${taskId}':{
+      id:'${taskId}',tabId:201,site:'chatgpt',status:'running',owner:'legacy',startedAt:1,
+      workerIncarnationId:workerIncarnations[201],
+      monitor:{step:0,nextCheckAt:0,manualRequired:false}}};
+  `);
+  const handle=h.evalCode('handleCall');
+  const early=await handle('get_result',{task_id:taskId});
+  assert.match(early.note,/await the orchestrator completion notification/,
+    'before the retries are exhausted the normal wait advice still applies');
+  h.evalCode(`tasks['${taskId}'].monitor.manualRequired=true;`);
+  const late=await handle('get_result',{task_id:taskId});
+  assert.match(late.note,/no notification will arrive on its own/,
+    'a manually-blocked task must not tell the Parent to wait for a notification');
+  assert.doesNotMatch(late.note,/await the orchestrator completion notification/);
+});
+
 test('D-044 manual Completed is gated and In Progress preserves the same monitored task',async()=>{
   const h=setup();await h.ready;
   const taskId='88888888-8888-4888-8888-888888888888';
@@ -1687,4 +1708,159 @@ test('startup activation failure uses verified virtual focus only for managed wo
     else
       await assert.rejects(h.evalCode('focusWorkerForStartup')(201),/Tab was unfocused/);
   }
+});
+
+test('slot exhaustion names the reviewed-but-open Children that hold slots',async()=>{
+  const h=setup();await h.ready;
+  h.evalCode(`
+    proxySettings={enabled:true,maxWorkers:2,maxTasksPerHour:500,taskTimeoutMin:60,
+      completionMonitor:{initialMinutes:5,hydrationSeconds:5,continuedMinutes:2,
+        retryMinutes:[5,3,1]}};
+    proxySettingsRevision=1;
+    workers=[201,301];
+    workerOwners={201:'legacy',301:'legacy'};
+    tasks={
+      'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa':
+        {id:'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',tabId:201,status:'done',parentReviewed:true},
+      'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb':
+        {id:'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',tabId:301,status:'done',parentReviewed:false},
+    };
+  `);
+  const err=await h.evalCode('guard')({newWorker:true}).then(()=>null,(e)=>e);
+  assert.ok(err,'a full worker list must refuse a new spawn');
+  assert.equal(err.code,'SUB_AGENT_LIMIT_REACHED');
+  // The reviewed-and-open tab is the actionable one; the unreviewed tab is not.
+  assert.match(err.message,/reviewed worker tab\(s\) are still open/);
+  assert.match(err.message,/201/,'the closable tab must be named');
+  const named=err.message.slice(err.message.indexOf('hold slots:'));
+  assert.doesNotMatch(named,/\b301\b/,
+    'an unreviewed Child is not closable and must not be advertised as such');
+});
+
+test('slot exhaustion with no reviewed Child says so instead of naming tabs',async()=>{
+  const h=setup();await h.ready;
+  h.evalCode(`
+    proxySettings={enabled:true,maxWorkers:1,maxTasksPerHour:500,taskTimeoutMin:60,
+      completionMonitor:{initialMinutes:5,hydrationSeconds:5,continuedMinutes:2,
+        retryMinutes:[5,3,1]}};
+    proxySettingsRevision=1;
+    workers=[201];workerOwners={201:'legacy'};
+    tasks={'cccccccc-cccc-4ccc-8ccc-cccccccccccc':
+      {id:'cccccccc-cccc-4ccc-8ccc-cccccccccccc',tabId:201,status:'running'}};
+  `);
+  const err=await h.evalCode('guard')({newWorker:true}).then(()=>null,(e)=>e);
+  assert.ok(err);
+  assert.equal(err.code,'SUB_AGENT_LIMIT_REACHED');
+  assert.match(err.message,/No reviewed worker is closable yet/);
+  assert.doesNotMatch(err.message,/close_worker on one of them/);
+});
+
+test('a reviewed Child that still has descendants is not advertised as closable',async()=>{
+  // close_worker refuses this tab ("Child has descendants"), so naming it would
+  // send the caller straight into a second failure. The predicate in guard()
+  // must mirror that half of the gate, not just the parentReviewed half.
+  const h=setup();await h.ready;
+  h.evalCode(`
+    proxySettings={enabled:true,maxWorkers:2,maxTasksPerHour:500,taskTimeoutMin:60,
+      completionMonitor:{initialMinutes:5,hydrationSeconds:5,continuedMinutes:2,
+        retryMinutes:[5,3,1]}};
+    proxySettingsRevision=1;
+    workers=[201,301];
+    workerOwners={201:'legacy',301:'legacy'};
+    workerParents={301:201};
+    tasks={
+      'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa':
+        {id:'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',tabId:201,status:'done',parentReviewed:true},
+      'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb':
+        {id:'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',tabId:301,status:'done',parentReviewed:true},
+    };
+  `);
+  const err=await h.evalCode('guard')({newWorker:true}).then(()=>null,(e)=>e);
+  assert.ok(err);
+  assert.equal(err.code,'SUB_AGENT_LIMIT_REACHED');
+  // 201 is reviewed and terminal but still owns a Child -> close_worker refuses it.
+  // 301 is the real leaf and remains closable, so it is named instead.
+  const named=err.message.slice(err.message.indexOf('hold slots:'));
+  assert.match(named,/\b301\b/,'the descendant-free leaf is still closable and must be named');
+  assert.doesNotMatch(named,/\b201\b/,
+    'a Child with descendants cannot be closed and must not be named');
+  assert.match(err.message,/reviewed worker tab\(s\) are still open/);
+});
+
+test('get_result stops advertising close_worker for a tab that was already closed',async()=>{
+  const h=setup();await h.ready;
+  h.evalCode(`
+    workers=[201];
+    workerOwners={201:'legacy'};
+    tasks={closedtask:{id:'closedtask',tabId:201,site:'chatgpt',owner:'legacy',
+      status:'done',result:'42',startedAt:1,finishedAt:2}};
+  `);
+  const before=h.evalCode('summarize')(h.evalCode('tasks.closedtask'));
+  assert.match(before.note,/Worker window is still open/,
+    'a live worker tab must still be advertised');
+  // closeWorkerTab is the real close path; it prunes every trace of the tab.
+  await h.evalCode('closeWorkerTab')(201);
+  const after=h.evalCode('summarize')(h.evalCode('tasks.closedtask'));
+  assert.doesNotMatch(after.note,/Worker window is still open/,
+    'a closed tab must not be advertised as still open');
+  assert.doesNotMatch(after.note,/call close_worker/,
+    'the Parent must not be told to close a tab that no longer exists');
+  assert.match(after.note,/closed/i,
+    'the note must say the worker tab is closed instead of lying');
+});
+
+test('the submission-evidence path survives to the tool result, not just the trace',async()=>{
+  // With only submission_confirmed, all five content.js confirmation paths read
+  // identically, so no caller could attest WHICH path proved a submission — and
+  // CM-01…CM-05 were unattestable as a result. The discriminator is computed in
+  // content.js, filtered by the worker_diagnostic allowlist, then here.
+  const h=setup();await h.ready;
+  h.evalCode(`
+    workers=[201];
+    workerOwners={201:'legacy'};
+    tasks={
+      '${UUID}':{id:'${UUID}',tabId:201,site:'chatgpt',owner:'legacy',
+        status:'running',startedAt:1},
+      'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb':{id:'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+        tabId:201,site:'chatgpt',owner:'legacy',status:'running',startedAt:2},
+      'cccccccc-cccc-4ccc-8ccc-cccccccccccc':{id:'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+        tabId:201,site:'chatgpt',owner:'legacy',status:'running',startedAt:3},
+    };
+  `);
+  const sender={id:'test-extension',frameId:0,tab:h.mockTabs.get(201)};
+  const evidence=async(taskId,evidenceType,step='submission_confirmation_evidence')=>
+    h.sendRuntime({type:'worker_diagnostic',diagnostic:{site:'chatgpt',taskId,step,
+      at:3,evidenceType,newUserTurnCount:1,draftCleared:true}},sender);
+  // Path 3 vs path 1 differ ONLY in this label; both are accepted submissions.
+  await evidence(UUID,'NEW_USER_TURN_AND_CLEARED_COMPOSER');
+  await evidence('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb','TASK_MARKER_IN_USER_TURN');
+  assert.equal(h.evalCode('summarize')(h.evalCode(`tasks['${UUID}']`)).submission_evidence,
+    'NEW_USER_TURN_AND_CLEARED_COMPOSER','the weak path must be labelled, not assumed');
+  assert.equal(h.evalCode('summarize')(
+    h.evalCode("tasks['bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb']")).submission_evidence,
+    'TASK_MARKER_IN_USER_TURN','each path must be distinguishable from the others');
+  // Only the confirmation step carries the discriminator; nothing else may set it.
+  await evidence('cccccccc-cccc-4ccc-8ccc-cccccccccccc','EXACT_RENDERED_USER_TURN',
+    'submission_confirmation_poll');
+  const untouched=h.evalCode('summarize')(
+    h.evalCode("tasks['cccccccc-cccc-4ccc-8ccc-cccccccccccc']"));
+  assert.equal(untouched.submission_evidence,undefined,
+    'a poll must not be mistaken for confirmation evidence');
+  assert.equal(untouched.submission_confirmed,false,
+    'recording evidence must not itself assert confirmation');
+});
+
+test('a closed failed worker is not advertised as open for inspection either',async()=>{
+  const h=setup();await h.ready;
+  h.evalCode(`
+    workers=[];
+    workerOwners={};
+    tasks={failedtask:{id:'failedtask',tabId:201,site:'chatgpt',owner:'legacy',
+      status:'failed',error:'boom',startedAt:1,finishedAt:2}};
+  `);
+  const s=h.evalCode('summarize')(h.evalCode('tasks.failedtask'));
+  assert.doesNotMatch(s.note,/left open for inspection/,
+    'a closed failed tab must not be described as open');
+  assert.doesNotMatch(s.note,/Call close_worker/);
+  assert.equal(s.error,'boom','the failure reason is still reported');
 });

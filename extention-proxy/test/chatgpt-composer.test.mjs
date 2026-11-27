@@ -12,7 +12,9 @@ function composerHarness({textarea,extraEnabledButton,neverEnableSend=false,
   driftAfterInsert=null,renderedUserText=null,userTurnWrapperOnly=false,
   copyUserText=null,hideNewUserTurn=false,existingUserTurn=false,
   routeAfterSubmit=false,generatingAfterSubmit=false,existingConversation=false,
-  modernUserBubbleOnly=false,hiddenComposer=false,authorizedManagedFocus=false}) {
+  modernUserBubbleOnly=false,hiddenComposer=false,authorizedManagedFocus=false,
+  settleDelayMs=0,composerNeverAppears=false,composerVanishesAfterMs=0,
+  hideComposerOnSettle=false,composerGoneAfterQueries=0}) {
   let messageHandler;
   let submitted='';
   let primaryClicks=0;
@@ -24,6 +26,10 @@ function composerHarness({textarea,extraEnabledButton,neverEnableSend=false,
   let form;
   let input;
   let driftScheduled=false;
+  let composerGone=false;
+  let composerQueries=0;
+  if(composerVanishesAfterMs>0)
+    setTimeout(()=>{composerGone=true;},composerVanishesAfterMs);
   const pageLocation={hostname:'chatgpt.com',
     pathname:existingConversation?'/c/'+randomUUID():'/'};
   class FakeTextArea {
@@ -79,7 +85,12 @@ function composerHarness({textarea,extraEnabledButton,neverEnableSend=false,
     if(selector.includes(','))return [...new Set(selector.split(',').flatMap(s=>query(s.trim())))];
     if(selector==='button[data-testid="stop-button"]')
       return submitted && generatingAfterSubmit?[{tagName:'BUTTON'}]:[];
-    if(selector==='#prompt-textarea')return [input];
+    if(selector==='#prompt-textarea') {
+      // deterministic: the Nth query is the first composer-wait poll
+      if(composerGoneAfterQueries>0 && ++composerQueries>=composerGoneAfterQueries)
+        composerGone=true;
+      return (composerNeverAppears||composerGone)?[]:[input];
+    }
     if(selector==='button[data-testid="send-button"]')return [primary];
     if(selector==='button[aria-label*="send" i]' ||
        selector==='button[aria-label="Send message"]')
@@ -156,6 +167,14 @@ function composerHarness({textarea,extraEnabledButton,neverEnableSend=false,
     if(message.type==='verify_managed_page_focus')
       return {ok:true,allowed:authorizedManagedFocus};
     if(message.type==='composer_send_click') throw new Error('DOM sending must not use CDP transport');
+    // The page-settle round-trip is a real async window. CM-08 races it.
+    if(message.type==='browser_page_settled') {
+      if(settleDelayMs>0) await new Promise((r)=>setTimeout(r,settleDelayMs));
+      if(hideComposerOnSettle) composerGone=true;
+      // Still a transport round-trip; earlier tests count it as one.
+      networkChecks++;
+      return {ok:true,ready:true};
+    }
     networkChecks++;
     if(networkBusyAfterInput && trustedEvents>0) {
       return {ok:false,ready:false,error:'background request still pending'};
@@ -190,6 +209,11 @@ function composerHarness({textarea,extraEnabledButton,neverEnableSend=false,
       nativeSubmissions,draft:textarea?input.value:input.textContent,networkChecks}),
     diagnostics:()=>diagnostics,
     setDraft(value){if(textarea)input.value=value;else input.textContent=value;},
+    hideComposer(){composerGone=true;},
+    dispatch(msg){return new Promise((resolve,reject)=>{
+      const r=messageHandler(msg,{},resolve);
+      if(r!==true)reject(new Error('Expected async response'));
+    });},
     manuallySent(value){submitted=value;},
     markQueueUncertain(){window.__markQueueUncertain();},
     command(cmd,args={}){return new Promise((resolve)=>{
@@ -549,6 +573,24 @@ test('Parent setup uses native ChatGPT form submission when isolated-world butto
   assert.equal(info.draft,'');
 });
 
+test('Parent setup reconciles a reformatted sent turn by its private marker without replay', {
+  timeout:20000,
+},async()=>{
+  const marker=randomUUID();
+  const h=composerHarness({textarea:false,extraEnabledButton:false,
+    renderedUserText:()=>`Pair using code ${marker} … Show more`});
+  const text='<chat_orchestrator_parent_setup>Pair using code '+marker+
+    ' and keep the returned credential private.</chat_orchestrator_parent_setup>';
+  const outcome=await h.callParent(text,marker);
+  assert.equal(outcome.submitted,true,JSON.stringify(outcome));
+  assert.equal(h.info().primaryClicks,1);
+  const duplicate=await h.callParent(text,marker);
+  assert.notEqual(duplicate.submitted,true);
+  assert.equal(h.info().primaryClicks,1,'visible setup must never be sent again');
+  assert.doesNotMatch(JSON.stringify(h.diagnostics()),new RegExp(marker),
+    'pairing marker must never be logged as a task ID');
+});
+
 test('non-submit ChatGPT buttons continue to use a single click without submitting the form', {
   timeout:10000,
 },async()=>{
@@ -685,4 +727,86 @@ test('hidden document without managed focus permission never activates Send', {
   const gate=h.diagnostics().find(event=>event.step==='pre_click_page_validation');
   assert.equal(gate?.tabHidden,true);
   assert.equal(gate?.managedFocusAuthorized,false);
+});
+
+
+// CM-08 — composer content changed externally between draft capture and Send.
+// The pre-insert gate (content.js:1055-1063, `previousDraft !== expected`) is
+// reached by a RACE, not by a pre-existing draft: submitManagerBatch,
+// submitParentInitialization and retryManagerDraft each refuse a non-idle or
+// non-matching composer BEFORE calling sendPrompt, so a mismatched draft that
+// is already there never gets this far. What the gate really defends is the
+// window inside sendPrompt's own awaits (45s composer wait, page settle):
+// the composer is idle when checked, then the user types, then the captured
+// previousDraft no longer matches. Zero coverage existed for this branch —
+// the one COMPOSER_DRAFT_MISMATCH test covers the POST-insert
+// EDITOR_REPLACED_AFTER_INSERT path, a different gate with a different message.
+test('CM-08 a draft typed during the settle window is refused before insert or click', {
+  timeout:15000,
+},async()=>{
+  // A real (short) settle round-trip opens the window the gate defends.
+  const h=composerHarness({textarea:false,extraEnabledButton:false,settleDelayMs:60});
+  const prompt=batch();
+  // The user types while sendPrompt is still awaiting page settle.
+  const typed=setTimeout(()=>h.setDraft('A personal note the user is still writing'),20);
+  const result=await h.call(prompt);
+  clearTimeout(typed);
+  assert.equal(result.ok,false,'an occupied composer must not be treated as ready');
+  assert.equal(result.uncertain,true,'nothing was sent, so the batch must reconcile');
+  assert.equal(h.info().primaryClicks,0,'never Send over a foreign draft');
+  assert.equal(h.info().secondaryClicks,0);
+  assert.equal(h.info().nativeSubmissions,0);
+  assert.equal(h.info().draft,'A personal note the user is still writing',
+    'the original draft must be preserved byte-for-byte for inspection');
+  assert.equal(h.info().submitted,'','nothing may have been sent');
+  const rejected=h.diagnostics().find((e)=>e.step==='draft_check_rejected');
+  assert.ok(rejected,'the refusal must be diagnosable, not silent');
+  assert.equal(rejected.reason,'NONMATCHING_EXISTING_DRAFT');
+  assert.equal(rejected.draftLength,'A personal note the user is still writing'.length);
+  // The tool result at this layer is deliberately generic ("requires
+  // reconciliation"), so the discriminator has to be readable here or the
+  // Parent cannot tell this refusal from a genuine uncertain send.
+  const summary=h.diagnostics().find((e)=>e.step==='submission_failure_summary');
+  assert.equal(summary?.errorCode,'COMPOSER_DRAFT_MISMATCH');
+  assert.equal(summary?.failureClass,'PROMPT_CONTENT_CHANGED');
+  assert.equal(summary?.submitAttempted,false,'no Send may be attempted');
+  // No confirmation may be claimed when no Send was attempted.
+  assert.equal(h.diagnostics().some((e)=>e.step==='submission_confirmation_evidence'),false);
+});
+
+// CM-15 — the 45s composer wait must fail loudly instead of hanging forever or
+// typing into a page that never produced an editor. The bound is at
+// content.js:994/1016 (timeoutMs 45000, pollInterval 250).
+test('CM-15 a page that never exposes a composer fails at the 45s bound', {
+  timeout:70000,
+},async()=>{
+  // The idle gate is evaluated before sendPrompt, so a composer that is absent
+  // from the start never reaches the 45s wait at all — submitManagerBatch
+  // (:1833-1836) refuses it as "not idle". The bound defends the window where
+  // a composer EXISTS and then disappears during the wait.
+  const h=composerHarness({textarea:false,extraEnabledButton:false,
+    composerGoneAfterQueries:2});
+  // run_prompt is the Child-spawn entry (:2133). Unlike submitManagerBatch it
+  // has no idle pre-check, so it reaches sendPrompt's composer wait directly.
+  // The composer is removed between the readiness snapshot and the wait.
+  const startedAt=Date.now();
+  const pending=h.dispatch({cmd:'run_prompt',taskId:randomUUID(),receiptNonce:randomUUID(),
+    text:'CM-15 composer wait stimulus',timeoutMs:1000});
+  // Remove the editor while the settle round-trip is in flight: after
+  // sendPrompt captured its entry snapshot, before it re-queries the composer.
+  const result=await pending;
+  const elapsed=Date.now()-startedAt;
+  assert.equal(result.ok,false,JSON.stringify(result));
+  assert.match(result.error,/not ready/,'got: '+JSON.stringify(result)+' diag='+
+    JSON.stringify(h.diagnostics().map((e)=>e.step).slice(-20)));
+  assert.ok(elapsed>=44000,'must wait the documented 45s, waited '+elapsed+'ms');
+  assert.ok(elapsed<=52000,'must not exceed the bound by a whole extra poll cycle: '+elapsed+'ms');
+  assert.equal(h.info().primaryClicks,0,'no Send without a composer');
+  const timeout=h.diagnostics().find((e)=>e.step==='composer_wait_timeout');
+  assert.ok(timeout,'the timeout must be diagnosable, not silent');
+  assert.ok(timeout.durationMs>=44000);
+  assert.equal(timeout.documentReady,'complete',
+    'the document was ready; the COMPOSER was not');
+  const begin=h.diagnostics().find((e)=>e.step==='composer_wait_begin');
+  assert.equal(begin?.timeoutMs,45000,'the bound itself must be pinned, not just observed');
 });

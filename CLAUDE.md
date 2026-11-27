@@ -1,0 +1,1 @@
+never terminate all node tasks once, i have a node process running which should not be terminate, if you need to terminate any node process teminate that specific process only

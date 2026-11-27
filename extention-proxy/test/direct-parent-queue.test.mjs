@@ -140,6 +140,11 @@ test('D-072/D-073 direct Child clarification and message survive busy Parent; si
   assert.equal(pending.events.length,2);
   assert.deepEqual(pending.events.map((item)=>item.entryType),
     ['STATUS_REQUEST','STATUS_REQUEST']);
+  // CM-12: coordination_pending is deliberately phase-only (server.js:1321-1337
+  // projects the reduced item and no payload), so the question is NOT readable
+  // before delivery — the summary reaches the Parent only in the delivered
+  // batch, asserted below at wakes[0]. Recording that shape here so a future
+  // "make the question visible in _pending" change is a deliberate decision.
   assert.equal(wakes.length,0,'busy Parent may not receive an interrupting prompt');
   busy=false;
   await call('coordination_start_delivery',parentCredential,{caller_tab_id:101});
@@ -147,6 +152,17 @@ test('D-072/D-073 direct Child clarification and message survive busy Parent; si
   assert.equal(wakes.length,1);
   assert.equal(wakes[0].origin_parent_url,route,'clarification returns to the task origin');
   assert.equal(wakes[0].events.length,1,'different conversation destinations retain FIFO');
+  // CM-12: the delivered batch is where the Child's question actually becomes
+  // answerable, so the contract is asserted here rather than at _pending.
+  const contextSummary=JSON.parse(wakes[0].events[0].summary);
+  assert.equal(contextSummary.kind,'CHILD_CONTEXT_REQUEST',
+    'the Parent must be told this is a context request, not a generic status');
+  assert.equal(contextSummary.question,'Which specification version?',
+    'the Child question must reach the Parent verbatim');
+  assert.equal(contextSummary.original_task_id,taskId,
+    'the Parent must know which Child task is waiting on it');
+  assert.equal(contextSummary.child_tab_id,201);
+  assert.equal(contextSummary.source,'direct_child');
   for(let i=0;i<75;i++){
     const current=await call('coordination_pending',parentCredential,{caller_tab_id:101});
     if(current.events[0]?.phase==='DELIVERED')break;

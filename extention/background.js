@@ -404,7 +404,8 @@ const DIAG_FIELDS = new Set(['tabId','rootTabId','parentTabId','windowId','group
   'frameId','ok','selectedIndex','newlineCount','actualCodePoint','expectedCodePoint',
   'actualLength','reusedTab','prepared','workerCount','taskCount','status','exactMatch',
   'whitespaceMatch','firstDifference','formTestId','activeTag','activeRole','contentEditable',
-  'ariaLabel','testId','enabled','disabled','ariaDisabled','inComposer','scopeTag','scopeTestId']);
+  'ariaLabel','testId','enabled','disabled','ariaDisabled','inComposer','scopeTag','scopeTestId',
+  'evidenceType','proofType']);
 function extensionDiagnostic(level,event,fields={}) {
   try {
     if (!['debug','info','warn','error'].includes(level) ||
@@ -683,6 +684,11 @@ function summarize(t) {
     source_incarnation_id: t.workerIncarnationId || null,
     submission_confirmed: t.submissionConfirmed === true,
   };
+  // Which of the five paths proved the submission. Without this every path
+  // reads as the same boolean, so a Parent (or a test) cannot tell a marker hit
+  // from a bare cleared composer. Omitted when never recorded, never inferred.
+  if (typeof t.submissionEvidence === 'string')
+    out.submission_evidence = t.submissionEvidence;
   if (t.originParentUrl) out.origin_parent_url=t.originParentUrl;
   if (Number.isSafeInteger(t.recoveredTabId)) {
     out.recovered_tab_id=t.recoveredTabId;
@@ -692,10 +698,18 @@ function summarize(t) {
   if (t.status === 'done' && t.autoClose) {
     out.note = 'Automatic closure is disabled. The worker stays open for parent review and fixing tasks.';
   } else if (t.status === 'done') {
-    out.note = `Worker window is still open (tab_id ${t.tabId}). You can send a follow-up with send_to_tab; when you no longer need this worker, call close_worker with tab_id ${t.tabId}.`;
+    // workers[] is the only proof the tab still exists: closeWorkerTab prunes it.
+    // Without this check get_result kept telling the Parent to close_worker a tab
+    // that was already closed, and the follow-up call failed with "not a direct
+    // child", so a well-behaved Parent was pushed into an error loop.
+    out.note = workers.includes(t.tabId)
+      ? `Worker window is still open (tab_id ${t.tabId}). You can send a follow-up with send_to_tab; when you no longer need this worker, call close_worker with tab_id ${t.tabId}.`
+      : `Worker tab ${t.tabId} is closed. Its result above is final; no close_worker call is needed.`;
   }
   if (t.status === 'failed') {
-    out.note = `Worker window left open for inspection (tab_id ${t.tabId}). Call close_worker with this tab_id when done.`;
+    out.note = workers.includes(t.tabId)
+      ? `Worker window left open for inspection (tab_id ${t.tabId}). Call close_worker with this tab_id when done.`
+      : `Worker tab ${t.tabId} is closed. The failure above was recorded before it closed; nothing more to close.`;
   }
   if (t.status === 'failed' || t.status === 'uncertain') out.error = t.error;
   if (t.status === 'uncertain') out.note = 'Submission outcome uncertain. Inspect the tab; never blindly replay.';
@@ -710,7 +724,9 @@ function summarize(t) {
     out.note='Child requested instructions from its direct Parent. The original task remains pending.';
     out.context_pending=true;
   }
-  if (t.status === 'running') out.note = 'Still running. Finish your current response and await the orchestrator completion notification; do not repeatedly poll get_result.';
+  if (t.status === 'running') out.note = t.monitor?.manualRequired === true
+    ? 'The automatic completion checks are exhausted and no notification will arrive on its own. The user must decide Completed / In Progress in the Desktop app, or the Child must call complete_task. Inspect the tab with read_chat before reporting.'
+    : 'Still running. Finish your current response and await the orchestrator completion notification; do not repeatedly poll get_result.';
   return out;
 }
 
@@ -829,6 +845,18 @@ function scheduleNextCompletionCheck(task,settings,now=Date.now()){
 // unique setup marker, end with an explicit final-answer cue, and stay the same
 // over two independently reloaded inspections. Otherwise require D-044 manual
 // confirmation instead of guessing from generic website idle.
+// D-042: an explicit final-answer cue is what makes a settled turn acceptable,
+// and an in-progress phrase disqualifies it regardless of length. Shared by both
+// paths so there is exactly one definition of "this is a final answer".
+// The length floor differs on purpose: the marker path (below) has only this
+// task's UUID in the transcript, so it needs more text; the signature path has
+// already proven it is reading the SAME turn the Child settled on.
+const FINAL_ANSWER_CUE=/\b(?:final answer|final result|completed task|task completed|here is the result|the result is|the answer is)\b/i;
+const NOT_FINISHED=/\b(?:still working|work in progress|to be continued|waiting for|cannot finish|not completed|incomplete)\b/i;
+function acceptableFinalAnswer(text,minLength) {
+  const answer=String(text||'').replace(/\s+/g,' ').trim();
+  return answer.length>=minLength && !NOT_FINISHED.test(answer) && FINAL_ANSWER_CUE.test(answer);
+}
 function monitoredFinalAnswer(task,transcript) {
   const parts=String(transcript||'').split(/(?:^|\n\n)(User|Assistant):\s*/);
   const turns=[];
@@ -842,11 +870,8 @@ function monitoredFinalAnswer(task,transcript) {
   if(markerIndex<0||lastUserIndex<markerIndex||lastUserIndex!==turns.length-2 ||
       (lastUserIndex!==markerIndex && !(task.contextResponseCount>0)))
     return null;
-  const answer=last.text.replace(/\s+/g,' ').trim();
-  if(answer.length<24 || /\b(?:still working|work in progress|to be continued|waiting for|cannot finish|not completed|incomplete)\b/i.test(answer) ||
-      !/\b(?:final answer|final result|completed task|task completed|here is the result|the result is|the answer is)\b/i.test(answer))
-    return null;
-  return answer;
+  if(!acceptableFinalAnswer(last.text,24))return null;
+  return last.text.replace(/\s+/g,' ').trim();
 }
 async function inspectDueCompletion(taskId){
   if(completionChecksInFlight.has(taskId))return;
@@ -893,7 +918,13 @@ async function inspectDueCompletion(taskId){
     const lastAssistant=String(chat?.transcript||'').split(/(?:^|\n\n)Assistant:\s*/).at(-1);
     const signature=normalized(task.uiCandidate?.signature||'');
     const idle=state?.ok===true&&state.state==='idle'&&chat?.ok===true;
+    // D-042: a matching signature proves the page settled on the turn we saw;
+    // it does NOT prove that turn is an answer. A short answer's signature IS
+    // the whole answer, so `includes()` was trivially true and any settled text
+    // of 12+ chars completed the task (D-A). Both paths now demand the same cue;
+    // 12 chars suffices here only because the signature already matched.
     const knownCompletion=idle&&signature.length>=12 &&
+      acceptableFinalAnswer(lastAssistant,12) &&
       normalized(lastAssistant).includes(signature);
     const fallback=idle&&!knownCompletion
       ? monitoredFinalAnswer(task,chat.transcript):null;
@@ -968,7 +999,22 @@ async function guard({ newWorker = false, reserveSlot = null } = {}) {
     // A failed inventory/persistence check must not discard ownership state.
     await reconcileMissedChildClosures();
     if (workers.length + workerSlotReservations.size >= cfg.maxWorkers) {
-      const limit=new Error('SUB_AGENT_LIMIT_REACHED: Complete work inline or reuse an idle Child');
+      // Reviewed-but-open Children are the usual cause; name them so the
+      // caller can close one instead of guessing why the slot is unavailable.
+      // Must mirror close_worker's whole gate, not just the task condition: a tab
+      // whose own tasks are reviewed is still refused while it has descendants
+      // (close_worker: "Child has descendants"). Advertising such a tab would
+      // send the caller into a second failure.
+      const closable = workers.filter((id) => {
+        if (workers.some((other) => workerParents[other] === id)) return false;
+        const own = Object.values(tasks).filter((t) => t.tabId === id);
+        return own.length > 0 && own.every((t) =>
+          ['done','failed'].includes(t.status) && t.parentReviewed === true);
+      });
+      const limit=new Error('SUB_AGENT_LIMIT_REACHED: Complete work inline or reuse an idle Child'+
+        (closable.length
+          ? `. ${closable.length} reviewed worker tab(s) are still open and hold slots: ${closable.join(', ')}. Call close_worker on one of them to free a slot.`
+          : '. No reviewed worker is closable yet; finish or review a running Child, then close it.'));
       limit.code='SUB_AGENT_LIMIT_REACHED';
       throw limit;
     }
@@ -2599,6 +2645,36 @@ async function handleCall(method, p = {}) {
       return {focused:true,tab_id:tabId};
       });
     }
+    case 'reload_manager_tab': {
+      return serializePromptStartup(async()=>{
+      if(p.__trustedPrincipal?.mode!=='profile')throw new Error('Paired manager required');
+      const tabId=await callerManagerTab(p,await getConfig());
+      const tab=await chrome.tabs.get(tabId);
+      if(siteOfUrl(tab?.url)!=='chatgpt')
+        throw new Error('Reload is restricted to the authenticated ChatGPT manager tab');
+      await chrome.tabs.reload(tabId);
+      // Report success only on a real 'complete'. On timeout the page may still
+      // be loading or the tab may be gone, so the caller must not treat that as
+      // a verified reload.
+      const completed=await new Promise((resolve)=>{
+        let timer=null;
+        const listener=(tid,info)=>{
+          if(tid===tabId && info.status==='complete'){
+            chrome.tabs.onUpdated.removeListener(listener);
+            if(timer)clearTimeout(timer);
+            resolve(true);
+          }
+        };
+        chrome.tabs.onUpdated.addListener(listener);
+        timer=setTimeout(()=>{
+          chrome.tabs.onUpdated.removeListener(listener);
+          resolve(false);
+        },15000);
+      });
+      return {reloaded:completed,tab_id:tabId,
+        reason:completed?undefined:'RELOAD_NOT_OBSERVED'};
+      });
+    }
     case 'inspect_manager_batch':
     case 'retry_manager_batch':
     case 'clear_skipped_manager_batch': {
@@ -3921,6 +3997,24 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           return output;
         };
         const safe=clean(diagnostic);
+        // The five confirmation paths are only distinguishable at the moment
+        // they fire, in content.js. Until this was retained, every one of them
+        // collapsed to the same boolean and no caller — Parent, Desktop or test
+        // — could tell which path proved a submission, or prove any single path
+        // at all. Persist the discriminator on the task it belongs to.
+        if(diagnostic.step==='submission_confirmation_evidence' &&
+            typeof safe.evidenceType==='string' &&
+            /^[A-Z_]{3,64}$/.test(safe.evidenceType)){
+          const byId=tasks[safe.taskId];
+          const confirmedTask=(byId && byId.tabId===trustedTabId) ? byId
+            : Object.values(tasks).filter((task)=>task.tabId===trustedTabId &&
+              ['running','uncertain'].includes(task.status))
+              .sort((a,b)=>(b.startedAt||0)-(a.startedAt||0))[0];
+          if(confirmedTask){
+            confirmedTask.submissionEvidence=safe.evidenceType;
+            await saveState();
+          }
+        }
         const milestones=new Set(['submission_begin','page_settled','draft_insert_done',
           'composer_state_transition','composer_projection_snapshot','send_button_wait_end',
           'pre_click_composer_validation_rejected','pre_click_button_rejected','send_activation',

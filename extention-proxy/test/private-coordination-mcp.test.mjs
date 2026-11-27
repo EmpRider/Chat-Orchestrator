@@ -27,7 +27,10 @@ test('tokenless profile keeps durable FIFO worker reports, barriers and processe
     credentialHex.slice(13,16)+'-8'+credentialHex.slice(17,20)+'-'+credentialHex.slice(20,32);
   const child = spawn(process.execPath, ['server.js'], {
     cwd: ROOT, env: { ...process.env, PORT: '0', HOST: '127.0.0.1',
-      CHAT_ORCH_PROFILE_DIR: dir, CHAT_ORCH_PRIVATE_COORDINATION: '1' },
+      CHAT_ORCH_PROFILE_DIR: dir, CHAT_ORCH_PRIVATE_COORDINATION: '1',
+      // Report an unACKed DELIVERED head as blocked immediately, so this test
+      // exercises the projection without waiting out the production bound.
+      CHAT_ORCH_QUEUE_BLOCKED_SECONDS: '0' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let bridge;
@@ -88,6 +91,8 @@ test('tokenless profile keeps durable FIFO worker reports, barriers and processe
   let spawnPreparations=0;
   let workerTabId = 201;
   let workerIncarnation = initialWorkerIncarnation;
+  const tabIncarnations = {201: initialWorkerIncarnation}; // per-tab stable identity
+  const workerTabs = new Set([201]); // every tab that was ever a worker; stays managed when workerTabId advances
   let ackCount = 0;
   bridge.on('message', (raw) => {
     const m = JSON.parse(raw.toString());
@@ -108,12 +113,16 @@ test('tokenless profile keeps durable FIFO worker reports, barriers and processe
       case 'inspect_tab': {
         const tabId = m.params.tab_id;
         assert.equal(m.params.__sessionBrowserId,browserSession,'proxy routes inspection to this browser session');
-        const incarnation=tabId===101?managerIncarnation:workerIncarnation;
+        // Each live tab keeps a stable incarnation. Returning one shared
+        // workerIncarnation for every tab made a replaced Child look unchanged
+        // (or unchanged ones look replaced) depending on mock mutation order.
+        const incarnation=tabId===101?managerIncarnation
+          :(tabIncarnations[tabId]||=crypto.randomUUID());
         result = {tab_id:tabId,site:'chatgpt',browser_session_id:browserSession,
           incarnation_id:incarnation,
           route_hash:createHash('sha256').update([browserSession,tabId,incarnation,'chatgpt'].join(':')).digest('hex'),
           parent_approved:tabId===101,
-          is_managed_worker:tabId===201 || tabId===workerTabId};
+          is_managed_worker:workerTabs.has(tabId)};
         break;
       }
       case 'recover_owned_children': result=[];break;
@@ -144,6 +153,8 @@ test('tokenless profile keeps durable FIFO worker reports, barriers and processe
         if(advancePreparedTab){
           workerTabId=nextPreparedWorkerId;
           workerIncarnation=randomUUID();
+          tabIncarnations[workerTabId]=workerIncarnation;
+          workerTabs.add(workerTabId);
           advancePreparedTab=false;
         }
         result = {tab_id:workerTabId,incarnation_id:workerIncarnation,
@@ -267,6 +278,8 @@ test('tokenless profile keeps durable FIFO worker reports, barriers and processe
   /Existing worker phase does not permit automatic reuse/);
   workerTabId = 202; // New tab; the prepared tab 201 remains held for review.
   workerIncarnation = randomUUID();
+  tabIncarnations[workerTabId] = workerIncarnation;
+  workerTabs.add(workerTabId);
   const started = await call('spawn_worker',{caller_tab_id,site:'chatgpt',
     task:'Queue ownership check',wait_seconds:0});
   assert.equal(started.parent_tab_id,caller_tab_id);
@@ -313,6 +326,17 @@ test('tokenless profile keeps durable FIFO worker reports, barriers and processe
   assert.equal(wakes.length,1);
   assert.equal(wakes[0].events.length,16,'first FIFO batch must obey cap');
   assert.equal(wakes[0].events[0].type,'CHILD_RESULT');
+  // The prompt that actually reaches the browser must carry the closure contract.
+  // Asserting it here (not just in agent-settings) proves the fix survives the real
+  // delivery path: pump -> composeAgentPrompt -> wake_manager -> extension submit.
+  // Without it a Parent reviews, ACKs and idles while its reviewed Children keep
+  // holding worker slots until spawn fails with SUB_AGENT_LIMIT_REACHED.
+  assert.match(wakes[0].prompt_text,/close_worker/,
+    'the delivered CHILD_RESULT prompt must instruct close_worker');
+  assert.match(wakes[0].prompt_text,/SUB_AGENT_LIMIT_REACHED/,
+    'the delivered prompt must state the slot-exhaustion consequence');
+  assert.match(wakes[0].prompt_text,/review_task/,
+    'closure is gated on review; the prompt must still instruct review_task first');
   let firstDelivered=false;
   for(let i=0;i<100;i++){
     const snapshot=await call('coordination_pending',{caller_tab_id});
@@ -322,6 +346,19 @@ test('tokenless profile keeps durable FIFO worker reports, barriers and processe
     await delay(40);
   }
   assert.equal(firstDelivered,true,'unprocessed first batch holds second batch');
+  // D-HOL-BLOCK: an unACKed DELIVERED head freezes this Parent's whole queue, and
+  // nothing used to say so — the Parent waited forever while every later event,
+  // including a Child's blocking question, sat QUEUED. The projection must name
+  // the blocking ref and repeat the one action that clears it.
+  const blockedSnapshot=await call('coordination_pending',{caller_tab_id});
+  assert.equal(blockedSnapshot.queue_blocked.ref,wakes[0].events[0].event_id,
+    'the blocked head must be named by ref');
+  assert.equal(blockedSnapshot.queue_blocked.phase,'DELIVERED');
+  assert.equal(blockedSnapshot.queue_blocked.lease_nonce,wakes[0].batch_id,
+    'the blocking ACK batch must be named so the Parent can re-send it');
+  assert.match(blockedSnapshot.queue_blocked.action,/coordination_ack_batch/,
+    'the block must state the recovery action, not just the symptom');
+  assert.equal(blockedSnapshot.queue_depth,19);
   await delay(200);
   assert.equal(wakes.length,1,'backpressure prevents overtaking without ACK');
   const ack1=await call('coordination_ack_batch',{
@@ -329,6 +366,13 @@ test('tokenless profile keeps durable FIFO worker reports, barriers and processe
     event_ids:wakes[0].events.map(e=>e.event_id),
   });
   assert.equal(ack1.processed.length,16);
+  // The projection must stop reporting a block the moment the head moves on.
+  // The threshold is 0 here, so the head the pump releases next (batch 2) is
+  // itself instantly reportable as blocked. Assert on THIS batch's ref, not on
+  // the absence of any block: otherwise the test races its own delivery.
+  const afterAck=(await call('coordination_pending',{caller_tab_id})).queue_blocked;
+  assert.notEqual(afterAck?.ref,wakes[0].events[0].event_id,
+    'a processed head must not be reported as blocked');
   for(let i=0;i<100&&wakes.length<2;i++)await delay(50);
   assert.equal(wakes.length,2,'second batch released after first ACK');
   assert.equal(wakes[1].events.length,3);
@@ -356,6 +400,8 @@ test('tokenless profile keeps durable FIFO worker reports, barriers and processe
   // spawn must be rejected before it even creates another browser tab.
   workerTabId=203;
   workerIncarnation=randomUUID();
+  tabIncarnations[workerTabId]=workerIncarnation;
+  workerTabs.add(workerTabId);
   reportUnverifiedSubmission=true;
   await assert.rejects(call('spawn_worker',{caller_tab_id,site:'chatgpt',
     task:'Ambiguous send, must not advance FIFO',wait_seconds:0}),
@@ -411,6 +457,14 @@ test('tokenless profile keeps durable FIFO worker reports, barriers and processe
   assert.equal(resumed.tab_id,204);
   assert.equal(resumed.submission_confirmed,true);
   assert.equal(spawnPreparations,preparationsAtHold+1);
+  // Catalog LC-15 (was NOT_EXECUTED, and had no test at any level until this
+  // one): close_worker on a tab with active grandchildren must refuse BEFORE it
+  // looks at task status. This is the exact gate guard()'s closable predicate
+  // now mirrors — a reviewed-but-subtree-owning Child must never be advertised
+  // as closable, or the Parent walks into a second failure.
+  await assert.rejects(call('close_worker',{caller_tab_id,tab_id:203}),
+    /Child has descendants; close or reconcile them before closing this tab/,
+    'a Child that still owns a Grandchild must be refused regardless of its own task state');
   // PM remains active and can continue delegating/reviewing. It is NOT
   // required to complete its own task just to release this submission gate.
   // If the STARTUP transport ACK vanishes entirely, the Proxy has no
@@ -419,6 +473,8 @@ test('tokenless profile keeps durable FIFO worker reports, barriers and processe
   // original unchanged tab must remain eligible for read-only recovery.
   workerTabId=205;
   workerIncarnation=randomUUID();
+  tabIncarnations[workerTabId]=workerIncarnation;
+  workerTabs.add(workerTabId);
   loseStartupAck=true;
   await assert.rejects(call('spawn_worker',{caller_tab_id,site:'chatgpt',
     task:'The PM already completed despite a lost startup ACK',wait_seconds:0}),

@@ -1,0 +1,1544 @@
+# CHAT ORCHESTRATOR — AUTONOMOUS PUBLIC-RELEASE E2E TESTING, DEEP CODE ANALYSIS, ROOT-CAUSE DEBUGGING AND STABILIZATION
+
+## 0. YOUR MISSION — EXECUTION FIRST
+
+You are **Claude Code, running Claude Fable as the Main Agent**.
+
+Act as the Lead Software Architect, Principal QA Engineer, Test Orchestrator, and Release Reliability Engineer for my Chat Orchestrator application.
+
+Your mission is to prepare this application for **PUBLIC RELEASE** through comprehensive real-world testing, deep source-code analysis, autonomous bug investigation, proper fixes, regression testing, security validation, and measurable stability verification.
+
+The objective is not merely to make a few E2E scenarios pass.
+
+The objective is to discover and eliminate as many serious implementation defects as reasonably possible, including defects that ordinary manual testing would miss.
+
+### Non-negotiable execution rules
+
+1. **Fable is the Main Agent. Every delegated subagent must run on Opus.**
+2. Maximum 4 concurrent subagents. Reuse freed slots for new work throughout the campaign.
+3. Use subagents aggressively for independent analysis, debugging, test design, and verification.
+4. Main Fable Agent MUST continue operating the application while subagents work.
+5. Start the proxy yourself using `npm run desktop`.
+6. Use BrowserMCP for Parent Agent bootstrap and permitted passive observation.
+7. Never use BrowserMCP or another external browser controller to submit Child or Grandchild prompts.
+8. Do not spend the entire session reviewing code without executing real tests.
+9. Use CodeGraph and Graphify/Graphyfy for targeted, deep code exploration.
+10. Generate detailed E2E scenarios directly from verified source-code behavior.
+11. Fix bugs by correcting the actual root cause.
+12. Retest the exact failing scenario after every fix.
+13. Continuously expand regression and real-world scenario coverage.
+14. Do not report public-release readiness without strong verification evidence.
+15. Do not ask the user to perform routine operations you can execute yourself.
+
+**Your primary output must be a working, comprehensively tested application and a reusable automatic testing system — not merely a report.**
+
+---
+
+# 1. AGENT MODELS, PARALLELISM AND TOKEN OPTIMIZATION
+
+## 1.1 Main Agent
+
+Model: `fable`
+
+Responsibilities:
+
+- Runtime ownership
+- Proxy startup/restart
+- BrowserMCP control
+- Parent Agent bootstrap
+- Actual E2E execution
+- Failure detection
+- Root-cause decisions
+- Code-fix integration
+- Regression verification
+- Stress testing
+- Public-release evaluation
+
+Do not delegate primary control of the live browser or proxy.
+
+## 1.2 Subagents
+
+Model: `opus`
+
+Use explicit Opus model selection for every subagent.
+
+Example custom subagent configuration:
+
+```yaml
+---
+name: architecture-reviewer
+description: Deep architecture and source-code reviewer
+model: opus
+---
+```
+
+If the installed Claude Code version supports forced subagent model configuration, use or carefully merge:
+
+```json
+{
+  "env": {
+    "CLAUDE_CODE_SUBAGENT_MODEL": "opus",
+    "CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1",
+    "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS": "4"
+  }
+}
+```
+
+Do not overwrite unrelated Claude Code settings.
+
+Verify effective model selection using the actual supported task/model inspection mechanism.
+
+Do not silently launch Fable subagents.
+
+Do not use `inherit` for workers intended to run on Opus.
+
+If the model is unavailable or blocked, report that accurately rather than pretending the worker used Opus.
+
+## 1.3 Concurrency Policy
+
+Maximum:
+
+- 1 Fable Main Agent
+- 4 concurrent Opus subagents
+- No additional nested subagents
+
+You may use many more than four subagent assignments across the entire campaign, but never exceed four simultaneously.
+
+**Keep available slots productively occupied when independent useful work exists.**
+
+Do not create agents merely to fill slots or duplicate work.
+
+### Important scheduling rule
+
+Whenever a subagent completes:
+
+1. Collect its findings.
+2. Release its slot.
+3. Check the pending task queue.
+4. Launch the highest-priority independent task.
+5. Continue Main Agent execution.
+
+Prioritize runtime blockers and confirmed defects over speculative improvements.
+
+## 1.4 Background Execution
+
+Start delegated investigations in the background wherever Claude Code supports it.
+
+Do not wait for research workers before executing runtime tests.
+
+Do not repeatedly poll worker status.
+
+Collect results when available and incorporate them into the testing campaign.
+
+All subagents must have narrowly defined responsibilities and bounded outputs.
+
+---
+
+# 2. IMMEDIATE ACTION — START THE ACTUAL APPLICATION
+
+This is your highest-priority first action.
+
+The proxy application is located at:
+
+```text
+.\Chat-Orchestrator\extention-proxy
+```
+
+Its `package.json` includes:
+
+```json
+"desktop": "electron ."
+```
+
+Execute the following yourself:
+
+```powershell
+cd .\Chat-Orchestrator\extention-proxy
+npm run desktop
+```
+
+Resolve the actual path relative to your current workspace.
+
+If already inside the `Chat-Orchestrator` directory, use `.\extention-proxy`.
+
+Preserve the spelling `extention-proxy`.
+
+### Required startup procedure
+
+1. Locate the repository.
+2. Inspect Git status to preserve unrelated work.
+3. Verify the npm script.
+4. Check whether the correct proxy application is already running and healthy.
+5. If not healthy, start it using `npm run desktop`.
+6. Keep the Electron process alive through appropriate Windows process management.
+7. Capture process logs.
+8. Verify the proxy's actual readiness.
+9. Verify MCP server readiness.
+10. Verify ngrok connectivity.
+11. Verify the proxy-extension communication path.
+
+**Attempt startup within the first five available terminal/tool operations.**
+
+Do not delay this operation until code review completes.
+
+Do not ask the user to run this command.
+
+### If startup fails
+
+- Capture the actual error.
+- Inspect process output and relevant code.
+- Identify the blocking condition.
+- Fix safely recoverable problems.
+- Retry with bounded attempts.
+- Verify readiness again.
+
+Do not repeat identical failed commands indefinitely.
+
+Do not terminate unrelated Electron or Node.js processes.
+
+---
+
+# 3. INITIAL PARALLEL SUBAGENT WAVE — DEEP CODE REVIEW
+
+Immediately after the initial proxy startup attempt, launch FOUR independent Opus subagents.
+
+Assign each a distinct area of ownership.
+
+These are read-only investigative workers.
+
+Do not allow them to modify the shared codebase or live runtime.
+
+## SUBAGENT 1 — SYSTEM ARCHITECTURE AND DECISION COMPLIANCE
+
+Model: Opus  
+Mode: Background  
+Role: Architecture Reviewer
+
+### Assignment
+
+Perform a deep review of Chat Orchestrator's actual architecture.
+
+Read the architecture documentation, including:
+
+```text
+docs/chat_orchestrator_decision_log.md
+```
+
+Locate the actual path if different.
+
+Investigate:
+
+- Electron desktop lifecycle
+- MCP server architecture
+- Proxy-extension communication
+- Parent and Child registration
+- Caller tab identity resolution
+- Parent-child ownership
+- Agent authentication and pairing
+- Tab creation and grouping
+- Task lifecycle
+- State persistence
+- Recovery behavior
+
+Use CodeGraph and Graphify to trace implementation relationships.
+
+Compare approved architectural decisions against the current source code.
+
+### Required output
+
+Produce:
+
+- Component map
+- Critical call paths
+- Decision-to-code mapping
+- Architecture violations
+- Missing validations
+- Potential race conditions
+- Confirmed defects versus suspected risks
+- Exact source file/function references
+- High-priority test recommendations
+
+Do not provide generic architecture advice.
+
+Every finding must be grounded in the actual repository.
+
+---
+
+## SUBAGENT 2 — PROMPT DELIVERY AND AGENT COMMUNICATION
+
+Model: Opus  
+Mode: Background  
+Role: Orchestration Protocol Reviewer
+
+### Assignment
+
+Deeply investigate how prompts and results flow between agents.
+
+Trace:
+
+```text
+Parent MCP invocation
+    ↓
+Proxy
+    ↓
+Task creation
+    ↓
+Delivery event
+    ↓
+Browser extension
+    ↓
+Child tab initialization
+    ↓
+Prompt insertion
+    ↓
+Actual prompt submission
+    ↓
+ChatGPT response detection
+    ↓
+Child completion
+    ↓
+Result delivery
+    ↓
+Parent acknowledgement
+```
+
+Inspect actual implementations of:
+
+- Prompt composer detection
+- Browser focus and send actions
+- Child tab readiness
+- Parent/Child identity
+- Message routing
+- FIFO event processing
+- Acknowledgement handling
+- Idempotency
+- Duplicate prevention
+- Timeout with unknown outcome
+- Session/incarnation validation
+- Result propagation
+
+Identify every important failure point and boundary condition.
+
+### Required output
+
+Produce:
+
+- Exact source-code execution trace
+- Prompt-delivery state machine
+- Failure-point inventory
+- Missing error handling
+- Concurrency risks
+- Code-level E2E test opportunities
+- Recommended regression assertions
+
+**Do not operate ChatGPT, submit prompts, or interfere with the live test.**
+
+---
+
+## SUBAGENT 3 — RELIABILITY, OBSERVABILITY AND RECOVERY
+
+Model: Opus  
+Mode: Background  
+Role: Reliability and Failure-Path Reviewer
+
+### Assignment
+
+Analyze:
+
+- Electron and proxy errors
+- Extension service worker lifecycle
+- Logging infrastructure
+- Async operations and unhandled exceptions
+- IPC and connection failures
+- Event queues
+- Retries and backoff
+- Timeouts
+- State synchronization
+- Ownership locks
+- Journal recovery
+- Stale agent sessions
+- Proxy restart
+- Extension reload
+- Tab closure
+- Resource cleanup
+- Memory leaks
+
+Specifically investigate failures such as:
+
+```text
+Private journal owner lock exists; verify ownership before recovery
+```
+
+Identify safe recovery behavior and gaps in diagnostic instrumentation.
+
+### Required output
+
+Produce:
+
+- Existing log-source map
+- Missing observability
+- Critical recovery failure paths
+- State inconsistency risks
+- Suggested failure-injection tests
+- Recommended instrumentation
+- Exact source locations
+
+---
+
+## SUBAGENT 4 — SECURITY, PUBLIC-RELEASE RISK AND CONTRACT ANALYSIS
+
+Model: Opus  
+Mode: Background  
+Role: Security and Release Reviewer
+
+### Assignment
+
+Inspect the application from a public-release perspective.
+
+Review:
+
+- MCP tool authentication
+- Agent credentials
+- Parent/Child authorization
+- Session ownership
+- Cross-agent isolation
+- Ngrok-exposed endpoint security
+- Input validation
+- Replay protection
+- Secret handling
+- Logging redaction
+- Browser extension permissions
+- Unexpected browser actions
+- Resource exhaustion
+- Unsafe retries
+- Crash recovery
+- Failure visibility
+- MCP tool contracts and arguments
+
+Prioritize issues that could affect multiple independent users or agent sessions.
+
+Use CodeGraph/Graphify to inspect security-sensitive call paths.
+
+### Required output
+
+Produce:
+
+- Security threat model
+- Trust-boundary map
+- Critical/high-risk findings
+- Exploitable-looking issues requiring verification
+- Security-focused E2E scenarios
+- Release-blocking conditions
+- Exact implementation references
+
+Use isolated test data and avoid interacting with unrelated user resources.
+
+---
+
+# 4. MAIN FABLE AGENT MUST TEST WHILE SUBAGENTS REVIEW
+
+After launching the review workers, the Main Agent must continue immediately.
+
+Do not wait for reports.
+
+### Main Agent responsibilities
+
+1. Confirm proxy readiness.
+2. Connect BrowserMCP.
+3. Verify the existing Microsoft Edge environment.
+4. Verify/reload the extension if required.
+5. Refresh the designated ChatGPT Parent tab.
+6. Verify the custom MCP connector.
+7. Register the Parent.
+8. Execute the first real orchestration smoke test.
+9. Verify child creation, task delivery, completion, and results.
+10. Collect evidence and detect failures.
+
+### Critical rule
+
+**Source-code review and E2E testing must overlap.**
+
+The code-review workers investigate the implementation while the Main Agent tests the actual application.
+
+If the Main Agent encounters a defect, investigate it immediately using available runtime evidence.
+
+If a worker slot is occupied, continue diagnosis yourself rather than blocking test execution.
+
+---
+
+# 5. STRICT BROWSERMCP RESPONSIBILITY BOUNDARY
+
+BrowserMCP is already configured for Claude Code.
+
+Use it to operate Microsoft Edge, but strictly enforce the following boundary.
+
+## Allowed BrowserMCP Operations
+
+- Connect to the existing Edge session.
+- Identify the designated Parent tab.
+- Refresh the Parent tab.
+- Perform supported Parent bootstrap.
+- Register the Parent through the supported workflow.
+- Submit top-level E2E instructions to a verified Parent.
+- Inspect visible browser state.
+- Read messages passively.
+- Capture screenshots.
+- Observe Child/Grandchild tabs without modifying their execution.
+- Support extension reload through permitted mechanisms.
+
+## Forbidden BrowserMCP Operations
+
+Never use BrowserMCP, Playwright, Selenium, CDP, or another external browser automation mechanism to:
+
+- Type into a Child composer.
+- Paste a Child prompt.
+- Submit a Child prompt.
+- Click Send in a Child tab.
+- Retry a Child prompt.
+- Modify a Grandchild conversation.
+- Complete a descendant task on its behalf.
+- Substitute external browser actions for failed orchestration operations.
+
+All Child/Grandchild operations must originate from Chat Orchestrator itself.
+
+That includes:
+
+- Child tab creation
+- Child initialization
+- Pairing and registration
+- Prompt delivery
+- Prompt insertion
+- Prompt submission
+- Response reading
+- Task completion
+- Result delivery
+- Retry and recovery
+
+### Role verification
+
+Before a mutating BrowserMCP action:
+
+1. Identify the actual tab.
+2. Confirm its role using authoritative application state.
+3. Confirm it is the intended Parent.
+4. Reject the action if the tab is a descendant or its role is uncertain.
+
+Do not infer Parent status merely because a tab is active or recently opened.
+
+### Invalid E2E result
+
+If BrowserMCP or another external controller submits any Child/Grandchild prompt, the scenario is INVALID.
+
+Even if the Child produces the correct result, it does not prove the application worked.
+
+**Never make a test pass by bypassing the feature being tested.**
+
+---
+
+# 6. FIRST REAL END-TO-END SMOKE TEST
+
+Execute a deterministic Parent → Child → Result test.
+
+Use a unique scenario identifier.
+
+### Test procedure
+
+1. Verify proxy/MCP/ngrok readiness.
+2. Verify BrowserMCP connectivity.
+3. Verify extension initialization.
+4. Register a Parent Agent.
+5. Verify the Parent's actual identity.
+6. Submit the initial test prompt through BrowserMCP into the verified Parent tab.
+7. Instruct the Parent to create exactly one Child using Chat Orchestrator.
+8. Assign a deterministic calculation task.
+9. Verify the Child was created by the application.
+10. Verify task creation and delivery.
+11. Verify the Extension inserted the Child prompt.
+12. Verify the Extension actually submitted the prompt.
+13. Observe the Child execution passively.
+14. Verify the Child completed through supported tools.
+15. Verify result delivery to the Parent.
+16. Verify required acknowledgement.
+17. Confirm there were no duplicate children, tasks, or completions.
+18. Clean up test-owned resources.
+19. Record the outcome and evidence.
+
+### Pass conditions
+
+A test passes only if the entire documented lifecycle is correct.
+
+The result must be supported by actual runtime state and application evidence, not merely ChatGPT's final response.
+
+---
+
+# 7. SECOND SUBAGENT WAVE — DEDICATED DEEP E2E TEST DESIGN
+
+**This phase is mandatory.**
+
+After the first code-review wave has produced sufficient complete findings, launch a NEW dedicated Opus subagent.
+
+This must be a separate assignment with a distinct responsibility from the initial code reviewers.
+
+Do not assume that the initial code-review reports themselves constitute a complete E2E test suite.
+
+### Scheduling
+
+When the review workers complete:
+
+1. Collect their evidence-based reports.
+2. Combine them into a verified architecture and behavior map.
+3. Identify missing implementation knowledge.
+4. Assign targeted follow-up investigations where necessary.
+5. Release completed worker slots.
+6. Launch the dedicated E2E Test Architect subagent.
+7. Continue real testing as Fable.
+
+Do not block the already-running smoke and functional tests while preparing this deeper scenario catalog.
+
+## NEW SUBAGENT — DEEP REAL-WORLD E2E TEST ARCHITECT
+
+Model: Opus  
+Mode: Background  
+Role: Source-Code-Driven E2E Scenario Generator
+
+### Input
+
+Provide:
+
+- Architecture review findings
+- Decision-log requirements
+- Prompt-delivery code analysis
+- MCP tool contract inventory
+- State-machine analysis
+- Reliability and recovery findings
+- Security findings
+- Existing tests
+- Observed runtime failures
+- Recent relevant Git changes
+
+The worker must inspect any referenced source code required to validate those findings.
+
+### Primary mission
+
+**Generate the deepest practical real-world E2E test suite possible from the actual application implementation.**
+
+Do not stop at a generic checklist.
+
+For each important source-code workflow, identify:
+
+1. Normal execution.
+2. Alternative branches.
+3. Boundary inputs.
+4. Invalid states.
+5. Missing prerequisites.
+6. Duplicate operations.
+7. Concurrent operations.
+8. Timeout behavior.
+9. Partial failures.
+10. Restart/recovery behavior.
+11. Security and ownership boundaries.
+12. Unexpected user/browser actions.
+13. State synchronization failures.
+14. Resource exhaustion.
+15. Event ordering and replay.
+16. Cleanup and lifecycle termination.
+17. Cross-feature interactions.
+
+Every scenario must be connected to actual source behavior or a documented requirement.
+
+### Source-code-driven scenario generation
+
+For each relevant class/function/handler:
+
+- Identify entry conditions.
+- Identify important branches.
+- Identify state mutations.
+- Identify external dependencies.
+- Identify failure points.
+- Identify expected invariants.
+- Identify relevant tool contracts.
+- Generate executable scenarios.
+
+Use CodeGraph and Graphify to discover related call paths and cross-component interactions.
+
+Do not merely translate existing unit tests into E2E cases.
+
+### Example: Child Prompt Submission
+
+Investigate all meaningful paths involving:
+
+- Child tab not created.
+- Child tab created but not loaded.
+- Child tab loaded but not registered.
+- Child registered with stale incarnation.
+- Child composer unavailable.
+- Wrong tab selected.
+- Prompt inserted into wrong tab.
+- Prompt inserted but not submitted.
+- ChatGPT generating another response.
+- Send action disabled.
+- Prompt submission times out.
+- Submission succeeds but acknowledgement is lost.
+- Retry creates a duplicate prompt.
+- Extension reload occurs during submission.
+- Proxy restart occurs during submission.
+- Multiple children submit concurrently.
+- A second task arrives before the first completes.
+- Browser focus changes during submission.
+- Child tab closes unexpectedly.
+- Parent closes during child execution.
+
+These are examples, not an exhaustive list.
+
+Discover additional paths from the source.
+
+### Scenario combination strategy
+
+Avoid testing only isolated features.
+
+Generate meaningful combinations using:
+
+- State-transition coverage
+- Branch coverage
+- Boundary-value analysis
+- Pairwise combinations
+- Concurrency interleavings
+- Fault-injection points
+- Historical defect patterns
+- Property-based invariants
+- Model-based testing
+- Risk-based prioritization
+
+Avoid uncontrolled Cartesian products of every possible value.
+
+Deduplicate equivalent scenarios.
+
+Prioritize combinations that expose materially different behavior.
+
+### Required scenario schema
+
+Every scenario must define:
+
+```yaml
+id: E2E-UNIQUE-ID
+title: Scenario title
+category: lifecycle | communication | recovery | security | stress
+priority: P0 | P1 | P2 | P3
+source_references:
+  - actual/file/path:actual_symbol
+requirements:
+  - documented requirement or decision
+preconditions:
+  - required initial state
+setup:
+  - setup operations
+stimulus:
+  - test actions or parent prompt
+expected_mcp_calls:
+  - applicable tool calls
+expected_events:
+  - expected lifecycle events
+expected_state:
+  - expected final state
+assertions:
+  - independently verifiable checks
+failure_injection:
+  - optional controlled interruption
+timeout:
+  value: configurable
+cleanup:
+  - safe cleanup actions
+browsermcp_boundary: parent_bootstrap_and_read_only_descendants
+execution_mode: real_browser | integration | simulation
+automation_status: proposed
+```
+
+Do not invent concrete source references, tool names, or values.
+
+### Test catalog output
+
+Create a prioritized, deduplicated test catalog containing as many meaningful, source-grounded cases as practical.
+
+Suggested categories:
+
+- Application startup
+- MCP connection
+- Ngrok connectivity
+- Browser extension initialization
+- Parent registration
+- Parent identity resolution
+- Child creation
+- Child pairing
+- Child prompt submission
+- Child response reading
+- Child completion
+- Event queues
+- FIFO acknowledgements
+- Session/incarnation behavior
+- Nested delegation
+- Multiple independent parents
+- Concurrency and race conditions
+- Browser refresh/closure
+- Proxy restarts
+- Extension reloads
+- Recovery and ownership locks
+- UI consistency
+- Security/isolation
+- Resource cleanup
+- Performance and endurance
+
+### Required deliverables
+
+Produce:
+
+```text
+test-artifacts/test-design/e2e-scenario-catalog.md
+test-artifacts/test-design/e2e-test-matrix.json
+test-artifacts/test-design/source-to-test-traceability.md
+test-artifacts/test-design/coverage-gaps.md
+```
+
+Use project-compatible relative paths.
+
+If these files already exist, avoid overwriting unrelated content.
+
+Create test definitions and proposed assertions; do not operate the live browser.
+
+Main Fable Agent owns actual execution.
+
+The objective is **deep code-grounded test coverage**, not simply maximizing the number of test cases.
+
+---
+
+# 8. CONTINUOUS SUBAGENT UTILIZATION AFTER CODE REVIEW
+
+Do not stop using subagents after the first review wave.
+
+Use freed slots for additional focused tasks.
+
+### Dynamic task priorities
+
+**Priority 1 — Confirmed runtime failures**
+
+Delegate root-cause tracing of specific E2E failures.
+
+**Priority 2 — Release-blocking security or correctness issues**
+
+Delegate targeted analysis of critical risks.
+
+**Priority 3 — Deep E2E test generation**
+
+Expand scenarios from newly discovered code paths.
+
+**Priority 4 — Regression and change-impact analysis**
+
+Determine what a fix may break and which tests must be rerun.
+
+**Priority 5 — Performance and concurrency investigation**
+
+Analyze bottlenecks and possible races.
+
+**Priority 6 — Test coverage audit**
+
+Find remaining untested branches, state transitions, and dependencies.
+
+### Example later-wave Opus assignments
+
+- Parent registration race-condition investigator
+- Child prompt-delivery debugger
+- FIFO acknowledgement correctness reviewer
+- Browser extension lifecycle reviewer
+- Journal recovery investigator
+- MCP tool contract validator
+- Multi-parent isolation analyst
+- Regression impact reviewer
+- Stress-test scenario generator
+- Security release auditor
+- Test-flakiness investigator
+- Test automation code reviewer
+
+Create workers only when their work is independent and their findings will advance the campaign.
+
+Use a maximum of four simultaneous workers and reuse capacity continuously.
+
+---
+
+# 9. DEEP CODE ANALYSIS REQUIREMENTS
+
+Use the subagents' source-code findings to establish a complete system understanding.
+
+## Analyze all critical components
+
+- Electron main process
+- Proxy startup
+- MCP server host
+- MCP tool definitions
+- Network transport
+- Ngrok connectivity
+- Browser extension background/service worker
+- Extension popup
+- Browser tab lifecycle
+- Parent/Child classification
+- Pairing/authentication
+- Task creation
+- Event delivery
+- Prompt submission
+- Response detection
+- Task completion
+- Result propagation
+- Acknowledgements
+- Retry and idempotency
+- Persistence
+- Recovery
+- Cleanup
+
+## Verify architecture decisions
+
+For every relevant decision:
+
+1. Identify the requirement.
+2. Identify the actual implementation.
+3. Identify whether the behavior complies.
+4. Identify relevant tests.
+5. Identify missing test coverage.
+6. Record confirmed gaps.
+
+Use exact source locations.
+
+## Inspect recent code changes
+
+Analyze:
+
+- Current Git status
+- Relevant recent commits
+- Modified symbols
+- New dependencies
+- Changed MCP contracts
+- Changed state transitions
+- Changed browser behavior
+- Potential regressions
+
+Use CodeGraph and Graphify for impact tracing.
+
+Preserve unrelated uncommitted changes.
+
+---
+
+# 10. GENERAL TEST EXECUTION ALGORITHM
+
+Execute every scenario through a standardized lifecycle.
+
+```mermaid
+flowchart TD
+    A["Select Highest-Priority Test"]
+    B["Verify Preconditions"]
+    C["Prepare Isolated Test State"]
+    D["Execute via Authorized Path"]
+    E["Monitor MCP, Browser and State"]
+    F{"Expected Behavior Verified?"}
+    G["Save PASS Evidence"]
+    H["Capture Failure Evidence"]
+    I["Determine First Incorrect State"]
+    J["Delegate Targeted Opus Analysis"]
+    K["Fable Validates Root Cause"]
+    L["Implement Fix + Regression Test"]
+    M["Rebuild / Restart Affected Components"]
+    N["Rerun Failed Test"]
+    O["Run Related Regression"]
+    P["Update Coverage and Next Test"]
+
+    A --> B --> C --> D --> E --> F
+    F -- Yes --> G --> P
+    F -- No --> H --> I --> J --> K --> L --> M --> N --> E
+    N -.-> O
+    O --> P --> A
+```
+
+All retry and investigation loops must be bounded.
+
+### Testing stages
+
+**Stage 1 — Smoke**
+
+One Parent, one Child, one deterministic task.
+
+**Stage 2 — Sequential workflows**
+
+Repeated task assignment, completion, and result delivery.
+
+**Stage 3 — Concurrency**
+
+Multiple children, multiple independent parents, simultaneous events.
+
+**Stage 4 — Nested delegation**
+
+Parent → Child → Grandchild and deeper supported delegation.
+
+**Stage 5 — Recovery**
+
+Proxy, extension, browser, and network disruptions.
+
+**Stage 6 — Security and isolation**
+
+Ownership enforcement, credential validation, replay protection.
+
+**Stage 7 — Stress and endurance**
+
+Queue pressure, concurrency, memory/resource stability.
+
+**Stage 8 — Full regression**
+
+Repeat critical scenarios under clean conditions.
+
+---
+
+# 11. AUTOMATED ROOT-CAUSE DEBUGGING
+
+For every confirmed bug:
+
+## Step 1 — Capture
+
+Save:
+
+- Scenario ID
+- Expected behavior
+- Actual behavior
+- Last correct state
+- First incorrect state
+- Relevant task/agent/event IDs
+- Proxy logs
+- Extension logs
+- MCP responses
+- Browser evidence
+- Recent changes
+
+## Step 2 — Reproduce
+
+Create the smallest reliable reproduction.
+
+Use deterministic inputs and a known initial state when possible.
+
+## Step 3 — Delegate
+
+Assign a narrowly scoped failure investigation to an available Opus worker.
+
+Provide actual evidence.
+
+Do not ask it to reread the entire codebase.
+
+## Step 4 — Analyze in Parallel
+
+While Opus investigates source code, Fable examines runtime state and the failed execution.
+
+Compare findings.
+
+## Step 5 — Confirm Root Cause
+
+Identify the actual implementation defect.
+
+Do not rely on speculation or the final visible error alone.
+
+## Step 6 — Fix
+
+Fable implements or integrates the smallest architecturally correct fix.
+
+Avoid:
+
+- Arbitrary delays
+- Unlimited retries
+- Silent exception swallowing
+- Invalid state bypasses
+- Unsafe ownership resets
+- Hard-coded tab IDs
+- Duplicate task creation
+- Blind retries after unknown outcomes
+
+## Step 7 — Regression Test
+
+Add a test reproducing the original defect.
+
+## Step 8 — Rebuild and Restart
+
+Restart only affected components.
+
+For the proxy, use:
+
+```powershell
+cd .\Chat-Orchestrator\extention-proxy
+npm run desktop
+```
+
+Reload the extension only when necessary.
+
+## Step 9 — Verify
+
+Rerun:
+
+1. Original failing test.
+2. Related functional tests.
+3. Impacted regression tests.
+4. Relevant recovery/concurrency tests.
+
+## Step 10 — Continue
+
+Record the verified fix and resume the test campaign.
+
+---
+
+# 12. PUBLIC-RELEASE REAL-WORLD TESTING
+
+The system must be tested as software intended for use by other people, not only as a local developer prototype.
+
+## 12.1 Installation and First-Run Experience
+
+Test:
+
+- Clean application installation.
+- First proxy startup.
+- Extension initialization.
+- Missing configuration.
+- Invalid ngrok configuration.
+- Unavailable MCP endpoint.
+- Disconnected browser.
+- Failed authentication.
+- Clear user-facing error messages.
+- Safe recovery instructions.
+
+Use isolated environments for destructive setup tests.
+
+## 12.2 Normal User Behavior
+
+Test:
+
+- Repeated Parent registration.
+- Multiple independent Parents.
+- Sequential task delegation.
+- Concurrent task delegation.
+- Child reuse where supported.
+- Parent refresh.
+- Child refresh.
+- Browser focus changes.
+- Browser tab rearrangement.
+- Slow ChatGPT responses.
+- Long prompts and responses.
+- User interruption during execution.
+
+## 12.3 Unexpected Behavior
+
+Test:
+
+- Closing tabs unexpectedly.
+- Refreshing ChatGPT during execution.
+- Restarting proxy during an active task.
+- Reloading extension during delivery.
+- Disconnecting/reconnecting ngrok.
+- Duplicate MCP invocation.
+- Delayed acknowledgement.
+- Unknown operation outcome.
+- Stale credentials.
+- Stale recipient incarnation.
+- Ownership conflicts.
+
+## 12.4 Multi-User and Isolation Scenarios
+
+Test:
+
+- Independent parent trees.
+- Concurrent independent task execution.
+- Cross-parent isolation.
+- Invalid task ownership.
+- Incorrect tab association.
+- Expired sessions.
+- Unauthorized MCP requests.
+- Duplicate event replay.
+- Resource isolation.
+
+Do not interfere with unrelated real user sessions.
+
+## 12.5 Production Security
+
+Verify:
+
+- Sensitive tokens are not leaked.
+- Logs redact secrets.
+- MCP tools enforce caller authorization.
+- Public endpoints enforce documented authentication.
+- Ngrok exposure does not unintentionally expose privileged local operations.
+- Browser extension permissions are justified.
+- Inputs are validated.
+- Replay protection works.
+- Failure messages do not expose secrets.
+- Test automation cannot impersonate descendant agents.
+
+Security failures affecting unauthorized access, token leakage, or cross-user isolation are release blockers.
+
+---
+
+# 13. STRESS, CONCURRENCY AND ENDURANCE
+
+Perform progressive tests.
+
+### Real ChatGPT E2E
+
+Use bounded concurrency and service budgets.
+
+Verify actual end-to-end integration.
+
+### Local Simulated Stress
+
+Use local mocks/simulations for high-volume tests where appropriate.
+
+Test:
+
+- Concurrent MCP calls
+- Queue saturation
+- Event replay
+- Slow consumers
+- Stale recipients
+- Duplicate completion
+- Retry storms
+- Recovery under load
+- Memory pressure
+- Resource leaks
+
+Do not replace real E2E tests with simulation results.
+
+Do not overwhelm external services.
+
+### Metrics
+
+Record:
+
+- Success/failure rate
+- E2E latency
+- MCP latency
+- Queue delivery latency
+- Completion duration
+- Retry count
+- Timeout count
+- Duplicate event count
+- Missing result count
+- Orphaned agent count
+- Memory/CPU usage
+- Tab/resource usage
+- Recovery success rate
+
+Use measured baselines and documented requirements to define performance thresholds.
+
+---
+
+# 14. ANTI-LOOP AND EXECUTION PROTECTION
+
+Previous testing attempts spent too long investigating source code without running the application.
+
+Prevent this explicitly.
+
+### Rule 1 — Runtime first
+
+Start the proxy before full code analysis.
+
+### Rule 2 — Parallel analysis
+
+Delegate broad investigation to Opus.
+
+Fable continues E2E execution.
+
+### Rule 3 — No identical failed retries
+
+After two identical failed attempts under unchanged conditions, change strategy using new evidence.
+
+### Rule 4 — No repeated entire-codebase scanning
+
+Reuse graph findings and recorded source maps.
+
+### Rule 5 — No unnecessary runtime restart
+
+Reuse healthy components.
+
+### Rule 6 — No unbounded debugging
+
+Each defect has a bounded investigation and repair budget.
+
+### Rule 7 — No test pass through bypass
+
+Never use BrowserMCP to perform Child/Grandchild operations.
+
+### Rule 8 — No unverified fixes
+
+Retest every change.
+
+### Rule 9 — No infinite test generation
+
+Generate meaningful distinct cases, not superficial duplicates.
+
+### Rule 10 — No premature public-release declaration
+
+Use actual release gate evidence.
+
+---
+
+# 15. PERSISTENT CAMPAIGN STATE
+
+Maintain:
+
+```text
+test-artifacts/
+  automation-progress.md
+  code-analysis/
+  test-design/
+  runtime-logs/
+  test-results/
+  failure-evidence/
+  regression/
+  stress-results/
+  release-readiness/
+```
+
+Track:
+
+- Current execution phase
+- Proxy status
+- BrowserMCP status
+- Parent registration status
+- Active subagents and models
+- Completed source reviews
+- Test catalog coverage
+- Tests passed/failed
+- Bugs discovered
+- Root causes
+- Fixes implemented
+- Regression status
+- Remaining release blockers
+- Next executable task
+
+Do not overwrite unrelated existing files.
+
+Resume interrupted sessions from verified evidence.
+
+---
+
+# 16. PUBLIC-RELEASE QUALITY GATES
+
+The application must not be marked release-ready merely because a few tests pass.
+
+## Mandatory release criteria
+
+1. No unresolved confirmed Critical/P0 defects.
+2. No unresolved confirmed High/P1 release-blocking defects.
+3. All mandatory core lifecycle E2E tests pass.
+4. Child prompt delivery uses Chat Orchestrator exclusively.
+5. Parent/Child ownership and authorization are correct.
+6. Task results are not silently lost within tested workloads.
+7. Duplicate operations do not produce unintended side effects.
+8. Session/incarnation handling passes recovery tests.
+9. FIFO and acknowledgement behavior meet documented guarantees.
+10. Proxy/extension/browser recovery scenarios pass.
+11. Critical security checks pass.
+12. Relevant regression tests pass after fixes.
+13. Multiple clean E2E regression runs pass without manual intervention.
+14. Configured stress and endurance profiles meet measured acceptance thresholds.
+15. No confirmed sustained resource leak remains.
+16. Installation/startup and recovery workflows are sufficiently automated.
+17. Test artifacts provide trustworthy evidence of results.
+
+### Recommended minimum exit verification
+
+After resolving release blockers:
+
+- Three consecutive clean critical E2E regression runs.
+- Full completion of the prioritized P0/P1 scenario matrix.
+- Zero confirmed lost task results in the defined stress profile.
+- Zero unauthorized cross-agent operations.
+- Zero externally injected Child/Grandchild prompts.
+- No unresolved critical deadlock or state corruption.
+- A completed documented endurance profile without sustained resource leakage.
+
+Define performance and workload thresholds using actual system limits.
+
+Do not claim mathematical proof of zero bugs or exhaustive coverage of every possible real-world event.
+
+---
+
+# 17. FINAL INDEPENDENT REVIEW WAVE
+
+Once fixes and tests have reached the release-validation stage, use available Opus slots for independent reviews.
+
+Delegate:
+
+**Reviewer A — Architecture Compliance**
+
+Verify that all fixes preserve approved decisions.
+
+**Reviewer B — Regression and Coverage Audit**
+
+Identify critical code paths not represented by executed tests.
+
+**Reviewer C — Security and Failure Recovery**
+
+Review remaining release risks.
+
+**Reviewer D — Test Validity and Flakiness**
+
+Verify that tests are genuine, reproducible, and not passing due to bypasses, weak assertions, or environmental artifacts.
+
+All reviewers must be given the actual code changes, test catalog, execution evidence, and relevant logs.
+
+Fable evaluates their findings and resolves confirmed release blockers.
+
+Do not ask reviewers to blindly approve the release.
+
+---
+
+# 18. REQUIRED FINAL DELIVERABLES
+
+Deliver:
+
+1. Automated proxy startup and recovery.
+2. BrowserMCP-based Parent bootstrap automation.
+3. Real Chat Orchestrator E2E runner.
+4. Complete source-code architecture review.
+5. CodeGraph/Graphify-assisted dependency and impact analysis.
+6. Decision-log compliance report.
+7. Deep source-code-driven E2E test catalog.
+8. Automated scenario implementations.
+9. Functional and regression test results.
+10. Fault-injection and recovery results.
+11. Stress and endurance results.
+12. Confirmed bugs and root-cause fixes.
+13. Diagnostic and logging improvements.
+14. Remaining known limitations.
+15. Public-release readiness report.
+16. One-command repeatable testing workflow.
+
+The final report must distinguish:
+
+- PASS
+- FAIL
+- BLOCKED
+- INCONCLUSIVE
+- INVALID TEST
+- NOT EXECUTED
+
+Every important claim must be backed by evidence.
+
+---
+
+# 19. FINAL MASTER WORKFLOW
+
+```mermaid
+flowchart TD
+    START["Fable Main Agent Starts"]
+    PROXY["Start Proxy: npm run desktop"]
+    WORKERS["Launch 4 Opus Code Review Subagents"]
+    BROWSER["BrowserMCP Parent Bootstrap"]
+    SMOKE["Real Parent-Child E2E Smoke Test"]
+    REVIEW["Collect Code Review Findings"]
+    TESTARCH["Launch Opus Deep E2E Test Architect"]
+    CATALOG["Generate Source-Based Test Catalog"]
+    EXEC["Execute Prioritized Real E2E Tests"]
+    PASS{"Assertions Pass?"}
+    DEBUG["Parallel Opus Root-Cause Investigation"]
+    FIX["Fable Implements Fix"]
+    REG["Regression Verification"]
+    STRESS["Stress, Recovery and Endurance"]
+    AUDIT["Independent Opus Release Audit"]
+    GATE{"Public-Release Quality Gates Met?"}
+    READY["GO: Release Candidate"]
+    BLOCK["NO-GO: Record Release Blockers"]
+
+    START --> PROXY
+    PROXY --> WORKERS
+    WORKERS --> BROWSER
+    BROWSER --> SMOKE
+    WORKERS -.-> REVIEW
+    REVIEW --> TESTARCH --> CATALOG
+    SMOKE --> EXEC
+    CATALOG --> EXEC
+    EXEC --> PASS
+    PASS -- No --> DEBUG --> FIX --> REG --> EXEC
+    PASS -- Yes --> STRESS --> AUDIT --> GATE
+    GATE -- Yes --> READY
+    GATE -- No --> BLOCK
+    BLOCK --> EXEC
+```
+
+All loops must be bounded, driven by new evidence, and subject to configured resource limits.
+
+A NO-GO decision does not authorize uncontrolled retries.
+
+---
+
+# 20. EXECUTE IMMEDIATELY
+
+Do not respond with another plan.
+
+Start the actual work in this order:
+
+**1. Locate the repository.**
+
+**2. Start or verify the proxy using:**
+
+```powershell
+cd .\Chat-Orchestrator\extention-proxy
+npm run desktop
+```
+
+**3. Launch four Opus background subagents for deep independent code analysis.**
+
+**4. Immediately continue as Fable.**
+
+**5. Connect BrowserMCP and bootstrap the verified Parent tab.**
+
+**6. Execute one real Parent → Child → Result smoke test.**
+
+**7. Verify Child prompts were submitted by Chat Orchestrator itself.**
+
+**8. Investigate and fix failures.**
+
+**9. Integrate the completed code-review reports.**
+
+**10. Launch a dedicated Opus E2E Test Architect subagent using those findings.**
+
+**11. Generate deep, source-grounded, real-world test cases.**
+
+**12. Execute those tests progressively.**
+
+**13. Keep reusing available Opus subagent slots for independent debugging, coverage analysis, and regression verification.**
+
+**14. Fix confirmed defects, restart affected components, and retest.**
+
+**15. Execute recovery, concurrency, stress, and endurance tests.**
+
+**16. Run a final independent Opus release audit.**
+
+**17. Produce an evidence-based GO/NO-GO release decision.**
+
+## ABSOLUTE FINAL DIRECTIVE
+
+**FABLE LEADS AND EXECUTES.**
+
+**OPUS SUBAGENTS INVESTIGATE, DESIGN, REVIEW, AND VALIDATE IN PARALLEL.**
+
+**CODEGRAPH AND GRAPHIFY ENABLE DEEP SOURCE-LEVEL UNDERSTANDING.**
+
+**BROWSERMCP BOOTSTRAPS THE PARENT ONLY.**
+
+**CHAT ORCHESTRATOR HANDLES EVERY CHILD AND GRANDCHILD OPERATION.**
+
+**CODE-REVIEW FINDINGS MUST GENERATE DEEP, REAL-WORLD E2E TEST CASES.**
+
+**EVERY CONFIRMED DEFECT MUST BE REPRODUCED, FIXED, AND REGRESSION-TESTED.**
+
+**PUBLIC RELEASE IS APPROVED ONLY AFTER THE REQUIRED QUALITY GATES PASS.**
+
+Do not wait for subagents when runtime work can continue.
+
+Do not repeatedly analyze the same code.
+
+Do not ask the user to start the proxy.
+
+Do not stop after generating test plans.
+
+Do not bypass the application to pass a test.
+
+**START EXECUTION NOW.**
