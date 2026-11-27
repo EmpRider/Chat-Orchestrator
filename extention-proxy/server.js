@@ -553,6 +553,9 @@ async function prepareAndStartWorker(args, principal) {
   const root = tabRegistry.get(callerRecord?.rootTabId,principal.browserSessionId);
   if (!root || root.parentTabId !== null || root.browserSessionId !== principal.browserSessionId)
     throw new Error('Root browser identity is unavailable for worker grouping');
+  if (root?.context_full === true)
+    throw Object.assign(new Error('Parent conversation context window is full; cannot spawn worker until context is rotated'),
+      {code:'CONTEXT_WINDOW_FULL'});
   const taskText = args.saga_task_id == null ? args.task :
     args.task + '\n\nExternal tracking reference (optional, not an execution identity): Saga task #' + args.saga_task_id;
   const params = {...args,task:taskText,__trustedPrincipal:principal,
@@ -2776,7 +2779,8 @@ function forward(method, principal) {
             return t.incarnation_id === known?.incarnationId && t.site === known.site && t.role==='worker';
           })
             .map(t=>({...t,parent_tab_id:tabRegistry.get(t.tab_id,caller.browserSessionId)?.parentTabId ?? null,
-              root_tab_id:tabRegistry.get(t.tab_id,caller.browserSessionId)?.rootTabId ?? null}));
+              root_tab_id:tabRegistry.get(t.tab_id,caller.browserSessionId)?.rootTabId ?? null,
+              context_full:t.context_full === true}));
         } else {
           // Child-bound follow-ups carry the same operating contract as spawn_worker.
           // A bare message lets the Child answer inline and never call complete_task,
@@ -3998,6 +4002,23 @@ if (isMain || process.parentPort) {
     process.exitCode = 1;
   });
   let terminating = false;
+  // Kill/crash safety: release the private journal lock on any abnormal
+  // termination so a stale lock cannot permanently block restart.
+  const releaseJournalOnExit=async()=>{
+    if(privateJournal){
+      try { await privateJournal.close(); privateJournal=null; privateCoordinationEnabled=false; }
+      catch(error){ console.error('[bridge] fatal lock release failed:', error.message); }
+    }
+  };
+  process.on('uncaughtException',async(error)=>{
+    console.error('[bridge] uncaught exception:', error.message);
+    await releaseJournalOnExit();
+    process.exitCode=1;
+  });
+  process.on('unhandledRejection',async(reason)=>{
+    console.error('[bridge] unhandled rejection:', String(reason?.message??reason));
+    await releaseJournalOnExit();
+  });
   for (const signal of ['SIGINT','SIGTERM',...(process.platform === 'win32' ? ['SIGBREAK'] : [])]) {
     process.on(signal, async() => {
       if (terminating) return;
